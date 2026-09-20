@@ -3,9 +3,12 @@
 
 Replies to everyone: DMs from any user, and group messages that mention
 the bot or reply to it. (Owner-only pause was lifted 2026-09-20.)
-Replies use ron_ai.py (Groq backend), streaming live via Telegram's native
-message drafts (sendMessageDraft) for long 1:1 answers, finalized as native
-rich messages (sendRichMessage) with contextual quick-reply buttons.
+Replies use ron_ai.py (multi-provider AI brain: Groq -> Gemini ->
+OpenRouter), streaming live via rich drafts for
+long 1:1 answers, sent as native rich messages (Bot API 10.1
+sendRichMessage) with contextual quick-reply buttons.
+Business / Secretary Mode: handles business_connection updates and answers
+business_message updates on the owner's business account.
 
 Run: copy .env.example to .env, fill it in, then
      nohup python3 ron_daemon.py >ron_daemon.log 2>&1 &
@@ -58,6 +61,241 @@ def _atomic_write_json(path, obj):
     os.replace(tmp, path)
 
 
+# --- Phase 3: watchdog hooks + degraded mode (2026-09-20) ---
+# The watchdog (ron_watchdog.py) restarts this daemon when it dies; the
+# daemon writes a heartbeat every 30s so a hung process is detectable too.
+# Degraded mode: if every AI provider keeps failing, the bot stops burning
+# API calls, tells the user honestly, queues their message to disk, and
+# answers it when a provider recovers — no silent drops, no duplicates.
+HEARTBEAT_FILE = str(BASE_DIR / "ron_heartbeat.json")
+DEGRADED_QUEUE = str(BASE_DIR / "degraded_queue.jsonl")
+BRAIN_FAIL_WINDOW = 600.0    # systemic failures counted over the last 10 min
+BRAIN_FAIL_THRESHOLD = 5     # this many -> degraded mode
+RECOVERY_POLL_SECS = 60      # provider probe interval while degraded
+QUEUE_MAX_AGE = 1800         # don't answer queued messages older than 30 min
+DEGRADED_NOTICE_COOLDOWN = 900.0  # one honest notice per chat per 15 min
+_SYSTEMIC_ERR_MARKERS = ("rate limited", "not connected yet",
+                         "AI backend error", "AI stream stalled",
+                         "AI stream closed", "AI backend returned empty reply")
+
+_BRAIN_LOCK = threading.Lock()
+_brain_failures = []         # timestamps of recent systemic AI failures
+_degraded = {"active": False, "since": 0.0}
+_degraded_notice_ts = {}     # chat_id -> last honest-notice timestamp
+_QUEUE_LOCK = threading.Lock()
+
+
+def _heartbeat_loop():
+    """Write pid+timestamp every 30s so the watchdog can spot a hang."""
+    while not _SHUTDOWN.is_set():
+        try:
+            _atomic_write_json(HEARTBEAT_FILE,
+                               {"pid": os.getpid(), "ts": time.time()})
+        except Exception:
+            pass
+        for _ in range(60):  # 0.5s granularity so shutdown is prompt
+            if _SHUTDOWN.is_set():
+                break
+            time.sleep(0.5)
+
+
+def _brain_down():
+    with _BRAIN_LOCK:
+        return _degraded["active"]
+
+
+def _record_brain_failure(err_text):
+    """Count one systemic AI failure; flip to degraded mode at threshold."""
+    with _BRAIN_LOCK:
+        now = time.time()
+        _brain_failures.append(now)
+        cutoff = now - BRAIN_FAIL_WINDOW
+        while _brain_failures and _brain_failures[0] < cutoff:
+            _brain_failures.pop(0)
+        if (not _degraded["active"]
+                and len(_brain_failures) >= BRAIN_FAIL_THRESHOLD):
+            _degraded["active"] = True
+            _degraded["since"] = now
+            print(f"[ron_daemon] DEGRADED MODE ON: {len(_brain_failures)} "
+                  f"systemic AI failures in 10 min", flush=True)
+
+
+def _record_brain_success():
+    """A real answer got through — clear the failure streak."""
+    with _BRAIN_LOCK:
+        if _brain_failures:
+            _brain_failures.clear()
+        if _degraded["active"]:
+            _degraded["active"] = False
+            print("[ron_daemon] DEGRADED MODE OFF: provider recovered",
+                  flush=True)
+
+
+def _is_systemic(err_text):
+    return any(m in (err_text or "") for m in _SYSTEMIC_ERR_MARKERS)
+
+
+def _queue_message(chat_id, user_id, user_name, text, reply_to=None,
+                   thread_id=None, business_connection_id=None, private=True):
+    """Persist one unanswered message to the degraded-mode queue."""
+    ts = time.time()
+    entry = {"qid": f"{ts:.6f}:{chat_id}:{user_id}", "ts": ts,
+             "chat_id": chat_id, "user_id": user_id, "user_name": user_name,
+             "text": text, "reply_to": reply_to, "thread_id": thread_id,
+             "business_connection_id": business_connection_id,
+             "private": private}
+    with _QUEUE_LOCK:
+        try:
+            with open(DEGRADED_QUEUE, "a") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[ron_daemon] queue write failed: {e}", flush=True)
+            return False
+    print(f"[ron_daemon] queued message for chat={chat_id} (degraded)",
+          flush=True)
+    return True
+
+
+def _maybe_degraded_notice(chat_id, reply_to=None, thread_id=None,
+                           business_connection_id=None):
+    """Honest, provider-neutral 'brain is down, you're queued' message —
+    at most one per chat per 15 minutes."""
+    now = time.time()
+    with _BRAIN_LOCK:
+        last = _degraded_notice_ts.get(str(chat_id), 0)
+        if now - last < DEGRADED_NOTICE_COOLDOWN:
+            return
+        _degraded_notice_ts[str(chat_id)] = now
+    notice = ("Whoa \u2014 every AI backend I use is down at the same time. "
+              "I've queued your message and I'll answer it as soon as one "
+              "comes back. No need to resend. \U0001F527")
+    try:
+        send_rich_with_kb(chat_id, notice, reply_to, thread_id,
+                          business_connection_id)
+    except Exception as e:
+        print(f"[ron_daemon] degraded notice failed: {e}", flush=True)
+
+
+def _drain_queue():
+    """Answer queued messages after recovery. True when the queue is empty.
+
+    Only entries answered successfully are removed (matched by qid), so a
+    mid-drain failure or a message queued concurrently is never lost or
+    answered twice. Stale entries (>30 min old) are dropped with a log line.
+    """
+    try:
+        with open(DEGRADED_QUEUE) as f:
+            entries = [json.loads(l) for l in f if l.strip()]
+    except FileNotFoundError:
+        return True
+    except Exception as e:
+        print(f"[ron_daemon] queue read failed: {e}", flush=True)
+        return False
+    if not entries:
+        return True
+    now = time.time()
+    answered = set()
+    # Purge stale entries up front so they can never block live ones behind
+    # them in the queue.
+    live = []
+    for e in entries:
+        if now - e.get("ts", 0) > QUEUE_MAX_AGE:
+            print(f"[ron_daemon] dropping stale queued msg "
+                  f"(chat={e.get('chat_id')})", flush=True)
+            answered.add(e.get("qid"))
+        else:
+            live.append(e)
+    for e in live:
+        try:
+            send_typing(e["chat_id"], e.get("business_connection_id"))
+            reply = ron_ai.chat(e["chat_id"], e["text"],
+                                e.get("user_name", "there"),
+                                system_extra=group_context())
+            send_rich_with_kb(e["chat_id"], reply, e.get("reply_to"),
+                              e.get("thread_id"),
+                              e.get("business_connection_id"))
+            handle_group_sends(e["chat_id"], e.get("user_id"),
+                               e.get("user_name", "there"), reply)
+            handle_send_topic(e["chat_id"], e.get("user_id"),
+                              e.get("user_name", "there"), reply)
+            handle_topic_actions(e["chat_id"], e.get("user_name", "there"),
+                                 reply,
+                                 origin_group_id=(None if e.get("private", True)
+                                                   else e["chat_id"]),
+                                 origin_thread_id=(None if e.get("private", True)
+                                                    else e.get("thread_id")))
+            answered.add(e.get("qid"))
+            _record_brain_success()
+        except Exception as ex:
+            print(f"[ron_daemon] queue replay failed, staying degraded: {ex}",
+                  flush=True)
+            break  # provider still sick — keep the rest queued
+    with _QUEUE_LOCK:
+        try:
+            with open(DEGRADED_QUEUE) as f:
+                current = [json.loads(l) for l in f if l.strip()]
+        except FileNotFoundError:
+            return not answered or len(answered) == len(entries)
+        except Exception:
+            return False
+        rest = [e for e in current if e.get("qid") not in answered]
+        try:
+            tmp = DEGRADED_QUEUE + ".tmp"
+            with open(tmp, "w") as f:
+                for e in rest:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            os.replace(tmp, DEGRADED_QUEUE)
+        except Exception as e:
+            print(f"[ron_daemon] queue rewrite failed: {e}", flush=True)
+            return False
+    return not rest
+
+
+def _recovery_loop():
+    """While degraded, probe providers every minute; drain the queue on
+    recovery."""
+    while not _SHUTDOWN.is_set():
+        time.sleep(RECOVERY_POLL_SECS)
+        if _SHUTDOWN.is_set() or not _brain_down():
+            continue
+        try:
+            results = ron_ai.probe_providers()
+        except Exception as e:
+            print(f"[ron_daemon] recovery probe failed: {e}", flush=True)
+            continue
+        healthy = [n for n, (ok, _) in results.items() if ok]
+        if not healthy:
+            continue
+        print(f"[ron_daemon] providers back ({', '.join(healthy)}), "
+              f"draining queue", flush=True)
+        if _drain_queue():
+            with _BRAIN_LOCK:
+                _degraded["active"] = False
+            print("[ron_daemon] DEGRADED MODE OFF: queue drained", flush=True)
+
+
+def _health_ping():
+    """Startup provider health check — DMs the owner if a key looks dead."""
+    time.sleep(15)  # let the poll loop settle first
+    try:
+        results = ron_ai.probe_providers()
+    except Exception as e:
+        print(f"[ron_daemon] startup health probe failed: {e}", flush=True)
+        return
+    for name, (ok, detail) in results.items():
+        print(f"[ron_daemon] health: {name} {'OK' if ok else 'DOWN'} - "
+              f"{detail}", flush=True)
+        if not ok and detail.startswith("HTTP 40"):
+            if OWNER_ID:
+                try:
+                    send(OWNER_ID,
+                         f"\u26A0\uFE0F Heads up: the {name} API key looks dead "
+                         f"({detail}). The bot's running on the other providers "
+                         f"for now.")
+                except Exception as e:
+                    print(f"[ron_daemon] owner alert failed: {e}", flush=True)
+
+
 def _track(t):
     with _INFLIGHT_LOCK:
         _INFLIGHT.add(t)
@@ -89,17 +327,22 @@ def api(method, params=None, timeout=65):
         return {"ok": False, "error": str(e)[:150]}
 
 
-def send(chat_id, text, reply_to=None, thread_id=None):
+def send(chat_id, text, reply_to=None, thread_id=None,
+         business_connection_id=None):
     params = {"chat_id": chat_id, "text": text}
     if reply_to:
         # api() urlencodes, so nested objects must be pre-serialized to JSON
         params["reply_parameters"] = json.dumps({"message_id": reply_to})
     if thread_id:
         params["message_thread_id"] = thread_id
+    if business_connection_id:
+        # Secretary Mode: send on the business account, not as the bot.
+        params["business_connection_id"] = business_connection_id
     return api("sendMessage", params)
 
 
-def send_markup(chat_id, text, reply_markup, reply_to=None):
+def send_markup(chat_id, text, reply_markup, reply_to=None,
+                business_connection_id=None):
     params = {
         "chat_id": chat_id,
         "text": text,
@@ -107,14 +350,19 @@ def send_markup(chat_id, text, reply_markup, reply_to=None):
     }
     if reply_to:
         params["reply_parameters"] = json.dumps({"message_id": reply_to})
+    if business_connection_id:
+        params["business_connection_id"] = business_connection_id
     return api("sendMessage", params)
 
 
-def send_typing(chat_id):
+def send_typing(chat_id, business_connection_id=None):
     """Show 'typing...' at the top of the chat. Telegram expires it after
     ~5s, so long generations must resend it periodically."""
     try:
-        api("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+        params = {"chat_id": chat_id, "action": "typing"}
+        if business_connection_id:
+            params["business_connection_id"] = business_connection_id
+        api("sendChatAction", params)
     except Exception:
         pass
 
@@ -287,6 +535,103 @@ def note_topic(group_id, thread_id, name=None, closed=None):
 def topic_name(group_id, thread_id):
     return (load_known_topics().get(str(group_id), {})
             .get(str(thread_id), {}).get("name"))
+
+
+# ---------------------------------------------------------------------------
+# Business / Secretary Mode: the bot can reply inside the owner's business
+# account chats (Chat Automation). BusinessConnection updates are persisted
+# here (atomic write + _FILE_LOCK, same pattern as known_groups.json);
+# business_message updates are answered like DMs, but every outgoing send
+# carries business_connection_id so the reply goes out on the business
+# account. Only connection metadata is stored — never message content.
+# ---------------------------------------------------------------------------
+BUSINESS_CONNECTIONS_FILE = str(BASE_DIR / "business_connections.json")
+
+
+def load_business_connections():
+    try:
+        with open(BUSINESS_CONNECTIONS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_business_connections(conns):
+    # Callers hold _FILE_LOCK (read-modify-write); the write itself is atomic.
+    try:
+        _atomic_write_json(BUSINESS_CONNECTIONS_FILE, conns)
+    except Exception as e:
+        print(f"[ron_daemon] save business connections error: {e}",
+              flush=True)
+
+
+def handle_business_connection(bc):
+    """Track (or drop) a business connection from a business_connection update."""
+    bc = bc or {}
+    conn_id = bc.get("id")
+    if not conn_id:
+        return
+    with _FILE_LOCK:
+        conns = load_business_connections()
+        if bc.get("is_enabled"):
+            # can_reply lives on BusinessBotRights in the current Bot API;
+            # older payloads carried it directly on the connection object.
+            rights = bc.get("rights") or {}
+            can_reply = bc.get("can_reply")
+            if can_reply is None:
+                can_reply = rights.get("can_reply", True)
+            user = bc.get("user") or {}
+            conns[conn_id] = {
+                "user_chat_id": bc.get("user_chat_id"),
+                "can_reply": bool(can_reply),
+                "user_id": user.get("id"),
+                "first_name": user.get("first_name", ""),
+                "date": bc.get("date", 0),
+            }
+            print(f"[ron_daemon] business connection {conn_id}: enabled, "
+                  f"can_reply={bool(can_reply)}", flush=True)
+        else:
+            if conns.pop(conn_id, None) is not None:
+                print(f"[ron_daemon] business connection {conn_id}: "
+                      "disabled, dropped", flush=True)
+        save_business_connections(conns)
+
+
+def handle_business_message(msg):
+    """Reply inside the owner's business account chats.
+
+    Answers the other party's messages like a DM (normal AI flow), but the
+    reply goes out on the business account via business_connection_id.
+    The owner's own messages and our own echoes are skipped so the bot
+    never talks over the human or loops on itself."""
+    msg = msg or {}
+    conn_id = msg.get("business_connection_id")
+    if not conn_id:
+        return
+    conn = load_business_connections().get(conn_id)
+    if not conn:
+        print(f"[ron_daemon] business message for unknown connection "
+              f"{conn_id}, ignoring", flush=True)
+        return
+    if not conn.get("can_reply"):
+        print(f"[ron_daemon] business connection {conn_id}: can_reply=false, "
+              "ignoring", flush=True)
+        return
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return
+    frm = msg.get("from") or {}
+    sender = frm.get("id", 0)
+    # Skip the business owner's own messages and any bot's echoes.
+    if sender and (sender == conn.get("user_id") or frm.get("is_bot")):
+        return
+    ai_reply(chat_id, sender, frm.get("first_name", "there"), text,
+             private=True, reply_to=msg.get("message_id"),
+             business_connection_id=conn_id)
 
 
 def resolve_topic(group_id, name):
@@ -557,13 +902,20 @@ def strip_markdown(t):
     return t.strip()
 
 
-def send_rich(chat_id, text, reply_markup=None, reply_to=None, thread_id=None):
+def send_rich(chat_id, text, reply_markup=None, reply_to=None, thread_id=None,
+              business_connection_id=None):
     """Native rich message (Bot API 10.1); falls back to plain text."""
     rp = {"reply_parameters": {"message_id": reply_to}} if reply_to else {}
     try:
         kw = {"reply_markup": reply_markup} if reply_markup else {}
         if thread_id:
             kw["message_thread_id"] = thread_id
+        if business_connection_id:
+            # Secretary Mode: rich send on the business account. If the
+            # business user can't send rich messages the API 400s and we
+            # fall through to the plain-text fallback below (which also
+            # carries the connection id).
+            kw["business_connection_id"] = business_connection_id
         r = rich_mod.rich_send(chat_id, text, fmt="markdown", **kw, **rp)
         if r.get("ok"):
             return r
@@ -572,13 +924,14 @@ def send_rich(chat_id, text, reply_markup=None, reply_to=None, thread_id=None):
         print(f"[ron_daemon] rich send error: {e}", flush=True)
     plain = strip_markdown(text)
     if reply_markup:
-        r2 = send_markup(chat_id, plain, reply_markup, reply_to)
+        r2 = send_markup(chat_id, plain, reply_markup, reply_to,
+                         business_connection_id)
         if r2.get("ok"):
             return r2
         # Bad keyboard (oversized button etc.) — drop it, keep the text.
         print(f"[ron_daemon] markup send not ok, retrying plain: "
               f"{str(r2)[:120]}", flush=True)
-    return send(chat_id, plain, reply_to, thread_id)
+    return send(chat_id, plain, reply_to, thread_id, business_connection_id)
 
 
 # ---------------------------------------------------------------------------
@@ -627,8 +980,7 @@ def handle_command(chat_id, user_id, cmd, is_private, text=""):
     return False
 
 
-# BOT_USERNAME comes from config (BOT_USERNAME env, defaults to the bot's
-# handle); commands like /poll@otherbot are ignored via parse_command.
+BOT_USERNAME = "ronrebootedbot"
 
 
 POLL_USAGE = (
@@ -753,7 +1105,8 @@ def draft_update(chat_id, draft_id, text):
     return False, backoff
 
 
-def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None):
+def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
+                      business_connection_id=None):
     """Trailer parsing + styled buttons + rich send with safe fallbacks."""
     clean, kb = parse_trailers(reply)
     if not clean:
@@ -764,13 +1117,70 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None):
                 if "callback_data" in b:
                     b["style"] = "primary"
     try:
-        send_rich(chat_id, clean, kb, reply_to, thread_id)
+        send_rich(chat_id, clean, kb, reply_to, thread_id,
+                  business_connection_id)
     except Exception as e:
         print(f"[ron_daemon] send failed: {e}", flush=True)
         try:
-            send(chat_id, strip_markdown(clean), reply_to, thread_id)
+            send(chat_id, strip_markdown(clean), reply_to, thread_id,
+                 business_connection_id)
         except Exception:
             pass
+
+
+# Token economy (2026-09-20, Phase 2): pure acknowledgments never reach the
+# AI at all — a canned reply costs zero API budget. Only fires when the
+# WHOLE message is an ack (after stripping trailing punctuation); anything
+# with real content still goes to the model. Variants rotate per chat so it
+# doesn't feel robotic.
+_CANNED_REPLIES = {
+    "ok": ["Got it 👍", "Noted 👌", "Alright 👍"],
+    "okay": ["Got it 👍", "Noted 👌", "Alright 👍"],
+    "okk": ["Got it 👍", "Haha, noted 👌"],
+    "k": ["👍", "Got it 👌"],
+    "kk": ["👍", "Got it 👌"],
+    "lol": ["😄", "Haha 😄"],
+    "lmao": ["😂", "Haha 😂"],
+    "haha": ["😄", "Hehe 😄"],
+    "hehe": ["😄", "Hehe 😄"],
+    "nice": ["Nice 🙂", "Cool 😎"],
+    "cool": ["Cool 😎", "Nice 🙂"],
+    "thanks": ["Anytime 🙂", "You got it 👍"],
+    "thank you": ["Anytime 🙂", "You got it 👍"],
+    "thx": ["Anytime 🙂", "👍"],
+    "ty": ["Anytime 🙂", "👍"],
+    "bye": ["Later! 👋", "See ya 👋"],
+    "good night": ["Good night 🌙", "Sleep well 🌙"],
+    "gn": ["Good night 🌙", "🌙"],
+    "good morning": ["Morning! ☀️", "Good morning ☀️"],
+    "gm": ["Morning! ☀️", "☀️"],
+}
+_CANNED_PUNCT_RE = None  # compiled lazily (re imported at module top)
+
+
+def canned_reply(text, chat_id):
+    """Return a canned ack for pure-ack messages, else None.
+
+    Zero API cost. Conservative by design: only single acks or pure-emoji
+    messages, never anything that could be a real question.
+    """
+    global _CANNED_PUNCT_RE
+    import re as _re
+    if _CANNED_PUNCT_RE is None:
+        _CANNED_PUNCT_RE = _re.compile(r"[!.,?~…]*$")
+    t = (text or "").strip()
+    if not t or len(t) > 24:
+        return None
+    # Pure emoji (no letters/digits at all)?
+    if not _re.search(r"[A-Za-z0-9\u00c0-\u024f\u1e00-\u1eff]", t):
+        variants = ["👍", "🙂👍", "Gotcha 👍"]
+        return variants[abs(hash((str(chat_id), t))) % len(variants)]
+    norm = _CANNED_PUNCT_RE.sub("", t.lower()).strip()
+    norm = _re.sub(r"\s+", " ", norm)
+    variants = _CANNED_REPLIES.get(norm)
+    if not variants:
+        return None
+    return variants[abs(hash((str(chat_id), norm))) % len(variants)]
 
 
 def stream_ai_reply(chat_id, user_id, user_name, text):
@@ -830,11 +1240,19 @@ def stream_ai_reply(chat_id, user_id, user_name, text):
 
 
 def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
-           thread_id=None):
+           thread_id=None, business_connection_id=None):
     """Run the LLM call off the poll loop so updates keep flowing."""
     def _go():
         cur = threading.current_thread()
         try:
+            # Phase 3 degraded mode: every provider is down — don't burn
+            # API calls, queue the message and be honest about it.
+            if _brain_down():
+                _queue_message(chat_id, user_id, user_name, text, reply_to,
+                               thread_id, business_connection_id, private)
+                _maybe_degraded_notice(chat_id, reply_to, thread_id,
+                                       business_connection_id)
+                return
             try:
                 extra = group_context()
                 if thread_id and not private:
@@ -842,29 +1260,62 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                     if tname:
                         extra += (f"\nYou are replying inside the '{tname}' topic. "
                                   "When the user says 'this topic', they mean it.")
-                if private:
+                # Business account reply: no draft streaming — drafts are a
+                # preview in the bot's own chats, but this reply must go out
+                # on the business account as one final message.
+                if private and not business_connection_id:
                     try:
                         stream_ai_reply(chat_id, user_id, user_name, text)
+                        _record_brain_success()
                         return
                     except Exception as e:
+                        emsg = str(e)
+                        # Token economy (2026-09-20): the stream attempt
+                        # already ran the FULL failover chain inside
+                        # ron_ai._request — every provider tried. A
+                        # single-send retry would just burn a second full
+                        # pass for the same dead end, so skip it and go
+                        # straight to the honest public message. (Transient
+                        # mid-stream blips still fall through to chat().)
+                        if "rate limited" in emsg or "not connected yet" in emsg:
+                            _record_brain_failure(emsg)
+                            print(f"[ron_daemon] stream exhausted all providers "
+                                  f"({emsg[:60]}), skipping single-send retry",
+                                  flush=True)
+                            if "not connected yet" in emsg:
+                                reply = ("My AI brain isn't plugged in yet \u2014 "
+                                         "the human's hooking up the API key, one sec. \U0001F527")
+                            else:
+                                reply = ("Whoa, too many requests at once \u2014 "
+                                         "give it a minute and try again. \u23F3")
+                            send_rich_with_kb(chat_id, reply, reply_to,
+                                              thread_id,
+                                              business_connection_id)
+                            return
+                        if _is_systemic(emsg):
+                            _record_brain_failure(emsg)
                         print(f"[ron_daemon] stream failed, single-send fallback: {e}",
                               flush=True)
-                # non-streaming path (groups): show typing while generating
-                send_typing(chat_id)
+                # non-streaming path (groups, business): show typing while generating
+                send_typing(chat_id, business_connection_id)
                 reply = ron_ai.chat(chat_id, text, user_name,
                                     system_extra=extra)
+                _record_brain_success()
             except Exception as e:
                 msg = str(e)
+                if _is_systemic(msg):
+                    _record_brain_failure(msg)
                 if "not connected yet" in msg:
                     reply = ("My AI brain isn't plugged in yet \u2014 "
                              "the human's hooking up the API key, one sec. \U0001F527")
                 elif "rate limited" in msg:
-                    reply = ("Groq's rate-limiting me right now \u2014 "
+                    reply = ("Whoa, too many requests at once \u2014 "
                              "give it a minute and try again. \u23F3")
                 else:
                     reply = "Brain glitch, try that again in a bit. \U0001F9E0"
                     print(f"[ron_daemon] ai error: {e}", flush=True)
-            send_rich_with_kb(chat_id, reply, reply_to, thread_id)
+            send_rich_with_kb(chat_id, reply, reply_to, thread_id,
+                              business_connection_id)
             handle_group_sends(chat_id, user_id, user_name, reply)
             handle_send_topic(chat_id, user_id, user_name, reply)
             handle_topic_actions(chat_id, user_name, reply,
@@ -971,6 +1422,12 @@ def handle_update(upd):
         return
 
     if is_private:
+        canned = canned_reply(text, chat_id)
+        if canned is not None:
+            # Zero-cost ack: no API call, still saved to history for context.
+            ron_ai._save_turn(chat_id, text, user_name, canned)
+            send_rich_with_kb(chat_id, canned)
+            return
         ai_reply(chat_id, user_id, user_name, text)
         return
 
@@ -985,6 +1442,14 @@ def handle_update(upd):
     if mentioned or replied_to_me:
         clean = text.replace("@" + BOT_USERNAME, "").strip()
         # Thread the reply so it's clear who Ron is answering.
+        canned = canned_reply(clean or text, chat_id)
+        if canned is not None:
+            # Zero-cost ack: no API call, still saved to history for context.
+            ron_ai._save_turn(chat_id, clean or text, user_name, canned)
+            send_rich_with_kb(chat_id, canned,
+                              reply_to=msg.get("message_id"),
+                              thread_id=msg.get("message_thread_id"))
+            return
         ai_reply(chat_id, user_id, user_name, clean or text, private=False,
                  reply_to=msg.get("message_id"),
                  thread_id=msg.get("message_thread_id"))
@@ -1075,11 +1540,20 @@ def save_offset(offset):
 def main():
     offset = load_offset()
     print(f"[ron_daemon] starting, offset={offset}", flush=True)
+    # Phase 3: heartbeat for the watchdog, startup provider health ping,
+    # and the degraded-mode recovery worker.
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    threading.Thread(target=_health_ping, daemon=True).start()
+    threading.Thread(target=_recovery_loop, daemon=True).start()
     while not _SHUTDOWN.is_set():
         try:
             r = api("getUpdates", {"offset": offset, "timeout": 50,
                                    "allowed_updates": ["message", "callback_query",
-                                                       "stopped_message_generation"]}, timeout=65)
+                                                       "stopped_message_generation",
+                                                       "business_connection",
+                                                       "business_message",
+                                                       "edited_business_message",
+                                                       "deleted_business_messages"]}, timeout=65)
             if not r.get("ok"):
                 print(f"[ron_daemon] getUpdates not ok: {str(r)[:150]}",
                       flush=True)
@@ -1090,6 +1564,22 @@ def main():
                 try:
                     if "callback_query" in upd:
                         handle_callback(upd["callback_query"])
+                    elif "business_connection" in upd:
+                        handle_business_connection(upd["business_connection"])
+                    elif "business_message" in upd:
+                        handle_business_message(upd["business_message"])
+                    elif "edited_business_message" in upd:
+                        # Edits in business chats: nothing to redo — log only.
+                        ebm = upd["edited_business_message"] or {}
+                        print(f"[ron_daemon] edited business message ignored "
+                              f"(conn={ebm.get('business_connection_id')})",
+                              flush=True)
+                    elif "deleted_business_messages" in upd:
+                        dbm = upd["deleted_business_messages"] or {}
+                        print(f"[ron_daemon] deleted business messages ignored "
+                              f"(conn={dbm.get('business_connection_id')}, "
+                              f"n={len(dbm.get('message_ids') or [])})",
+                              flush=True)
                     elif "stopped_message_generation" in upd:
                         # 10.3 native Stop button: halt the in-flight stream
                         smg = upd["stopped_message_generation"] or {}

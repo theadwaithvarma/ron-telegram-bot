@@ -1,0 +1,38 @@
+# Example systemd unit for the Ron Telegram bot watchdog.
+#
+#   1. Copy this file to /etc/systemd/system/ron-watchdog.service
+#   2. Edit the User=, WorkingDirectory=, and path placeholders below
+#   3. Copy .env.example to .env next to the bot and fill it in
+#   4. systemctl daemon-reload && systemctl enable --now ron-watchdog
+#
+# The watchdog runs `ron_watchdog.py --loop`, which checks the daemon every
+# 60 seconds (dead process, stale heartbeat, duplicate daemons, broken
+# ron_ai.json) and restarts it with exponential backoff (60s -> 5min ->
+# 15min -> 1h). No code changes are needed to tune the loop — the 60s
+# interval lives in ron_watchdog.py (CHECK_SECS). The unit itself just
+# keeps the watchdog alive; the watchdog keeps the daemon alive.
+[Unit]
+Description=Ron Telegram bot watchdog (supervises ron_daemon.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The user the bot runs as:
+User=YOUR_USER
+# Install dir, e.g. /opt/ron-telegram-bot (suggested):
+WorkingDirectory=/opt/ron-telegram-bot
+# The daemon reads its config from the environment; point at your .env so
+# BOT_TOKEN / GROQ_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY are set:
+EnvironmentFile=/opt/ron-telegram-bot/.env
+# If the watchdog script lives somewhere other than the bot dir:
+# Environment=RON_BOT_DIR=/opt/ron-telegram-bot
+# If this host needs an egress proxy for api.telegram.org and the AI
+# providers, add the proxy variables here, e.g.:
+# Environment=https_proxy=http://proxy-host:3128
+ExecStart=/usr/bin/python3 /opt/ron-telegram-bot/ron_watchdog.py --loop
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

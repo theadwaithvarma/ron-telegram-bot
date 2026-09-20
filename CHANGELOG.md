@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.1.0 — 2026-09-20
+
+Self-sufficiency release: the multi-provider brain, token economy, and
+self-healing supervision that landed on the live bot after 1.0.1.
+
+- **Multi-provider AI brain** (`ron_ai.py`) — failover chain Groq
+  (`openai/gpt-oss-120b` → `openai/gpt-oss-20b`) → Gemini
+  (`gemini-3.8-flash` → `gemini-flash-lite-latest`) → OpenRouter
+  (`nex-agi/nex-n2.5-pro:free` → `nvidia/nemotron-3.5-lightning:free`),
+  tunable via `ron_ai.json`. Per-provider 429 cooldowns, 401/403 skips the
+  rest of that provider, model-not-found skips just that model. Providers
+  without a key are skipped silently — the bot runs fine on Groq alone.
+  Errors stay provider-neutral; only the owner (if `OWNER_ID` is set) gets
+  a private heads-up about a dead key
+- **Token economy (Phase 2)** — a failed stream after full chain exhaustion
+  goes straight to the honest error instead of re-running the whole chain;
+  greetings and small talk try each provider's smallest model first with a
+  short prompt; pure acknowledgements (`ok`, `lol`, `thanks`, `👍`, `gn`)
+  get canned replies with zero API calls (still logged to history)
+- **Watchdog supervisor** (`ron_watchdog.py`, new) — 60-second checks for
+  dead/hung daemons (stale heartbeat), duplicate processes, and invalid
+  `ron_ai.json`; exponential restart backoff (60s → 5min → 15min → 1h);
+  broken configs are quarantined and the last-known-good copy restored.
+  Ships with `ron-watchdog.service.example` for systemd
+- **Degraded mode** — after 5 systemic AI failures in 10 minutes the bot
+  stops burning API calls, tells users honestly their message is queued,
+  persists the queue to `degraded_queue.jsonl`, and replays it on recovery
+  without duplicates; canned acknowledgements keep working throughout
+- **Business / Secretary Mode** — handles `business_connection` and
+  `business_message` updates: replies go to the customer through the
+  owner's business account as one rich message (no draft streaming there)
+- Release packaging: `GEMINI_API_KEY` / `OPENROUTER_API_KEY` added to
+  `config.py` and `.env.example`; `ron_ai.json` ships the default model
+  chain; all runtime state files are git-ignored
+
 ## 1.0.1 — 2026-09-20
 
 Runtime sync: three batches that landed on the live bot after 1.0.0.

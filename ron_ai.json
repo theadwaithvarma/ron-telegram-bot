@@ -1,0 +1,26 @@
+{
+  "model": "openai/gpt-oss-120b",
+  "providers": [
+    {
+      "models": [
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b"
+      ],
+      "name": "groq"
+    },
+    {
+      "models": [
+        "gemini-3.8-flash",
+        "gemini-flash-lite-latest"
+      ],
+      "name": "gemini"
+    },
+    {
+      "models": [
+        "nex-agi/nex-n2.5-pro:free",
+        "nvidia/nemotron-3.5-lightning:free"
+      ],
+      "name": "openrouter"
+    }
+  ]
+}

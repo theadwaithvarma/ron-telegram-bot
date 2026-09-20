@@ -7,5 +7,11 @@ history.jsonl
 known_groups.json
 known_topics.json
 state.json
+ron_heartbeat.json
+degraded_queue.jsonl
+ron_watchdog.json
+ron_watchdog.log
+ron_ai.json.good
+business_connections.json
 *.log
 .venv/

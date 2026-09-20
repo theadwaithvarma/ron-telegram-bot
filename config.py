@@ -70,6 +70,8 @@ GROQ_API_KEY = _required("GROQ_API_KEY")  # console.groq.com
 # --- Optional -------------------------------------------------------------
 GROQ_MODEL = _optional("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL = _optional("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GEMINI_API_KEY = _optional("GEMINI_API_KEY")          # optional: provider skipped when unset
+OPENROUTER_API_KEY = _optional("OPENROUTER_API_KEY")  # optional: provider skipped when unset
 BOT_USERNAME = _optional("BOT_USERNAME", "ronrebootedbot")
 OWNER_ID = _optional_int("OWNER_ID")      # reserved for owner-only features
 SYSTEM_PROMPT = _optional("SYSTEM_PROMPT")
