@@ -369,11 +369,19 @@ class TestPhotoHook(unittest.TestCase):
 class SyncThread:
     """threading.Thread stand-in that runs the target inline, so worker
     logic can be tested deterministically without sleeps."""
-    def __init__(self, target=None, daemon=None):
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
         self._target = target
+        self._args = args or ()
+        self._kwargs = kwargs or {}
 
     def start(self):
-        self._target()
+        self._target(*self._args, **self._kwargs)
+
+    def join(self, timeout=None):
+        pass  # ran inline in start()
+
+    def is_alive(self):
+        return False
 
 
 class TestVisionWorker(unittest.TestCase):

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.8.5 — 2026-09-21
+
+More speed: the typing indicator + "Thinking…" draft were sent
+serially *before* the AI call started — ~0.4s of pure Telegram
+round-trips blocking the thing that actually takes time.
+
+- New `typing_kickoff()` helper: fires `sendChatAction("typing")` in a
+  background thread while the AI request starts immediately. Applied to
+  all three reply paths — DM draft streaming (typing + empty draft now
+  overlap the AI call), group/business text replies, and group vision
+  replies. The kickoff is joined (10s timeout) after generation so the
+  final send never races the draft setup.
+- Test doubles updated: the `SyncThread` stand-ins in the vision/imagen
+  tests now accept `args=`/`kwargs=` and provide `join()`/`is_alive()`,
+  matching the real `threading.Thread` signature.
+- 3 new kickoff tests (AI starts while typing is in flight, draft-before-
+  final ordering). 289/289 green.
+
 ## 1.8.4 — 2026-09-21
 
 Speed fix: every Telegram API call was opening a brand-new HTTPS

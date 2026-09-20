@@ -879,6 +879,19 @@ def send_typing(chat_id, business_connection_id=None):
         pass
 
 
+def typing_kickoff(chat_id, business_connection_id=None):
+    """Show 'typing…' without blocking the AI call.
+
+    The indicator is pure UX — the AI request is the long pole, so it
+    starts immediately while Telegram catches up in the background.
+    Returns the thread; join it (with a timeout) after the AI finishes
+    so reply ordering stays deterministic."""
+    t = threading.Thread(target=send_typing,
+                         args=(chat_id, business_connection_id), daemon=True)
+    t.start()
+    return t
+
+
 BTN_RE = re.compile(r"^\[buttons:\s*(.+?)\s*\]\s*$", re.M | re.I)
 LINK_RE = re.compile(r"^\[links:\s*(.+?)\s*\]\s*$", re.M | re.I)
 # trailers the model tacks onto the end of a sentence instead of their own line
@@ -1982,9 +1995,15 @@ def _stream_with_draft(chat_id, produce):
     last_push = [0.0]
     last_push_len = [0]
     next_push_ok = [0.0]  # 429 backoff deadline
-    send_typing(chat_id)
-    # empty text = native "Thinking…" placeholder, shown immediately
-    draft_update(chat_id, draft_id, "")
+    # Telegram-side signals go off in the background: the AI call below
+    # (the long pole) starts immediately instead of waiting ~0.4s for
+    # the typing indicator + empty draft to round-trip first.
+    def _kickoff():
+        send_typing(chat_id)
+        # empty text = native "Thinking…" placeholder, shown immediately
+        draft_update(chat_id, draft_id, "")
+    kickoff = threading.Thread(target=_kickoff, daemon=True)
+    kickoff.start()
 
     def on_token(tok):
         buf.append(tok)
@@ -2007,6 +2026,9 @@ def _stream_with_draft(chat_id, produce):
     try:
         reply = produce(on_token, stop_event)
     finally:
+        # Never leave the kickoff thread dangling: the final send below
+        # must not race the "Thinking…" draft it was setting up.
+        kickoff.join(timeout=10)
         # Only clear our own slot — a newer concurrent stream in this chat
         # may have registered its event after us.
         if STOP_EVENTS.get(chat_id) is stop_event:
@@ -2191,11 +2213,13 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                             _record_brain_failure(emsg)
                         print(f"[ron_daemon] stream failed, single-send fallback: {e}",
                               flush=True)
-                # non-streaming path (groups, business): show typing while generating
-                send_typing(chat_id, business_connection_id)
+                # non-streaming path (groups, business): typing fires in the
+                # background while the AI call starts immediately.
+                _kt = typing_kickoff(chat_id, business_connection_id)
                 reply = ron_ai.chat(chat_id, text, user_name,
                                     system_extra=extra, user_id=user_id,
                                     is_private=private)
+                _kt.join(timeout=10)
                 _record_brain_success()
                 # Phase 6: cache the successful reply (before the
                 # light-mode footer, which is per-user/per-day).
@@ -2273,8 +2297,11 @@ def ai_vision_reply(chat_id, user_id, user_name, caption, file_id,
                                         caption, image_b64)
                 else:
                     # groups / business / light mode: single send.
-                    send_typing(chat_id, business_connection_id)
-                    reply = ron_ai.vision_stream(image_b64, caption)
+                    _kt = typing_kickoff(chat_id, business_connection_id)
+                    try:
+                        reply = ron_ai.vision_stream(image_b64, caption)
+                    finally:
+                        _kt.join(timeout=10)
                     try:
                         ron_ai._save_turn(
                             chat_id, ("[photo] " + (caption or "")).strip(),

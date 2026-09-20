@@ -47,11 +47,19 @@ def _mk_limits_file(test):
 
 class SyncThread:
     """threading.Thread stand-in that runs the target inline."""
-    def __init__(self, target=None, daemon=None):
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
         self._target = target
+        self._args = args or ()
+        self._kwargs = kwargs or {}
 
     def start(self):
-        self._target()
+        self._target(*self._args, **self._kwargs)
+
+    def join(self, timeout=None):
+        pass  # ran inline in start()
+
+    def is_alive(self):
+        return False
 
 
 class TestImagenLimits(unittest.TestCase):
