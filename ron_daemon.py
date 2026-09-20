@@ -46,6 +46,29 @@ OFFSET_FILE = os.path.join(HOME, "workspace", "telegram-bot", "ron_daemon.offset
 OWNER_ID = 6819786239  # Adwaith — bot owner (no longer a reply gate)
 PLAYGROUND = "-1003920795086"
 
+# Maintenance mode: /shutdown (owner only) makes the bot go quiet for
+# everyone except the owner; /start (owner) brings it back. Persisted to
+# disk so it survives daemon restarts.
+MAINT_FILE = os.path.join(HOME, "workspace", "telegram-bot",
+                           "ron_maintenance.json")
+
+
+def maintenance_on():
+    """True when the bot is in owner-only maintenance mode."""
+    try:
+        with open(MAINT_FILE) as f:
+            return bool(json.load(f).get("maintenance"))
+    except (OSError, ValueError):
+        return False
+
+
+def set_maintenance(on, by):
+    """Persist maintenance mode. Atomic write like the other state files."""
+    tmp = MAINT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"maintenance": bool(on), "by": by, "ts": time.time()}, f)
+    os.replace(tmp, MAINT_FILE)
+
 _entry = dynamic_credential_entry("custom.telegram")
 _SURROGATE = str(_entry["surrogate"]).strip()
 BASE = f"https://api.telegram.org/bot{_SURROGATE}"
@@ -1067,6 +1090,9 @@ def handle_business_message(msg):
     # Skip the business owner's own messages and any bot's echoes.
     if sender and (sender == conn.get("user_id") or frm.get("is_bot")):
         return
+    # Maintenance mode covers business chats too — customers wait quietly.
+    if maintenance_on():
+        return
     ai_reply(chat_id, sender, frm.get("first_name", "there"), text,
              private=True, reply_to=msg.get("message_id"),
              business_connection_id=conn_id)
@@ -1449,6 +1475,26 @@ def parse_command(text):
 
 def handle_command(chat_id, user_id, cmd, is_private, text="",
                    user_name="there"):
+    if cmd == "shutdown":
+        # Owner-only maintenance mode: the bot goes quiet for everyone
+        # except the owner. /start (owner) wakes it back up.
+        if user_id != OWNER_ID:
+            send(chat_id, "Only Adwaith can shut me down.")
+            return True
+        set_maintenance(True, user_id)
+        send(chat_id, "Maintenance mode on \U0001F6CC — quiet for everyone "
+                      "but you. Send /start to wake me back up.")
+        return True
+    if cmd == "start":
+        if maintenance_on():
+            if user_id != OWNER_ID:
+                send(chat_id, "Ron is taking a break \U0001F6CC — back soon.")
+                return True
+            set_maintenance(False, user_id)
+            send(chat_id, "Back online \u2014 everyone can talk to me again.")
+            return True
+        # Normally /start stays conversational (not a scripted greeting).
+        return False
     if cmd == "ping":
         send(chat_id, "\U0001F3D3 pong \u2014 alive and polling.")
         return True
@@ -2102,6 +2148,11 @@ def handle_update(upd):
     is_private = chat.get("type") == "private"
 
     cmd = parse_command(text)
+    # Maintenance mode: everyone except the owner is ignored (silently —
+    # no AI calls, no replies). /start still reaches handle_command so
+    # non-owners get the "taking a break" notice and the owner can wake up.
+    if maintenance_on() and user_id != OWNER_ID and cmd != "start":
+        return
     if cmd and handle_command(chat_id, user_id, cmd, is_private, text,
                                user_name):
         return

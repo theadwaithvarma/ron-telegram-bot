@@ -63,6 +63,8 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 | `/pollm` | Multi-answer poll — `/pollm Q? \| A \| B \| C` |
 | `/quiz` | Quiz mode — `/quiz Q? \| *Correct \| Wrong \| Wrong` |
 | `/health` | Compact status card — uptime, AI chain, memory, cache, backup, restarts |
+| `/shutdown` | Owner only — maintenance mode: bot goes quiet for everyone but Adwaith |
+| `/start` | Owner only during maintenance — wakes the bot back up for everyone |
 
 ### 🛠️ Group Power Tools
 - **DM-to-group pings** — `[send_group: Group Name | message]` posts your message in a group, mentioning you (fuzzy group-name resolution)

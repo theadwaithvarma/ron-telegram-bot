@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.6.0 — 2026-09-20
+
+Owner-only maintenance mode: Adwaith can now quiet the bot for everyone
+but himself without touching the server.
+
+- **`/shutdown`** (owner only) — flips the bot into maintenance mode:
+  every DM, group message and business-chat message from anyone else is
+  silently ignored (no replies, no AI calls burned). The owner's own
+  chats keep working normally.
+- **`/start`** — during maintenance, the owner wakes the bot back up for
+  everyone; anyone else just gets a short "taking a break" notice.
+  Outside maintenance `/start` still flows to the conversational AI
+  (no scripted greeting), as before.
+- The flag persists in `ron_maintenance.json`, so it survives daemon
+  restarts; 10 new tests cover the flag, both commands and the update
+  gate (159/159 green).
+
 ## 1.5.1 — 2026-09-20
 
 Reboot-survival fix, learned the hard way: a host reboot wiped the
