@@ -90,12 +90,18 @@ class TestMarkdownToBlocks(unittest.TestCase):
     def test_quote(self):
         blks = markdown_to_blocks("> quoted\n> lines")
         self.assertEqual(blks[0]["type"], "blockquote")
+        # Live-verified shape: nested blocks, not "text".
+        self.assertEqual(blks[0]["blocks"][0]["type"], "paragraph")
+        self.assertIn("quoted", blks[0]["blocks"][0]["text"])
 
     def test_bullet_list(self):
         blks = markdown_to_blocks("- a\n- b")
         self.assertEqual(blks[0]["type"], "list")
         self.assertFalse(blks[0]["ordered"])
         self.assertEqual(len(blks[0]["items"]), 2)
+        # Live-verified shape: items are {"blocks": [...]}, not {"text"}.
+        self.assertEqual(blks[0]["items"][0]["blocks"][0]["type"],
+                         "paragraph")
 
     def test_ordered_list(self):
         blks = markdown_to_blocks("1. a\n2. b")
@@ -112,12 +118,21 @@ class TestMarkdownToBlocks(unittest.TestCase):
         self.assertEqual([b["type"] for b in blks],
                          ["paragraph", "divider", "paragraph"])
 
-    def test_table_degrades_to_pre(self):
+    def test_table_becomes_real_table_block(self):
+        # Live-verified 2026-09-21: tables are real table blocks with a
+        # "cells" field (the old monospace-pre degradation is gone).
         md = "| A | B |\n|---|---|\n| 1 | 2 |"
         blks = markdown_to_blocks(md)
-        self.assertEqual(blks[0]["type"], "pre")
-        self.assertIn("A", blks[0]["text"])
-        self.assertIn("1", blks[0]["text"])
+        self.assertEqual(blks[0]["type"], "table")
+        cells = blks[0]["cells"]
+        self.assertEqual([c["text"] for c in cells[0]], ["A", "B"])
+        self.assertEqual([c["text"] for c in cells[1]], ["1", "2"])
+
+    def test_table_cell_inline_formatting_parsed(self):
+        blks = markdown_to_blocks("| **a** | ||x|| |")
+        cells = blks[0]["cells"]
+        self.assertEqual(cells[0][0]["text"]["type"], "bold")
+        self.assertEqual(cells[0][1]["text"]["type"], "spoiler")
 
     def test_spoiler_line_not_table(self):
         # "||x||" starts+ends with "|" but is a spoiler, not a table.
@@ -134,6 +149,46 @@ class TestMarkdownToBlocks(unittest.TestCase):
     def test_never_empty(self):
         self.assertTrue(markdown_to_blocks(""))
         self.assertTrue(markdown_to_blocks("\n\n"))
+
+
+class TestFenceAndNestingFixes(unittest.TestCase):
+    """v1.15.0 live-shape regressions: asymmetric inline nesting, c++/c#
+    fences, and empty/unclosed fences never emit an empty pre block
+    (Telegram rejects those with RICH_MESSAGE_CONTENT_REQUIRED)."""
+
+    def test_italic_containing_bold(self):
+        node = parse_inline("*a **b** c*")
+        self.assertEqual(node["type"], "italic")
+        kinds = [n if isinstance(n, str) else n.get("type")
+                 for n in node["text"]]
+        self.assertIn("bold", kinds)
+
+    def test_fence_cplusplus_language(self):
+        blocks = markdown_to_blocks("```c++\nint x;\n```")
+        self.assertEqual(blocks[0]["type"], "pre")
+        self.assertEqual(blocks[0]["text"], "int x;")
+        self.assertEqual(blocks[0]["language"], "c++")
+
+    def test_fence_csharp_language(self):
+        blocks = markdown_to_blocks("```c#\nvar x;\n```")
+        self.assertEqual(blocks[0]["type"], "pre")
+        self.assertEqual(blocks[0]["language"], "c#")
+
+    def test_closed_empty_fence_emits_no_empty_pre(self):
+        blocks = markdown_to_blocks("```\n```")
+        self.assertFalse(
+            [b for b in blocks
+             if b.get("type") == "pre" and not (b.get("text") or "").strip()])
+
+    def test_unclosed_empty_fence_becomes_paragraph(self):
+        blocks = markdown_to_blocks("```")
+        self.assertEqual(blocks[0]["type"], "paragraph")
+
+    def test_unclosed_fence_with_content_becomes_pre(self):
+        blocks = markdown_to_blocks("```python\nx = 1")
+        pres = [b for b in blocks if b.get("type") == "pre"]
+        self.assertEqual(len(pres), 1)
+        self.assertEqual(pres[0]["text"], "x = 1")
 
 
 if __name__ == "__main__":

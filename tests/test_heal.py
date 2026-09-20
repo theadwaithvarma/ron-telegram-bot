@@ -36,8 +36,29 @@ def _load_repo_module(name):
     return mod
 
 
-ron_daemon = _load_repo_module("ron_daemon")
-rich_send = _load_repo_module("rich_send")
+ron_daemon = None  # replaced below by the bootstrap
+
+
+def _bootstrap_repo_modules():
+    """Register the REPO copies of the daemon and its dependencies in
+    sys.modules BEFORE the daemon itself is loaded.
+
+    ron_daemon.py puts the live deploy dir first on sys.path (its
+    line-27 tweak), so whichever test module imports the daemon first
+    would otherwise cache the DEPLOYED ron_owner/ron_richblocks/... in
+    sys.modules and poison every test file that runs later in the same
+    process (python -m unittest discover). Registering the repo copies
+    first makes the daemon's own `import ron_owner` etc. hit the cache,
+    so the whole suite exercises repo code, not deployed code.
+    """
+    for _dep in ("http_pool", "ron_ai", "rich_send", "ron_cache",
+                 "ron_health", "ron_richblocks", "ron_richvalidate",
+                 "ron_vision", "ron_imagen", "ron_privacy", "ron_owner"):
+        _load_repo_module(_dep)
+    return _load_repo_module("ron_daemon")
+
+
+ron_daemon = _bootstrap_repo_modules()
 
 
 class ScriptedAPI:
@@ -276,3 +297,231 @@ class HealChainTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _PatchedTransports(unittest.TestCase):
+    """Same transport fixture as HealChainTest, without inheriting its
+    test methods (avoids double-running them in subclasses)."""
+
+    def setUp(self):
+        self._orig_api = ron_daemon.api
+        self._rich_mod = ron_daemon.rich_mod
+        self._orig_json = self._rich_mod.api_json
+
+    def tearDown(self):
+        ron_daemon.api = self._orig_api
+        self._rich_mod.api_json = self._orig_json
+
+    def _patch(self, results, json_results=None):
+        mock = ScriptedAPI(results)
+        ron_daemon.api = mock
+        jmock = ScriptedAPI(json_results if json_results is not None
+                            else results)
+        self._rich_mod.api_json = jmock
+        return mock, jmock
+
+
+class RichKeyboardHealTest(_PatchedTransports):
+    """v1.15.0: every RICH_MESSAGE_* failure heals as a parse error; a
+    keyboard failure (BUTTON_DATA_INVALID, bad button rows) drops the
+    keyboard and retries text-only — stripping formatting can never fix
+    a bad keyboard (audit D.7)."""
+
+    def test_rich_message_errors_classify_as_parse(self):
+        for err in ("Bad Request: RICH_MESSAGE_CONTENT_REQUIRED",
+                    "Bad Request: RICH_MESSAGE_BUTTONS_TOO_MANY",
+                    "Bad Request: RICH_MESSAGE_INVALID"):
+            self.assertEqual(ron_daemon._heal_kind(err), "parse", err)
+
+    def test_button_errors_classify_as_keyboard(self):
+        for err in ("Bad Request: BUTTON_DATA_INVALID",
+                    "Bad Request: button row is empty"):
+            self.assertEqual(ron_daemon._heal_kind(err), "keyboard", err)
+
+    def test_keyboard_error_drops_keyboard_retries_text_only(self):
+        mock, _ = self._patch([
+            _fail("HTTP 400: Bad Request: BUTTON_DATA_INVALID"),
+            _OK,
+        ])
+        kb = {"inline_keyboard":
+              [[{"text": "Tap", "callback_data": "q:Tap"}]]}
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = ron_daemon.send_healed(
+                "sendMessage",
+                {"chat_id": 1, "text": "*hi*", "parse_mode": "Markdown",
+                 "reply_markup": kb})
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(len(mock.calls), 2)
+        method2, params2 = mock.calls[1]
+        self.assertEqual(method2, "sendMessage")
+        self.assertNotIn("reply_markup", params2)  # keyboard dropped
+        self.assertEqual(params2["text"], "*hi*")  # text/formatting kept
+        self.assertEqual(params2["parse_mode"], "Markdown")
+
+    def test_buttons_too_many_drops_rich_to_plain(self):
+        _, jmock = self._patch([], json_results=[
+            _fail("Bad Request: RICH_MESSAGE_BUTTONS_TOO_MANY"),
+            _OK,
+        ])
+        blocks = [{"type": "paragraph", "text": "hello"}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = ron_daemon.send_blocks(1, blocks)
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(len(jmock.calls), 2)
+        self.assertEqual(jmock.calls[0][0], "sendRichMessage")
+        method2, params2 = jmock.calls[1]
+        self.assertEqual(method2, "sendMessage")
+        self.assertNotIn("rich_message", params2)
+        self.assertEqual(params2["text"], "hello")
+
+    def test_classic_keyboard_carries_no_style(self):
+        # Blocks path fails -> classic markdown + under-bubble keyboard.
+        # InlineKeyboardButton has no "style" field (it belongs to
+        # in-bubble RichMessageButton only) — the fallback must not add it.
+        import json as _json
+        mock, jmock = self._patch([_OK],
+                                  json_results=[_fail("Bad Request: "
+                                                      "RICH_MESSAGE_CONTENT_REQUIRED")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            ron_daemon.send_rich_with_kb(1, "Pick one\n[buttons: A | B]")
+        kbs = []
+        for m, p in (mock.calls + jmock.calls):
+            rm = p.get("reply_markup")
+            if rm is None:
+                continue
+            kbs.append(_json.loads(rm) if isinstance(rm, str) else rm)
+        self.assertTrue(kbs, "expected a classic keyboard fallback send")
+        for kb in kbs:
+            for row in kb["inline_keyboard"]:
+                for b in row:
+                    self.assertNotIn("style", b)
+
+
+class RichValidatorWiringTest(_PatchedTransports):
+    """v1.15.0: an invalid rich payload logs LOUDLY, never touches the
+    rich transport, and the user still gets a plain-text fallback."""
+
+    def test_invalid_blocks_logged_loudly_and_transport_skipped(self):
+        bad = [{"type": "table", "rows": [[{"text": "x"}]]}]  # wrong field
+        sent = []
+        orig_send = ron_daemon.send
+        ron_daemon.send = lambda *a, **k: sent.append(
+            a[1] if len(a) > 1 else "") or {"ok": True}
+        try:
+            _, jmock = self._patch([_OK])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ron_daemon.send_blocks(1, bad)
+            log = buf.getvalue()
+        finally:
+            ron_daemon.send = orig_send
+        self.assertEqual(jmock.calls, [],
+                         "rich transport must not be called")
+        self.assertIn("RICH VALIDATION FAILED", log)
+        self.assertIn("table", log)
+        self.assertTrue(sent, "user still gets a plain-text fallback")
+
+    def test_markdown_plus_blocks_rejected(self):
+        payload = {"chat_id": 1,
+                   "rich_message": {"markdown": "x", "blocks": []}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            v = ron_daemon._rich_violations(payload, "sendRichMessage")
+        self.assertTrue(v)
+        self.assertTrue(any("exactly one of" in x for x in v))
+
+    def test_warnings_only_do_not_trigger_fallback(self):
+        inner = {"type": "bold", "text": "x"}
+        for _ in range(20):  # nesting deeper than the validator ceiling
+            inner = {"type": "bold", "text": [inner]}
+        payload = {"chat_id": 1, "rich_message": {"blocks": [
+            {"type": "paragraph", "text": inner}]}}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            v = ron_daemon._rich_violations(payload, "sendRichMessage")
+        self.assertEqual(v, [])
+        self.assertNotIn("RICH VALIDATION FAILED", buf.getvalue())
+
+    def test_valid_blocks_pass_through_silently(self):
+        _, jmock = self._patch([_OK])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            r = ron_daemon.send_blocks(
+                1, [{"type": "paragraph", "text": "hi"}])
+        self.assertTrue(r["ok"])
+        self.assertNotIn("RICH VALIDATION FAILED", buf.getvalue())
+        self.assertEqual(jmock.calls[0][0], "sendRichMessage")
+
+
+class BlocksTextTest(unittest.TestCase):
+    """_blocks_text handles the live-verified shapes (v1.15.0):
+    blockquote.blocks, list-item blocks, table cells."""
+
+    def test_new_block_shapes(self):
+        blocks = [
+            {"type": "blockquote", "blocks": [
+                {"type": "paragraph", "text": "quoted"}]},
+            {"type": "list", "items": [
+                {"blocks": [{"type": "paragraph", "text": "one"}]},
+                {"blocks": [{"type": "paragraph", "text": "two"}]}]},
+            {"type": "table", "cells": [
+                [{"text": "a"}, {"text": "b"}],
+                [{"text": "c"}, {"text": "d"}]]},
+        ]
+        txt = ron_daemon._blocks_text(blocks)
+        self.assertIn("quoted", txt)
+        self.assertIn("\u2022 one", txt)
+        self.assertIn("\u2022 two", txt)
+        self.assertIn("a | b", txt)
+        self.assertIn("c | d", txt)
+
+    def test_old_shapes_yield_nothing(self):
+        # The old (wrong) shapes must not leak stale text through the
+        # fallback — blockquote.text / list-item.text / table.rows are
+        # simply ignored.
+        blocks = [
+            {"type": "blockquote", "text": "stale"},
+            {"type": "list", "items": [{"text": "stale"}]},
+            {"type": "table", "rows": [[{"text": "stale"}]]},
+        ]
+        self.assertEqual(ron_daemon._blocks_text(blocks), "")
+
+
+class StripMarkdownTest(unittest.TestCase):
+    """v1.15.0: the no-format fallback strips spoiler/highlight markers
+    and fences with non-word language tags (c++, c#)."""
+
+    def test_spoiler_and_highlight_removed(self):
+        self.assertEqual(ron_daemon.strip_markdown("a ||spoil|| b ==hl== c"),
+                         "a spoil b hl c")
+
+    def test_fence_with_nonword_language(self):
+        self.assertEqual(ron_daemon.strip_markdown("```c++\nint x;\n```"),
+                         "int x;")
+
+
+class TrailerFixesTest(unittest.TestCase):
+    """v1.15.0 trailer hardening: lone markers cleaned from labels,
+    non-http link targets keep the label visible and are logged."""
+
+    def test_lone_markers_stripped_from_labels(self):
+        clean, kb = ron_daemon.parse_trailers(
+            "Hi\n[buttons: *star* alone | _under_ score]")
+        self.assertEqual([b["text"] for b in kb["inline_keyboard"][0]],
+                         ["star alone", "under score"])
+
+    def test_nonhttp_link_label_stays_visible_and_logged(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            clean, kb = ron_daemon.parse_trailers(
+                "Src\n[links: my page -> ftp://example.com/x]")
+        self.assertIn("my page", clean)  # label kept as visible text
+        self.assertIsNone(kb)  # no link button built
+        self.assertIn("non-http", buf.getvalue())  # logged loudly
+
+    def test_nonhttp_arrow_in_buttons_kept_as_label(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            clean, kb = ron_daemon.parse_trailers(
+                "Hi\n[buttons: docs -> not-a-url]")
+        self.assertEqual(kb["inline_keyboard"][0][0]["text"], "docs")
+        self.assertIn("non-http", buf.getvalue())

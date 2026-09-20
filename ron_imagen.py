@@ -244,42 +244,67 @@ def send_photo(chat_id, path, caption="", reply_to=None, thread_id=None):
 
     Returns the parsed Bot API response. Image bytes go straight from
     /tmp to Telegram — never into history, memory, or logs.
+
+    The caption is sent as PLAIN TEXT (no parse_mode): it is built from
+    raw user input (/imagine prompt) and any unbalanced markdown in it
+    would 400 the whole upload ("can't parse entities"). If the API
+    rejects the caption anyway, we retry once WITHOUT the caption so a
+    caption problem is never misreported as an upload failure.
     """
     boundary = "----ronimg" + os.urandom(8).hex()
     with open(path, "rb") as f:
         img = f.read()
-    parts = []
 
-    def field(name, value):
+    def _build(with_caption):
+        parts = []
+
+        def field(name, value):
+            parts.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; '
+                f'name="{name}"\r\n\r\n{value}\r\n'.encode())
+
+        field("chat_id", str(chat_id))
+        if with_caption:
+            field("caption", caption[:1024])  # Telegram photo-caption cap
+        if reply_to:
+            field("reply_parameters",
+                  json.dumps({"message_id": reply_to}))
+        if thread_id:
+            field("message_thread_id", str(thread_id))
         parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; '
-            f'name="{name}"\r\n\r\n{value}\r\n'.encode())
+            f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; '
+            f'filename="image.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
+            .encode() + img + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        return b"".join(parts)
 
-    field("chat_id", str(chat_id))
-    if caption:
-        field("caption", caption[:1024])  # Telegram photo-caption cap
-        field("parse_mode", "Markdown")
-    if reply_to:
-        field("reply_parameters",
-              json.dumps({"message_id": reply_to}))
-    if thread_id:
-        field("message_thread_id", str(thread_id))
-    parts.append(
-        f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; '
-        f'filename="image.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
-        .encode() + img + b"\r\n")
-    parts.append(f"--{boundary}--\r\n".encode())
-    body = b"".join(parts)
-    try:
-        status, raw = http_pool.pool_for("api.telegram.org").post(
-            f"/bot{rich_send._SURROGATE}/sendPhoto",
-            body, f"multipart/form-data; boundary={boundary}", 60)
-        if status != 200:
-            raise RuntimeError(
-                f"HTTP {status}: {raw[:200].decode('utf-8', 'replace')}")
-        return json.loads(raw.decode("utf-8", "replace"))
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:300]}
+    def _post(body):
+        try:
+            status, raw = http_pool.pool_for("api.telegram.org").post(
+                f"/bot{rich_send._SURROGATE}/sendPhoto",
+                body, f"multipart/form-data; boundary={boundary}", 60)
+            if status != 200:
+                raise RuntimeError(
+                    f"HTTP {status}: {raw[:200].decode('utf-8', 'replace')}")
+            return json.loads(raw.decode("utf-8", "replace"))
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:300]}
+
+    body = _build(with_caption=bool(caption))
+    r = _post(body)
+    if r.get("ok") or not caption:
+        return r
+    # Rejected WITH a caption — retry once without it so the image still
+    # lands. Only retry when the error smells like the caption (parse or
+    # caption-length), not a transport/upload failure.
+    err = str(r.get("description") or r.get("error") or "").lower()
+    if "caption" in err or "parse" in err or "too long" in err:
+        r2 = _post(_build(with_caption=False))
+        if r2.get("ok"):
+            print("[ron_imagen] sendPhoto: caption rejected, retried "
+                  "without caption", flush=True)
+            return r2
+    return r
 
 
 def delete_message(chat_id, message_id):

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Owner power commands (v1.13.0) tests: gating, bans, broadcast two-step,
+"""Owner power commands (v1.15.0) tests: gating, bans, broadcast two-step,
 /quiet expiry, /forgetuser scoping, ephemeral auto-delete, /model pinning,
-clean-restart flag, /del + /edit of the bot's own messages, and the ron_ai
-hooks (AI_CALL_HOOK, user_id tagging).
+clean-restart flag, the /del + /edit REMOVAL (fallthrough to conversational
+AI), and the ron_ai hooks (AI_CALL_HOOK, user_id tagging).
 
 No network, no Telegram. Run: python3 -m unittest discover tests -v
 (from ~/workspace/ron-telegram-bot)
@@ -79,7 +79,7 @@ class PowerBase(unittest.TestCase):
         self.orig_send = ron_daemon.send
         self.orig_api = ron_daemon.api
         self.orig_timer = ron_daemon._Timer
-        ron_daemon.send = lambda chat_id, text, **k: self.sent.append(
+        ron_daemon.send = lambda chat_id, text, *a, **k: self.sent.append(
             (chat_id, text)) or {"ok": True,
                                  "result": {"message_id": 4242}}
         ron_daemon.api = lambda *a, **k: {"ok": True}
@@ -594,15 +594,17 @@ class OutboundAccountingTest(PowerBase):
         self.assertEqual(self._out_count(), before + 1)
 
     def test_send_rich_counts(self):
-        orig = ron_daemon.rich_mod.rich_send
-        ron_daemon.rich_mod.rich_send = lambda *a, **k: {
+        # send_rich goes through the self-healing send (rich_mod.api_json
+        # for sendRichMessage), not the old rich_mod.rich_send helper.
+        orig = ron_daemon.send_healed
+        ron_daemon.send_healed = lambda *a, **k: {
             "ok": True, "result": {"message_id": 1}}
         try:
             before = self._out_count()
             ron_daemon.send_rich(1, "hi")
             self.assertEqual(self._out_count(), before + 1)
         finally:
-            ron_daemon.rich_mod.rich_send = orig
+            ron_daemon.send_healed = orig
 
 
 class SayRestartTest(PowerBase):
@@ -722,169 +724,38 @@ class AiHookTest(unittest.TestCase):
             self.assertEqual(set(t.keys()), {"role", "content"})
 
 
-class DelEditTest(PowerBase):
-    """Owner /del and /edit: reply-based, own messages only, ephemeral."""
+class DelEditRemovedTest(PowerBase):
+    """/del and /edit were REMOVED in v1.15.0 (scope cut).
 
-    OWN = {"message_id": 100, "text": "hello there",
-           "from": {"id": 111, "is_bot": True,
-                    "username": ron_daemon.BOT_USERNAME}}
-    OTHER_BOT = {"message_id": 101, "text": "not mine",
-                 "from": {"id": 222, "is_bot": True,
-                          "username": "someotherbot"}}
-    HUMAN = {"message_id": 102, "text": "a human said this",
-             "from": {"id": 333, "is_bot": False, "username": "kaviya"}}
-    PHOTO = {"message_id": 103, "photo": [{"file_id": "x"}],
-             "from": {"id": 111, "is_bot": True,
-                      "username": ron_daemon.BOT_USERNAME}}
+    They must not be handled anywhere: no owner handler registered, no
+    resolver helpers left in ron_owner, and handle_command must fall
+    through (return False) so the text goes to the conversational AI.
+    """
 
-    # -- pure resolvers ------------------------------------------------
-    def test_del_requires_reply(self):
-        mid, hint = ron_owner.resolve_del_target(None, "ronrebootedbot")
-        self.assertIsNone(mid)
-        self.assertIn("Reply", hint)
-        mid, hint = ron_owner.resolve_del_target({}, "ronrebootedbot")
-        self.assertIsNone(mid)
+    def test_no_del_edit_handlers_in_ron_owner(self):
+        for name in ("resolve_del_target", "resolve_edit_target",
+                     "parse_edit_args"):
+            self.assertFalse(hasattr(ron_owner, name),
+                             f"ron_owner.{name} should not exist")
 
-    def test_del_refuses_foreign_messages(self):
-        for msg in (self.HUMAN, self.OTHER_BOT):
-            mid, hint = ron_owner.resolve_del_target(msg, "ronrebootedbot")
-            self.assertIsNone(mid)
-            self.assertIn("own messages", hint)
+    def test_del_falls_through_to_conversational(self):
+        ok = self.owner("del", "/del", reply_msg={"message_id": 100})
+        self.assertFalse(ok, "/del must not be handled (fall through)")
+        self.assertEqual(self.sent, [])
 
-    def test_del_accepts_own_message(self):
-        mid, hint = ron_owner.resolve_del_target(self.OWN, "ronrebootedbot")
-        self.assertEqual(mid, 100)
-        self.assertIsNone(hint)
+    def test_edit_falls_through_to_conversational(self):
+        ok = self.owner("edit", "/edit fixed text",
+                        reply_msg={"message_id": 100})
+        self.assertFalse(ok, "/edit must not be handled (fall through)")
+        self.assertEqual(self.sent, [])
 
-    def test_parse_edit_args(self):
-        self.assertEqual(ron_owner.parse_edit_args("new text"),
-                         (False, "new text"))
-        self.assertEqual(ron_owner.parse_edit_args("--no-buttons new text"),
-                         (True, "new text"))
-        self.assertEqual(ron_owner.parse_edit_args("--no-buttons"),
-                         (True, ""))
-        # Flag is only special as the first token.
-        self.assertEqual(ron_owner.parse_edit_args("keep --no-buttons"),
-                         (False, "keep --no-buttons"))
-        self.assertEqual(ron_owner.parse_edit_args(""), (False, ""))
-
-    def test_edit_target_validation(self):
-        mid, hint = ron_owner.resolve_edit_target(self.OWN, "ronrebootedbot",
-                                                  "new")
-        self.assertEqual((mid, hint), (100, None))
-        # No text -> usage.
-        mid, hint = ron_owner.resolve_edit_target(self.OWN, "ronrebootedbot",
-                                                  "")
-        self.assertIsNone(mid)
-        self.assertIn("Usage", hint)
-        # No reply -> hint.
-        mid, hint = ron_owner.resolve_edit_target(None, "ronrebootedbot",
-                                                  "new")
-        self.assertIsNone(mid)
-        self.assertIn("Reply", hint)
-        # Not ours -> hint.
-        mid, hint = ron_owner.resolve_edit_target(self.HUMAN,
-                                                  "ronrebootedbot", "new")
-        self.assertIsNone(mid)
-        self.assertIn("own messages", hint)
-        # Non-text target (photo, service msg) -> clean error.
-        mid, hint = ron_owner.resolve_edit_target(self.PHOTO,
-                                                  "ronrebootedbot", "new")
-        self.assertIsNone(mid)
-        self.assertIn("text messages", hint)
-
-    # -- /del flow ------------------------------------------------------
-    def _capture_api(self):
-        calls = []
-        ron_daemon.api = lambda m, p=None, **k: calls.append((m, p)) or \
-            {"ok": True}
-        return calls
-
-    def test_del_command_flow(self):
-        calls = self._capture_api()
-        ok = self.owner("del", "/del", reply_msg=self.OWN)
-        self.assertTrue(ok)
-        self.assertEqual(calls, [("deleteMessage",
-                                  {"chat_id": 1, "message_id": 100})])
-        self.assertIn("Deleted", self.reply_text())
-        # Ephemeral: reply + command scheduled for deletion.
-        self.assertEqual(len(FakeTimer.scheduled), 1)
-
-    def test_del_api_failure_is_clean(self):
-        ron_daemon.api = lambda *a, **k: {"ok": False,
-                                          "error": "message to delete not found"}
-        self.owner("del", "/del", reply_msg=self.OWN)
-        self.assertIn("Couldn't delete", self.reply_text())
-
-    def test_del_hint_when_no_reply(self):
-        calls = self._capture_api()
-        self.owner("del", "/del")
-        self.assertIn("Reply", self.reply_text())
-        self.assertEqual(calls, [])
-
-    def test_del_refuses_foreign_message(self):
-        calls = self._capture_api()
-        self.owner("del", "/del", reply_msg=self.HUMAN)
-        self.assertIn("own messages", self.reply_text())
-        self.assertEqual(calls, [])
-
-    # -- /edit flow -----------------------------------------------------
-    def test_edit_command_flow(self):
-        calls = self._capture_api()
-        ok = self.owner("edit", "/edit fixed text", reply_msg=self.OWN)
-        self.assertTrue(ok)
-        self.assertEqual(len(calls), 1)
-        method, params = calls[0]
-        self.assertEqual(method, "editMessageText")
-        self.assertEqual(params["chat_id"], 1)
-        self.assertEqual(params["message_id"], 100)
-        self.assertEqual(params["text"], "fixed text")
-        # No flag -> reply_markup omitted, buttons preserved.
-        self.assertNotIn("reply_markup", params)
-        self.assertIn("Edited", self.reply_text())
-        self.assertEqual(len(FakeTimer.scheduled), 1)
-
-    def test_edit_no_buttons_clears_keyboard(self):
-        calls = self._capture_api()
-        self.owner("edit", "/edit --no-buttons fresh text",
-                   reply_msg=self.OWN)
-        method, params = calls[0]
-        self.assertEqual(method, "editMessageText")
-        self.assertEqual(params["text"], "fresh text")
-        kb = json.loads(params["reply_markup"])
-        self.assertEqual(kb, {"inline_keyboard": []})
-        self.assertIn("Edited", self.reply_text())
-
-    def test_edit_no_buttons_without_text_is_usage(self):
-        calls = self._capture_api()
-        self.owner("edit", "/edit --no-buttons", reply_msg=self.OWN)
-        self.assertIn("Usage", self.reply_text())
-        self.assertEqual(calls, [])
-
-    def test_edit_api_failure_is_clean(self):
-        ron_daemon.api = lambda *a, **k: {"ok": False,
-                                          "error": "message can't be edited"}
-        self.owner("edit", "/edit x", reply_msg=self.OWN)
-        self.assertIn("Couldn't edit", self.reply_text())
-
-    def test_edit_refuses_non_text_target(self):
-        calls = self._capture_api()
-        self.owner("edit", "/edit x", reply_msg=self.PHOTO)
-        self.assertIn("text messages", self.reply_text())
-        self.assertEqual(calls, [])
-
-    def test_del_edit_refuse_nonowner(self):
+    def test_del_edit_fall_through_for_nonowner_too(self):
         for cmd, text in (("del", "/del"), ("edit", "/edit x")):
             with self.subTest(cmd=cmd):
                 self.sent.clear()
-                FakeTimer.scheduled.clear()
                 ok = ron_daemon.handle_command(1, OTHER, cmd, True, text,
-                                               cmd_msg_id=7,
-                                               reply_msg=self.OWN)
-                self.assertTrue(ok)
-                self.assertIn("Only Adwaith", self.reply_text())
-                self.assertEqual(len(FakeTimer.scheduled), 1)
-
+                                               cmd_msg_id=7)
+                self.assertFalse(ok)
 
 if __name__ == "__main__":
     unittest.main()

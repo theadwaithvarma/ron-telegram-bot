@@ -1,10 +1,46 @@
 # Changelog
 
+## 1.15.0 — 2026-09-21
+
+Rich-text fix loop: the whole live-fire matrix is green against the real
+Bot API, and every finding is now enforced locally before anything is sent.
+
+- **Correct block shapes** (verified live 2026-09-21, enforced by the new
+  `ron_richvalidate` pre-flight check on every `sendRichMessage`):
+  blockquote carries nested `blocks`, list items carry
+  `{"blocks": [{"type": "paragraph", ...}]}`, tables carry `cells`
+  (not `rows`). Wrong shapes fail LOUD in the logs
+  (`[ron_daemon] RICH VALIDATION FAILED: …`) and the user gets a plain-text
+  fallback — the invalid rich request is never sent.
+- **Validator stays stricter than the server on purpose.** Telegram
+  silently accepts three ambiguous payloads; we reject them locally so a
+  sloppy AI draft can never depend on server leniency: markdown + blocks
+  together, a button with two action fields, a button label given as a
+  RichText dict.
+- **Keyboard failures heal correctly.** `BUTTON_DATA_INVALID` and other
+  button errors are now their own heal class: the bad keyboard is dropped
+  and the text retried without `reply_markup` (stripping formatting can't
+  fix a bad keyboard). Every `RICH_MESSAGE_*` error classifies as healable.
+- Converter fixes: asymmetric inline nesting (`*a **b** c*` nests
+  properly), `c++`/`c#` fence languages, empty/unclosed fences never emit
+  an empty `pre` (the server 400s those), tables keep `||spoiler||` cells
+  intact and parse inline formatting per cell.
+- Trailer hardening: lone `*`/`_` stripped from button labels, non-http
+  `[links:]` targets keep the label as visible text (and log loudly)
+  instead of vanishing, `||`/`==` stripped in the plain-text fallback.
+- `/imagine` photo captions go out as plain text (no `parse_mode`) — an
+  unbalanced marker in a prompt no longer 400s the whole upload; a
+  caption rejection retries once without the caption.
+- **`/del` and `/edit` removed** (scope cut). They fall through to the
+  conversational AI; all handlers, resolvers, tests, and docs are gone.
+- Deliberate limitations: block types outside the verified set are
+  rejected by the validator (fail loud, don't guess); `#`/`@` stay plain
+  text on the blocks path (no hashtag/mention entities there).
+
 ## 1.14.0 — 2026-09-21
 
 Self-healing send pipeline: the bot now detects its OWN formatting
-errors and fixes them automatically — no user action, no manual /del//edit
-needed for these.
+errors and fixes them automatically — no user action needed for these.
 
 - All outbound text sends (`send()`, `send_markup()`, rich `sendRichMessage`
   via `send_blocks()`/`send_rich()`) and `editMessageText` go through
@@ -23,20 +59,6 @@ needed for these.
 - Silent on success — the user just sees the fixed message. Every
   auto-recovery is logged (`[ron_daemon] send healed: …`) so it shows
   up in `/logs`.
-- `/del` and `/edit` stay as-is: manual override for content mistakes.
-
-## 1.13.0 — 2026-09-21
-
-Owner-only message surgery (ephemeral like all power commands):
-
-- `/del` — delete one of the bot's own messages. Must be sent as a reply
-  to the target, so ownership is verifiable (the bot's own messages only —
-  never other users', even where it's admin).
-- `/edit <new text>` — rewrite one of the bot's own text messages, sent as
-  a reply to it. Plain `/edit` leaves inline buttons untouched;
-  `/edit --no-buttons <new text>` strips the inline keyboard too.
-  Non-text targets (photos, service messages) get a clean error.
-
 ## 1.12.0 — 2026-09-21
 
 Owner power commands (all owner-only, all ephemeral — the command and the

@@ -54,6 +54,7 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 - **Rolling history summaries** — once a chat's raw history passes 40 turns, the oldest half is folded into an encrypted per-chat summary by the cheap model; prompts carry summary + last 15 turns instead of unbounded history
 - **Light mode** (`light_mode` in `ron_ai.json`): cheap-model routing, no draft streaming, one rich send per reply — running lean on demand, built for heavy lifting
 - **Self-healing sends** — every outbound message goes through `send_healed()`: if Telegram rejects the bot's own formatting ("can't parse entities", overlong text), it strips the formatting or truncates and retries automatically (max 3 attempts), logging each recovery. The user just sees the fixed message.
+- **Strict rich-text validation** (`ron_richvalidate.py`) — every `sendRichMessage` payload is checked locally *before* it goes out, against shapes verified live against the Bot API: blockquotes carry nested `blocks`, list items carry `{"blocks": [...]}`, tables carry `cells`. The validator is deliberately stricter than Telegram (which silently accepts markdown+blocks together, two-action buttons, and dict button labels — we reject all three). Violations fail loud in the logs and fall back to plain text; the bad payload is never sent. Keyboard failures (`BUTTON_DATA_INVALID`) heal by dropping the keyboard and retrying text-only.
 
 ### 🧠 Privacy-First Memory
 - **Encrypted per-chat memory** (`ron_memory.py`): SQLite + Fernet encryption at rest (key from `RON_MEMORY_KEY`; fails closed without it). Each chat's memory is strictly isolated — DM, group, and Business memories never merge
@@ -92,8 +93,6 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 | `/users` | Owner only — full user roster |
 | `/forgetuser` | Owner only — wipe one user's data (DM chat fully, group turns) |
 | `/model` | Owner only — show or re-pin the AI provider chain |
-| `/del` | Owner only — delete one of the bot's own messages (send as a reply to it) |
-| `/edit` | Owner only — rewrite one of the bot's own text messages (send as a reply; `--no-buttons` strips its inline keyboard) |
 
 All owner commands are **ephemeral** — the command and the reply auto-delete after 30 seconds.
 | `/start` | Owner only during maintenance — wakes the bot back up for everyone |

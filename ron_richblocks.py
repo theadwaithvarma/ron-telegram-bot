@@ -6,28 +6,38 @@ message bubble (InputRichBlockButtons) instead of under it (reply_markup
 inline keyboard).
 
 Every wire shape below was verified against the live Bot API with
-sendRichMessage probes on 2026-09-20. Probe trick: an invalid chat_id
-(12345) returns "Bad Request: chat not found" when the payload PARSES, and
-a parse error otherwise — so shapes can be validated without sending any
-visible message.
+sendRichMessage probes on 2026-09-21 (see /tmp/harness/results.md).
+The 2026-09-20 probe shapes for blockquote/list/table were WRONG
+(guessed) — the live API 400s them; the corrected shapes below are the
+empirically accepted ones.
 
 Verified shapes:
 - paragraph:  {"type": "paragraph", "text": RichText}
-- blockquote: {"type": "blockquote", "text": RichText}
-- pre:        {"type": "pre", "text": str, "language": str}
-- list:       {"type": "list", "ordered": bool, "items": [{"text": RichText}]}
+- blockquote: {"type": "blockquote", "blocks": [nested blocks, ...]}
+              (NOT {"text": ...} — that 400s with RICH_MESSAGE_EMPTY)
+- pre:        {"type": "pre", "text": str, "language"?: str}
+              (language optional; EMPTY text 400s RICH_MESSAGE_CONTENT_REQUIRED)
+- list:       {"type": "list", "ordered": bool,
+               "items": [{"blocks": [{"type": "paragraph", "text": RichText}]}]}
+              (items are InputRichBlockListItem = {"blocks": [...]} —
+               NOT {"text": ...}, which 400s with RICH_MESSAGE_EMPTY)
 - divider:    {"type": "divider"}
+- table:      {"type": "table", "cells": [[{"text": RichText}, ...], ...],
+               "is_compact"?: bool}
+              (field is "cells", a 2-D array — NOT "rows"; "rows" 400s with
+               "Can't find field \"cells\"")
 - buttons:    {"type": "buttons", "buttons": [RichMessageButton, ...],
                "align": "left"|"center"|"right"}   (ONE row per block, 1-8)
 - RichText:   plain str, or a list mixing str and inline nodes
 - inline:     {"type": "bold"|"italic"|"code"|"underline"|"strikethrough"|
                "spoiler"|"marked", "text": RichText}
               {"type": "url", "text": RichText, "url": str}   ("url" REQUIRED)
-              {"type": "mention"|"hashtag"|"subscript", "text": str}
 
-NOT cracked (probes kept answering "Can't find field"): the heading and
-table block shapes. Headings degrade to a bold paragraph, tables to a
-monospace pre block with aligned columns — info preserved, zero API risk.
+NOT emitted (shapes unverified — fail loud locally rather than guess):
+heading blocks (degrade to bold paragraph), expandable_blockquote,
+pull_quote, details, media blocks. Mention/hashtag/subscript parsing is
+not implemented — #/@ stay plain text on the blocks path (the markdown
+path entity-parses them), by design.
 
 Pure functions, no network. Safe to import anywhere.
 """
@@ -112,7 +122,24 @@ def parse_inline(s):
             # Lone "_" inside a word (like_this) is not italic.
             if marker == "_" and i > 0 and (s[i - 1].isalnum()):
                 continue
-            close = s.find(marker, i + len(marker))
+            # Find the closing marker. A single-char candidate is skipped
+            # when it is half of a double marker — mirror of the open-side
+            # guard above. Without this, '*a **b** c*' pairs the opening
+            # '*' with the first '*' of the inner '**', silently flattening
+            # the bold node into italic (audit C.1).
+            close = -1
+            j = i + len(marker)
+            while True:
+                j = s.find(marker, j)
+                if j == -1:
+                    break
+                if len(marker) == 1 and (
+                        s.startswith(marker * 2, j)
+                        or (j > i and s.startswith(marker * 2, j - 1))):
+                    j += 1
+                    continue
+                close = j
+                break
             if close == -1:
                 continue
             inner = s[i + len(marker):close]
@@ -151,29 +178,30 @@ def text_blocks(text):
 # Blocks: Telegram Markdown -> block list (for messages that carry buttons)
 # ---------------------------------------------------------------------------
 
-_FENCE_RE = re.compile(r"^```(\w*)\s*$")
+_FENCE_RE = re.compile(r"^```([^`\s]*)\s*$")
 _DIVIDER_RE = re.compile(r"^(---+$|\*\*\*+$|___+)\s*$")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _UL_RE = re.compile(r"^\s*[-*]\s+(.*)$")
 _OL_RE = re.compile(r"^\s*\d+[.)]\s+(.*)$")
 
 
-def _table_to_text(tlines):
-    """Degrade a markdown table to aligned monospace text (pre block)."""
-    rows = []
-    for ln in tlines:
-        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
-        if cells and all(re.match(r"^:?-{2,}:?$", c) for c in cells):
-            continue  # separator row: |---|---|
-        rows.append([re.sub(r"\s+", " ", c) for c in cells])
-    if not rows:
-        return "\n".join(tlines)
-    width = max(len(r) for r in rows)
-    rows = [r + [""] * (width - len(r)) for r in rows]
-    colw = [max(len(r[j]) for r in rows) for j in range(width)]
-    return "\n".join(
-        "  ".join(c.ljust(colw[j]) for j, c in enumerate(r)).rstrip()
-        for r in rows)
+def _split_cells(s):
+    """Split a table row on '|' without shattering ||spoiler|| spans.
+
+    Spoiler markers contain the cell separator, so "||x||" is hidden
+    behind a placeholder before the split and restored after.
+    """
+    hidden = []
+
+    def _hide(m):
+        hidden.append(m.group(0))
+        return "\x00%d\x00" % (len(hidden) - 1)
+
+    masked = re.sub(r"\|\|.*?\|\|", _hide, s)
+    parts = [c.strip() for c in masked.strip().strip("|").split("|")]
+    return [re.sub(r"\x00(\d+)\x00",
+                   lambda m: hidden[int(m.group(1))], p)
+            for p in parts]
 
 
 def _is_table_row(s):
@@ -186,11 +214,11 @@ def markdown_to_blocks(md):
     """Convert a Telegram-Markdown reply into rich-message blocks.
 
     Covers what the bot's replies actually use: paragraphs, ## headings
-    (degraded to bold — the heading block shape never parsed in probes),
-    > quotes, - / 1. lists, ``` code fences, --- dividers, tables
-    (degraded to monospace), and all inline formatting via parse_inline.
-    Never raises on weird input — worst case it degrades to plain
-    paragraph blocks.
+    (degraded to bold paragraph — heading blocks are unverified locally),
+    > quotes, - / 1. lists, ``` code fences, --- dividers, tables (real
+    table blocks with inline-parsed cells), and all inline formatting via
+    parse_inline. Never raises on weird input — worst case it degrades to
+    plain paragraph blocks. Never emits an empty pre block.
     """
     lines = (md or "").split("\n")
     blocks, para = [], []
@@ -212,14 +240,33 @@ def markdown_to_blocks(md):
             flush_para()
             code = []
             i += 1
-            while i < len(lines) and not lines[i].strip().startswith("```"):
+            closed = False
+            while i < len(lines):
+                if lines[i].strip().startswith("```"):
+                    closed = True
+                    break
                 code.append(lines[i])
                 i += 1
-            i += 1  # skip closing fence (or run past EOF, fine)
-            blk = {"type": "pre", "text": "\n".join(code).strip("\n")}
-            if m.group(1):
-                blk["language"] = m.group(1)
-            blocks.append(blk)
+            if closed:
+                i += 1  # skip the closing fence
+            # Unclosed fence: only the code collected so far is code; the
+            # fence line + content become a pre block ONLY when there is
+            # actual code content. Never emit an empty pre block — the
+            # server 400s it (RICH_MESSAGE_CONTENT_REQUIRED). An empty
+            # fence carries no content, so it is dropped silently.
+            body = "\n".join(code).strip("\n")
+            if body.strip():
+                blk = {"type": "pre", "text": body}
+                if m.group(1):
+                    blk["language"] = m.group(1)
+                blocks.append(blk)
+            elif not closed:
+                # Unclosed fence with no code content: keep the fence
+                # line as a plain paragraph. Never an empty pre block —
+                # the server 400s it (RICH_MESSAGE_CONTENT_REQUIRED).
+                blocks.append({"type": "paragraph", "text": s})
+            # Closed-but-empty fence (```\n```): carries no content at
+            # all — dropped rather than sent as an empty pre.
             continue
         # --- divider
         if _DIVIDER_RE.match(s):
@@ -236,17 +283,22 @@ def markdown_to_blocks(md):
                                      "text": parse_inline(m.group(2))}]})
             i += 1
             continue
-        # > quote block
+        # > quote block — verified shape: {"type": "blockquote",
+        # "blocks": [nested blocks]}. The {"text": ...} shape 400s with
+        # RICH_MESSAGE_EMPTY (harness B7 + shape probes, 2026-09-21).
         if s.startswith(">"):
             flush_para()
             q = []
             while i < len(lines) and lines[i].strip().startswith(">"):
                 q.append(re.sub(r"^>\s?", "", lines[i].strip()))
                 i += 1
-            blocks.append({"type": "blockquote",
-                           "text": parse_inline("\n".join(q))})
+            blocks.append({"type": "blockquote", "blocks": [
+                {"type": "paragraph",
+                 "text": parse_inline("\n".join(q))}]})
             continue
-        # - / * / 1. lists
+        # - / * / 1. lists — items are InputRichBlockListItem =
+        # {"blocks": [...]}. The {"text": ...} shape 400s with
+        # RICH_MESSAGE_EMPTY (harness B10/B11 + shape probes, 2026-09-21).
         m = _UL_RE.match(line) or _OL_RE.match(line)
         if m:
             flush_para()
@@ -257,21 +309,36 @@ def markdown_to_blocks(md):
                       else _UL_RE.match(lines[i]))
                 if not mm:
                     break
-                items.append({"text": parse_inline(mm.group(1))})
+                items.append({"blocks": [
+                    {"type": "paragraph",
+                     "text": parse_inline(mm.group(1))}]})
                 i += 1
             if items:
                 blocks.append({"type": "list", "ordered": ordered,
                                "items": items})
             continue
-        # | table | -> monospace pre block
+        # | table | — real table block. The server takes "cells" (a 2-D
+        # array of {"text": RichText}); the old monospace-pre degradation
+        # is gone (harness B15 + shape probes, 2026-09-21). The
+        # separator row (|---|---|) is skipped; ragged rows are padded
+        # with empty cells; cell content is inline-parsed.
         if _is_table_row(s):
             flush_para()
-            tlines = []
+            rows = []
             while i < len(lines) and _is_table_row(lines[i].strip()):
-                tlines.append(lines[i].strip())
+                cells = _split_cells(lines[i].strip())
+                if cells and all(re.match(r"^:?-{2,}:?$", c)
+                                 for c in cells):
+                    i += 1
+                    continue  # separator row: |---|---|
+                rows.append([{"text": parse_inline(
+                    re.sub(r"\s+", " ", c))} for c in cells])
                 i += 1
-            blocks.append({"type": "pre",
-                           "text": _table_to_text(tlines)})
+            if rows:
+                width = max(len(r) for r in rows)
+                cells2d = [r + [{"text": ""}] * (width - len(r))
+                           for r in rows]
+                blocks.append({"type": "table", "cells": cells2d})
             continue
         # blank line = paragraph break
         if not s:

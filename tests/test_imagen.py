@@ -11,7 +11,8 @@ Covers:
   prompt truncation.
 - ron_imagen.fetch_image: JPEG validation, temp cleanup on failure,
   empty prompt rejected.
-- ron_imagen.send_photo: multipart body shape, caption cap.
+- ron_imagen.send_photo: multipart body shape, caption cap, no parse_mode,
+  caption-rejection retry without caption.
 - ron_daemon /imagine hook: prompt parsing, empty-prompt hint, limit
   notice without any provider burn, ack sent then deleted, quota
   recorded only on success, history marker without image bytes.
@@ -476,8 +477,56 @@ class TestSendPhoto(unittest.TestCase):
         self.assertIn(b'name="photo"', body)
         self.assertIn(FAKE_JPEG, body)  # image bytes go to Telegram...
         self.assertIn(b'name="caption"', body)
+        # Captions are plain text: NO parse_mode. (The caption is built
+        # from raw user input; any unbalanced markdown would 400 the
+        # whole upload.) v1.15.0.
+        self.assertNotIn(b'name="parse_mode"', body)
         self.assertIn(b'"message_id": 42', body)
         self.assertIn(b'name="message_thread_id"', body)
+
+    def test_caption_rejected_retries_without_caption(self):
+        """A caption rejection must not sink the image: the function
+        retries once without the caption (v1.15.0)."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        tmp.write(FAKE_JPEG)
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        posts = []
+
+        def post(path, body, content_type, timeout=None):
+            posts.append(body)
+            if len(posts) == 1:
+                return 200, b'{"ok": false, "description": ' \
+                    b'"Bad Request: can\'t parse caption"}'
+            return 200, b'{"ok": true, "result": {}}'
+        fake = mock.MagicMock()
+        fake.post.side_effect = post
+        with mock.patch("http_pool.pool_for", return_value=fake):
+            r = ron_imagen.send_photo(777, tmp.name, caption="bad *cap")
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(posts), 2)
+        self.assertIn(b'name="caption"', posts[0])
+        self.assertNotIn(b'name="caption"', posts[1])
+        self.assertIn(FAKE_JPEG, posts[1])
+
+    def test_caption_rejected_upload_failure_not_retried(self):
+        """A non-caption failure (transport error) must not be retried:
+        no duplicate uploads of an already-accepted image."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        tmp.write(FAKE_JPEG)
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        posts = []
+
+        def post(path, body, content_type, timeout=None):
+            posts.append(body)
+            raise RuntimeError("boom")
+        fake = mock.MagicMock()
+        fake.post.side_effect = post
+        with mock.patch("http_pool.pool_for", return_value=fake):
+            r = ron_imagen.send_photo(777, tmp.name, caption="hi")
+        self.assertFalse(r["ok"])
+        self.assertEqual(len(posts), 1)
 
     def test_caption_capped_at_1024(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)

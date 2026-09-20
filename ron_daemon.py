@@ -46,6 +46,12 @@ try:
     import ron_richblocks
 except Exception:
     ron_richblocks = None
+# Strict local validator for outgoing payloads (Bot API 10.3 shapes).
+# None-safe — without it, rich sends skip the pre-flight check.
+try:
+    import ron_richvalidate
+except Exception:
+    ron_richvalidate = None
 
 # Image reading (photos -> Gemini vision). None-safe — without it the bot
 # tells users photos aren't supported instead of crashing.
@@ -983,9 +989,13 @@ def _note_sent(result):
 # send_healed(), which retries failed calls after auto-fixing the two
 # failure classes Telegram actually returns for our messages:
 #   * parse/entity errors ("can't parse entities",
-#     RICH_MESSAGE_CONTENT_REQUIRED) -> strip ALL formatting, retry as
-#     plain text (the inline keyboard is kept — a bad keyboard is a
-#     different failure class and keeps its own error).
+#     RICH_MESSAGE_* (empty content, too many buttons, bad shapes)) ->
+#     strip ALL formatting, retry as plain text (the inline keyboard is
+#     kept — a bad keyboard is a different failure class and keeps its
+#     own error).
+#   * keyboard errors ("button…" — BUTTON_DATA_INVALID, bad button rows)
+#     -> drop the inline keyboard entirely, retry text-only. Stripping
+#     formatting can't fix a bad keyboard (audit D.7).
 #   * length errors ("message is too long", "caption is too long") ->
 #     truncate to Telegram limits (4096 text / 1024 caption, marked "…").
 # Retry chain (max 3 API attempts, never infinite):
@@ -1004,9 +1014,13 @@ _TG_TEXT_LIMIT = 4096
 _TG_CAPTION_LIMIT = 1024
 
 _PARSE_ERR_RE = re.compile(
-    r"can'?t parse entities|parse entities|rich_message_content_required",
+    r"can'?t parse entities|parse entities|rich_message",
     re.I)
 _LENGTH_ERR_RE = re.compile(r"too long|too big", re.I)
+# Keyboard failures (BUTTON_DATA_INVALID, bad button rows): stripping
+# formatting can't fix a bad keyboard — it must be dropped and the text
+# retried without reply_markup (audit D.7).
+_KEYBOARD_ERR_RE = re.compile(r"button", re.I)
 
 
 def _api_ok(r):
@@ -1021,12 +1035,15 @@ def _api_err(r):
 
 
 def _heal_kind(err):
-    """Classify a Telegram send/edit failure: 'parse', 'length', 'other'."""
+    """Classify a Telegram send/edit failure: 'parse', 'length',
+    'keyboard', or 'other'."""
     e = (err or "").lower()
     if _PARSE_ERR_RE.search(e):
         return "parse"
     if _LENGTH_ERR_RE.search(e):
         return "length"
+    if _KEYBOARD_ERR_RE.search(e):
+        return "keyboard"
     return "other"
 
 
@@ -1057,7 +1074,11 @@ def _truncate_send_text(params):
 
 def _blocks_text(blocks):
     """Best-effort plain text from Bot API 10.3 rich blocks, for the
-    sendRichMessage -> sendMessage fallback."""
+    sendRichMessage -> sendMessage fallback.
+
+    Handles the live-verified shapes (2026-09-21): blockquote/list items
+    carry nested "blocks", tables carry "cells".
+    """
     out = []
 
     def _rt(node):
@@ -1069,17 +1090,41 @@ def _blocks_text(blocks):
             return "".join(_rt(n) for n in node)
         return ""
 
-    for b in blocks or []:
+    def _block(b):
         if not isinstance(b, dict):
-            continue
+            return ""
         t = b.get("type")
-        if t in ("paragraph", "blockquote", "pre"):
-            out.append(_rt(b.get("text", "")))
-        elif t == "list":
+        if t in ("paragraph", "pre", "footer", "heading"):
+            return _rt(b.get("text", ""))
+        if t == "blockquote":
+            return "\n".join(_block(x)
+                             for x in b.get("blocks", []) or [])
+        if t == "list":
+            lines = []
             for item in b.get("items", []) or []:
-                out.append("\u2022 " + _rt(item.get("text", "")))
-        # divider / buttons carry no readable text
-    return "\n".join(s for s in out if s).strip()
+                if not isinstance(item, dict):
+                    continue
+                it = "\n".join(_block(x)
+                               for x in item.get("blocks", []) or [])
+                if it.strip():
+                    lines.append("\u2022 " + it)
+            return "\n".join(lines)
+        if t == "table":
+            rows = []
+            for row in b.get("cells", []) or []:
+                if not isinstance(row, list):
+                    continue
+                rows.append(" | ".join(
+                    _rt(c.get("text", "")) for c in row
+                    if isinstance(c, dict)))
+            return "\n".join(rows)
+        return ""  # divider / buttons carry no readable text
+
+    for b in blocks or []:
+        s = _block(b)
+        if s.strip():
+            out.append(s)
+    return "\n".join(out).strip()
 
 
 def _rich_fallback_text(payload):
@@ -1114,8 +1159,29 @@ def send_healed(method, params, as_json=False):
     # Recovery chain: the fix matching the classification first, then the
     # other fix applied on top (a message can be malformed AND too long).
     # Each entry is (label, transport, method, params).
+    t = rich_mod.api_json if as_json else api
     attempts = []
-    if method == "sendRichMessage":
+    if kind == "keyboard":
+        # A bad keyboard (BUTTON_DATA_INVALID, bad button rows) can't be
+        # fixed by stripping formatting — drop the keyboard and retry
+        # text-only (audit D.7). For sendRichMessage the rich content goes
+        # too: a buttons-block error can't be fixed in place.
+        no_kb = {k: v for k, v in params.items()
+                 if k not in ("reply_markup", "rich_message")}
+        if method == "sendRichMessage":
+            no_kb["text"] = strip_markdown(_rich_fallback_text(params))
+            attempts.append(("bad keyboard dropped, retried as plain "
+                             "text-only",
+                             rich_mod.api_json, "sendMessage", no_kb))
+            attempts.append(("bad keyboard dropped, then truncated",
+                             rich_mod.api_json, "sendMessage",
+                             _truncate_send_text(no_kb)))
+        else:
+            attempts.append(("bad keyboard dropped, retried text-only",
+                             t, method, no_kb))
+            attempts.append(("bad keyboard dropped, then truncated",
+                             t, method, _truncate_send_text(no_kb)))
+    elif method == "sendRichMessage":
         # Bad rich content can't be fixed in place — drop it and go plain.
         # Recovery stays on the JSON transport: payloads may carry nested
         # dicts (reply_parameters) that the urlencoded api() can't send.
@@ -1127,7 +1193,6 @@ def send_healed(method, params, as_json=False):
                          rich_mod.api_json, "sendMessage",
                          _truncate_send_text(plain)))
     else:
-        t = rich_mod.api_json if as_json else api
         stripped = _strip_send_format(params)
         if kind == "parse":
             attempts.append(("stripped formatting", t, method, stripped))
@@ -1760,8 +1825,9 @@ def strip_trailer_syntax(reply):
 
 def _clean_btn_label(s):
     """Button labels are plain text — strip Markdown the AI sometimes leaks
-    in (**bold**, `code`, ||spoiler||, ==highlight==) and collapse spaces."""
-    s = re.sub(r"(\*\*|__|`|~~|\|\||==)", "", s or "")
+    in (**bold**, `code`, ||spoiler||, ==highlight==, lone * and _) and
+    collapse spaces."""
+    s = re.sub(r"(\*\*|__|`|~~|\|\||==|\*|_)", "", s or "")
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -1772,6 +1838,7 @@ def parse_trailers(reply):
     clean = strip_trailer_syntax(reply)
     kb = []
     link_row = []
+    dropped_labels = []  # non-http link targets: kept as visible text
     # Spoiler markers contain the "|" separator — erase them before the
     # split, or "||x||" shatters into phantom buttons.
     if btns:
@@ -1791,6 +1858,11 @@ def parse_trailers(reply):
                     link_row.append({"text": _clean_btn_label(label)[:40],
                                      "url": url})
                     continue
+                # Non-http target: not a link. Keep the left side as the
+                # callback label instead of junk like "a -> nothttp".
+                print(f"[ron_daemon] trailer: non-http '->' target dropped "
+                      f"in [buttons:], label {label!r}", flush=True)
+                b = label
             label = _clean_btn_label(b)
             if label:
                 row.append({"text": label[:40],
@@ -1807,8 +1879,18 @@ def parse_trailers(reply):
             if url.startswith("http"):
                 link_row.append({"text": _clean_btn_label(label)[:40],
                                  "url": url})
+            else:
+                # Non-http target: never let the label vanish silently —
+                # keep it as visible plain text in the message and log it.
+                kept = _clean_btn_label(label)
+                if kept:
+                    dropped_labels.append(kept)
+                print(f"[ron_daemon] trailer: non-http link target dropped, "
+                      f"label {label!r}", flush=True)
     if link_row:
         kb.append(link_row[:8])
+    if dropped_labels:
+        clean = (clean + "\n" + "\n".join(dropped_labels)).strip()
     return clean, {"inline_keyboard": kb} if kb else None
 
 
@@ -1875,8 +1957,9 @@ def rich_text_block(text):
 
 def strip_markdown(t):
     """Degrade rich Markdown to plain text for the no-format fallback."""
-    t = re.sub(r"```\w*\n?", "", t)
+    t = re.sub(r"```[^`\s]*\n?", "", t)
     t = re.sub(r"[*_`~]", "", t)
+    t = re.sub(r"\|\||==", "", t)  # spoiler ||..|| / highlight ==..== markers
     t = re.sub(r"^#{1,6}\s+", "", t, flags=re.M)
     t = re.sub(r"^>\s?", "", t, flags=re.M)
     t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
@@ -1903,7 +1986,12 @@ def send_rich(chat_id, text, reply_markup=None, reply_to=None, thread_id=None,
         payload = {"chat_id": chat_id, "rich_message": {"markdown": text}}
         payload.update(kw)
         payload.update(rp)
-        r = send_healed("sendRichMessage", payload, as_json=True)
+        if _rich_violations(payload, "sendRichMessage"):
+            # Loud log already printed — skip the rich attempt entirely
+            # and fall through to the plain-text ladder below.
+            r = {"ok": False, "error": "local rich validation failed"}
+        else:
+            r = send_healed("sendRichMessage", payload, as_json=True)
         if r.get("ok"):
             _note_sent(r)  # /stats: rich sends bypass send(), count here
             return r
@@ -2189,55 +2277,8 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
                      f"\u2709\uFE0F Sent to {dest}." if ok
                      else f"Send failed: {err}")
         return True
-    if cmd == "del":
-        # Owner-only: delete one of the bot's own messages. Reply-based —
-        # /del must be sent as a reply to the target, so ownership is
-        # verifiable (the bot may be admin in groups, where deleteMessage
-        # could otherwise remove someone else's message). Own messages
-        # only — never other users'.
-        if not _owner_gate(user_id):
-            _owner_refuse(chat_id, user_id, cmd_msg_id)
-            return True
-        target, hint = ron_owner.resolve_del_target(reply_msg, BOT_USERNAME)
-        if hint is not None:
-            _owner_reply(chat_id, user_id, cmd_msg_id, hint)
-            return True
-        r = api("deleteMessage",
-                {"chat_id": chat_id, "message_id": target})
-        if not (isinstance(r, dict) and r.get("ok")):
-            err = str((r or {}).get("error", "unknown"))[:80]
-            _owner_reply(chat_id, user_id, cmd_msg_id,
-                         f"Couldn't delete it: {err}")
-            return True
-        _owner_reply(chat_id, user_id, cmd_msg_id, "Deleted.")
-        return True
-    if cmd == "edit":
-        # Owner-only: rewrite one of the bot's own text messages. Plain
-        # /edit <text> leaves inline buttons untouched; /edit --no-buttons
-        # <text> strips them. Reply-based, same ownership check as /del.
-        if not _owner_gate(user_id):
-            _owner_refuse(chat_id, user_id, cmd_msg_id)
-            return True
-        no_buttons, new_text = ron_owner.parse_edit_args(_cmd_args(text))
-        target, hint = ron_owner.resolve_edit_target(reply_msg, BOT_USERNAME,
-                                                     new_text)
-        if hint is not None:
-            _owner_reply(chat_id, user_id, cmd_msg_id, hint)
-            return True
-        params = {"chat_id": chat_id, "message_id": target,
-                  "text": new_text}
-        if no_buttons:
-            # An empty inline keyboard clears the buttons; omitting
-            # reply_markup preserves whatever was there.
-            params["reply_markup"] = json.dumps({"inline_keyboard": []})
-        r = send_healed("editMessageText", params)
-        if not (isinstance(r, dict) and r.get("ok")):
-            err = str((r or {}).get("error", "unknown"))[:80]
-            _owner_reply(chat_id, user_id, cmd_msg_id,
-                         f"Couldn't edit it: {err}")
-            return True
-        _owner_reply(chat_id, user_id, cmd_msg_id, "Edited.")
-        return True
+    # NOTE: /del and /edit were removed in v1.15.0 (scope cut) — they are
+    # intentionally unhandled and fall through to the conversational AI.
     if cmd == "restart":
         # Owner-only: clean daemon restart. The ephemeral ack must actually
         # be deleted BEFORE we exit, so the flag + shutdown happen in a
@@ -2619,6 +2660,29 @@ def draft_update(chat_id, draft_id, text):
     return False, backoff
 
 
+def _rich_violations(payload, method):
+    """Strict local pre-flight check for an outgoing rich payload.
+
+    Runs ron_richvalidate.validate_outgoing BEFORE send_healed. Returns
+    the list of hard violations (empty = clean). On violations a LOUD log
+    line is printed with the full list — the failure is loud in logs,
+    never silent — and the caller must fall back to plain text. Never
+    raises: a validator failure must not break the reply path.
+    """
+    if ron_richvalidate is None:
+        return []
+    try:
+        violations = [v for v in ron_richvalidate.validate_outgoing(
+            payload, method) if not v.startswith("WARN: ")]
+    except Exception as e:
+        print(f"[ron_daemon] RICH VALIDATION ERROR: {e}", flush=True)
+        return []
+    if violations:
+        print(f"[ron_daemon] RICH VALIDATION FAILED ({method}): "
+              f"{len(violations)} violation(s): {violations}", flush=True)
+    return violations
+
+
 def send_blocks(chat_id, blocks, reply_to=None, thread_id=None,
                 business_connection_id=None):
     """Blocks-form rich send (Bot API 10.3): buttons ride INSIDE the bubble.
@@ -2633,6 +2697,11 @@ def send_blocks(chat_id, blocks, reply_to=None, thread_id=None,
         payload["message_thread_id"] = thread_id
     if business_connection_id:
         payload["business_connection_id"] = business_connection_id
+    if _rich_violations(payload, "sendRichMessage"):
+        # Local validation failed (loud log already printed) — the user
+        # still gets the message as plain text; never raise to the caller.
+        return send(chat_id, strip_markdown(_blocks_text(blocks)),
+                    reply_to, thread_id, business_connection_id)
     try:
         # Self-healing: bad blocks are dropped and retried as plain text.
         return send_healed("sendRichMessage", payload, as_json=True)
@@ -2667,11 +2736,11 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
                   f"keyboard: {str(r)[:120]}", flush=True)
         except Exception as e:
             print(f"[ron_daemon] blocks build/send error: {e}", flush=True)
-    # No buttons, no blocks builder, or blocks failed: the classic path.
-    for row in rows:  # Bot API 10.3 styled buttons on the keyboard fallback
-        for b in row:
-            if "callback_data" in b:
-                b["style"] = "primary"
+    # No buttons, no blocks builder, or blocks failed: the classic path —
+    # markdown shape + under-bubble keyboard. NOTE: no "style" is added to
+    # classic InlineKeyboardButton dicts: "style" is a RichMessageButton
+    # (in-bubble) field only; the official InlineKeyboardButton has no
+    # such field (the local validator flags it).
     try:
         send_rich(chat_id, clean, kb, reply_to, thread_id,
                   business_connection_id)
@@ -3553,18 +3622,14 @@ def handle_callback(query):
         msg = query.get("message") or {}
         chat = msg.get("chat") or {}
         if chat.get("id"):
-            try:
-                rich_mod.api_json("sendRichMessage", {
-                    "chat_id": chat.get("id"),
-                    "rich_message": {"markdown":
-                        "🎲 *Spoiler quiz*\n"
-                        "What has keys but can't open locks?\n\n"
-                        "Tap to reveal: ||a piano|| 🎹\n\n"
-                        "Spoilers also work mid-sentence: the treasure was "
-                        "||under the old oak|| all along."},
-                })
-            except Exception:
-                pass
+            # Routed through send_rich (local validation + self-healing +
+            # plain-text fallback) — no more silent total failures.
+            send_rich(chat.get("id"),
+                      "🎲 *Spoiler quiz*\n"
+                      "What has keys but can't open locks?\n\n"
+                      "Tap to reveal: ||a piano|| 🎹\n\n"
+                      "Spoilers also work mid-sentence: the treasure was "
+                      "||under the old oak|| all along.")
         return
     if not data.startswith("q:"):
         # Phase 4: private-DM approval buttons (mem:go:<pid> / mem:no:<pid>).
