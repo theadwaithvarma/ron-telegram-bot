@@ -52,6 +52,13 @@ try:
 except Exception:
     ron_vision = None
 
+# Image generation (/imagine -> Pollinations). None-safe — without it the
+# bot tells users generation isn't supported instead of crashing.
+try:
+    import ron_imagen
+except Exception:
+    ron_imagen = None
+
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 from dynamic_credentials import dynamic_credential_entry, read_json_response
 
@@ -1526,7 +1533,7 @@ def parse_command(text):
 
 
 def handle_command(chat_id, user_id, cmd, is_private, text="",
-                   user_name="there"):
+                   user_name="there", reply_to=None, thread_id=None):
     if cmd == "shutdown":
         # Owner-only maintenance mode: the bot goes quiet for everyone
         # except the owner. /start (owner) wakes it back up.
@@ -1569,6 +1576,10 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
                 "ephemeral_message_parameters": {"receiver_user_id": user_id},
             })
         return True
+    if cmd == "imagine":
+        return _handle_imagine(chat_id, user_id, user_name, text,
+                               is_private, reply_to=reply_to,
+                               thread_id=thread_id)
     if cmd == "forget":
         # Phase 4: per-chat memory wipe. In a DM anyone can wipe their own
         # DM; in a group only the owner (group memory is shared).
@@ -1648,6 +1659,11 @@ def _handle_health(chat_id):
     try:
         if ron_vision is not None:
             info["images_24h"] = ron_vision.stats().get("images_24h")
+    except Exception:
+        pass
+    try:
+        if ron_imagen is not None:
+            info["images_gen_24h"] = ron_imagen.stats().get("images_gen_24h")
     except Exception:
         pass
     try:
@@ -2296,6 +2312,119 @@ def _vision_limit_text(retry_after):
             f"in {wait} and I'll take a look. \U0001F4F8")
 
 
+def _imagen_limit_text(retry_after):
+    """Provider-neutral generation-cap notice with a human wait estimate."""
+    secs = int(retry_after)
+    if secs >= 3600:
+        wait = f"~{secs // 3600}h {(secs % 3600) // 60}m"
+    else:
+        wait = f"~{max(1, (secs + 59) // 60)}m"  # round up: "come back in"
+    return ("I've hit my image-generation limit for now — try /imagine "
+            f"again in {wait}. \U0001F3A8")
+
+
+def _imagine_prompt(text):
+    """Strip the /imagine (or /imagine@bot) prefix, return the prompt."""
+    parts = (text or "").split(None, 1)
+    if not parts:
+        return ""
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _handle_imagine(chat_id, user_id, user_name, text, is_private,
+                    reply_to=None, thread_id=None):
+    """/imagine <prompt> -> generated image.
+
+    Rules (mirroring the vision path, all deliberate):
+    - Quota is checked BEFORE any provider call: a capped user gets the
+      limit notice with zero network burn, and failed generations never
+      consume quota (record_use runs only after a successful fetch).
+    - The fetch + upload run in a worker thread so slow generation never
+      stalls update polling.
+    - Maintenance silence for non-owners is enforced at the update level
+      (handle_update returns before commands), same as /poll.
+    - History stores "[generated image]" + prompt — never image bytes.
+    - Failures are provider-neutral: users never hear "pollinations".
+    """
+    prompt = _imagine_prompt(text)
+    if ron_imagen is None:
+        send(chat_id, "Image generation isn't available right now.",
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    if not prompt:
+        send(chat_id, "Tell me what to draw — e.g. "
+                      "/imagine a red fox in the snow \U0001F3A8",
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    allowed, retry_after = ron_imagen.check_limit(user_id, OWNER_ID)
+    if not allowed:
+        send(chat_id, _imagen_limit_text(retry_after),
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    _ai_imagine_reply(chat_id, user_id, user_name, prompt,
+                      private=is_private, reply_to=reply_to,
+                      thread_id=thread_id)
+    return True
+
+
+def _ai_imagine_reply(chat_id, user_id, user_name, prompt, private=True,
+                      reply_to=None, thread_id=None):
+    """Generate + upload an image off the poll loop, like ai_vision_reply."""
+    def _go():
+        ack_id = None
+        try:
+            r = send(chat_id, "\U0001F3A8 Generating your image…",
+                     reply_to=reply_to, thread_id=thread_id)
+            ack_id = (r.get("result") or {}).get("message_id")
+        except Exception:
+            ack_id = None
+        path = None
+        try:
+            path = ron_imagen.fetch_image(prompt)
+        except Exception as e:
+            print(f"[ron_daemon] imagine fetch failed: {e}", flush=True)
+            if ack_id:
+                ron_imagen.delete_message(chat_id, ack_id)
+            send_rich_with_kb(
+                chat_id,
+                "Couldn't generate that image — the image service hiccuped. "
+                "Try again in a bit. \U0001F3A8",
+                reply_to=reply_to, thread_id=thread_id)
+            return
+        try:
+            # Quota is spent only now — a successful generation.
+            ron_imagen.record_use(user_id, OWNER_ID)
+            caption = f"\U0001F3A8 {prompt[:200]}"
+            up = ron_imagen.send_photo(chat_id, path, caption=caption,
+                                       reply_to=reply_to, thread_id=thread_id)
+            if ack_id:
+                ron_imagen.delete_message(chat_id, ack_id)
+            if up.get("ok"):
+                try:
+                    ron_ai._save_turn(chat_id, f"/imagine {prompt}",
+                                      user_name,
+                                      f"[generated image] {prompt}", user_id)
+                except Exception as e:
+                    print(f"[ron_daemon] imagine history save failed: {e}",
+                          flush=True)
+            else:
+                print(f"[ron_daemon] imagine upload failed: "
+                      f"{str(up)[:200]}", flush=True)
+                send_rich_with_kb(
+                    chat_id,
+                    "The image was ready but the upload failed — "
+                    "try /imagine again. \U0001F3A8",
+                    reply_to=reply_to, thread_id=thread_id)
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    t = threading.Thread(target=_go, daemon=True)
+    t.start()
+
+
 def _handle_photo(msg, chat, frm, user_id, user_name, is_private):
     """Photo message -> vision reply.
 
@@ -2440,7 +2569,9 @@ def handle_update(upd):
                  reply_to=msg.get("message_id"), thread_id=msg.get("message_thread_id"))
         return
     if cmd and handle_command(chat_id, user_id, cmd, is_private, text,
-                               user_name):
+                               user_name,
+                               reply_to=msg.get("message_id"),
+                               thread_id=msg.get("message_thread_id")):
         return
 
     # Phase 4 (silent): track group membership and check for disclosure

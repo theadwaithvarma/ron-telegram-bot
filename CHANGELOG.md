@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.8.0 — 2026-09-20
+
+The bot can now draw. `/imagine a red fox in the snow` generates an
+image and sends it back as a photo, in DMs and groups.
+
+- **Image generation** (`/imagine`, `ron_imagen.py`) — prompt goes to a
+  free keyless image API (1024x1024 JPEG), uploaded via `sendPhoto`
+  multipart. Nothing runs on the bot itself: generation adds zero weight
+  and never slows regular chat — it only fires on an explicit command,
+  in a worker thread. A "Generating…" placeholder is deleted once the
+  photo lands; failures get an honest provider-neutral message and never
+  name the backend.
+- **Fair quota** — 10 successful generations per rolling 6 hours for
+  everyone; the owner is exempt. The limit is checked before any network
+  call, and quota is spent only after a successful generation.
+- **Privacy-first** — image bytes never touch history, memory, logs, or
+  durable storage; history keeps `[generated image]` + prompt. `/health`
+  reports images generated in the last 24h (merged into the images line
+  to keep the card at 8 lines).
+
+
 ## 1.7.0 — 2026-09-20
 
 The bot can now see. Send it a photo in DM (or mention it with a photo in

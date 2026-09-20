@@ -31,6 +31,14 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 - Privacy-first: image bytes never touch history, memory, logs, or disk; history keeps `[photo]` + caption only; vision runs with no history or memory attached
 - `/health` shows image reads from the last 24h
 
+### 🎨 Image Generation
+- `/imagine a red fox in the snow` — Ron generates an image and sends it back as a photo, in DMs and groups
+- Keyless provider (`ron_imagen.py`): prompt → 1024×1024 JPEG via `sendPhoto` multipart upload; nothing runs on the bot itself, so generation adds zero weight and never slows regular chat
+- "🎨 Generating…" placeholder is deleted once the photo lands; failures get an honest provider-neutral retry message
+- Fair quota: 10 generations per rolling 6 hours for everyone, owner exempt; quota is spent only on successful generations
+- Privacy-first: image bytes never touch history, memory, logs, or disk; history keeps `[generated image]` + prompt only
+- `/health` shows images generated in the last 24h
+
 ### 💬 Conversational AI
 - **Multi-provider brain** (`ron_ai.py`) with automatic failover: Groq → Gemini → OpenRouter, each with its own model ladder, tunable in `ron_ai.json`
 - Per-provider rate-limit cooldowns, dead-key detection, and silent skipping of providers you haven't keyed — runs fine on Groq alone
@@ -69,6 +77,7 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 | `/poll` | `/poll Question? \| Option A \| Option B` |
 | `/pollm` | Multi-answer poll — `/pollm Q? \| A \| B \| C` |
 | `/quiz` | Quiz mode — `/quiz Q? \| *Correct \| Wrong \| Wrong` |
+| `/imagine` | Generate an image — `/imagine a red fox in the snow` |
 | `/health` | Compact status card — uptime, AI chain, memory, cache, backup, restarts |
 | `/shutdown` | Owner only — maintenance mode: bot goes quiet for everyone but Adwaith |
 | `/start` | Owner only during maintenance — wakes the bot back up for everyone |

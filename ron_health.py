@@ -122,7 +122,10 @@ def build_health_card(info):
     lines.append(cache_line)
 
     n = info.get("images_24h")
-    lines.append(f"🖼 images read (24h): {n if n is not None else 'n/a'}")
+    g = info.get("images_gen_24h")
+    ns = n if n is not None else "n/a"
+    gs = g if g is not None else "n/a"
+    lines.append(f"🖼 images 24h: read {ns} · generated {gs}")
 
     bts = info.get("backup_ts")
     # Flag a backup pipeline that is failing: no good snapshot in 36h
