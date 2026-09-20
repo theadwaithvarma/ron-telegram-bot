@@ -155,6 +155,9 @@ _brain_failures = []         # timestamps of recent systemic AI failures
 _degraded = {"active": False, "since": 0.0}
 _degraded_notice_ts = {}     # chat_id -> last honest-notice timestamp
 _QUEUE_LOCK = threading.Lock()
+_TAP_LOCK = threading.Lock()
+_tap_ts = {}                 # (chat_id, user_id, data) -> last tap time
+_TAP_WINDOW = 30             # button-mash throttle window (seconds)
 
 
 def _heartbeat_loop():
@@ -218,6 +221,24 @@ def _queue_message(chat_id, user_id, user_name, text, reply_to=None,
              "private": private}
     with _QUEUE_LOCK:
         try:
+            # Dedupe: the same (chat, user, text) already queued
+            # (button-mash, double-sends) must not pile up — one queued
+            # copy is answered on recovery, the rest would just be spam.
+            try:
+                with open(DEGRADED_QUEUE) as f:
+                    for line in f:
+                        try:
+                            e = json.loads(line)
+                        except ValueError:
+                            continue
+                        if (str(e.get("chat_id")) == str(chat_id)
+                                and str(e.get("user_id")) == str(user_id)
+                                and (e.get("text") or "") == (text or "")):
+                            print("[ron_daemon] queue dedupe: already queued "
+                                  f"(chat={chat_id})", flush=True)
+                            return True
+            except FileNotFoundError:
+                pass
             with open(DEGRADED_QUEUE, "a") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:
@@ -2656,6 +2677,11 @@ def handle_callback(query):
         api("answerCallbackQuery", {"callback_query_id": query["id"]})
     except Exception:
         pass
+    # Maintenance mode covers button taps too: text messages are gated in
+    # handle_update, but callback queries arrive here directly. Non-owners
+    # get silence (the /start command still explains the break).
+    if maintenance_on() and frm.get("id") != OWNER_ID:
+        return
     if data == "demo_more":
         msg = query.get("message") or {}
         chat = msg.get("chat") or {}
@@ -2685,6 +2711,21 @@ def handle_callback(query):
     chat_id = chat.get("id")
     frm = query.get("from") or {}
     if chat_id:
+        # Button-mash throttle: every tap re-sends the label as a message,
+        # so a user hammering a button would burn one AI call per tap and
+        # flood the chat on degraded-queue replay. One tap per user+button
+        # per window; extras are dropped silently.
+        tap_key = (chat_id, frm.get("id"), data)
+        now = time.time()
+        with _TAP_LOCK:
+            last = _tap_ts.get(tap_key, 0)
+            _tap_ts[tap_key] = now
+            if len(_tap_ts) > 2000:
+                _tap_ts.clear()
+        if now - last < _TAP_WINDOW:
+            print(f"[ron_daemon] button-mash dropped (chat={chat_id} "
+                  f"user={frm.get('id')})", flush=True)
+            return
         ai_reply(chat_id, frm.get("id", 0), frm.get("first_name", "there"),
                  data[2:], private=(chat.get("type") == "private"),
                  thread_id=(msg.get("message_thread_id")))

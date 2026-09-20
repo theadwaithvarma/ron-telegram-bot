@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.8.2 — 2026-09-20
+
+Spam-guard hotfix. A user hammering a quick-reply button re-sent the
+button label as a message per tap; callback queries bypassed the
+maintenance-mode gate, each tap burned an AI call, and the degraded
+queue piled up duplicates that replayed as a group flood.
+
+- `handle_callback` now honors maintenance mode for non-owners
+  (silently ignored, like text messages).
+- Button-mash throttle: one tap per user+button per 30s; rapid repeat
+  taps are dropped before they reach the AI.
+- Degraded-queue dedupe: an identical (chat, user, text) entry already
+  queued is not appended again.
+
+
 ## 1.8.1 — 2026-09-20
 
 Hotfix for `/imagine`: the image provider's default backend started
