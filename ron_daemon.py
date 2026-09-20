@@ -2006,22 +2006,27 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
                      else f"Send failed: {err}")
         return True
     if cmd == "restart":
-        # Owner-only: clean daemon restart. Drops the flag file the
-        # watchdog honors, so the relaunch doesn't burn the crash
-        # counter or enter backoff.
+        # Owner-only: clean daemon restart. The ephemeral ack must actually
+        # be deleted BEFORE we exit, so the flag + shutdown happen in a
+        # background thread after the 30s deletion timer has fired.
+        # The watchdog honors the flag file: relaunch without burning the
+        # crash counter or entering backoff.
         if not _owner_gate(user_id):
             _owner_refuse(chat_id, user_id, cmd_msg_id)
             return True
-        try:
-            ron_owner.request_restart()
-        except Exception as e:
-            _owner_reply(chat_id, user_id, cmd_msg_id,
-                         f"Restart request failed: {e}")
-            return True
         _owner_reply(chat_id, user_id, cmd_msg_id,
                      "\U0001F504 Restarting \u2014 back in about a minute.")
-        ron_owner.flush()
-        _SHUTDOWN.set()
+
+        def _delayed_restart():
+            time.sleep(ron_owner.EPHEMERAL_TTL + 3)
+            try:
+                ron_owner.request_restart()
+            except Exception as e:
+                print(f"[ron_daemon] restart flag failed: {e}", flush=True)
+            ron_owner.flush()
+            _SHUTDOWN.set()
+
+        threading.Thread(target=_delayed_restart, daemon=True).start()
         return True
     if cmd == "quiet":
         # Owner-only: maintenance mode with auto-resume. /shutdown stays

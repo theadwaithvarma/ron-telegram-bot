@@ -600,11 +600,33 @@ class SayRestartTest(PowerBase):
         self.owner("say", "/say abc hi")
         self.assertIn("Usage", self.reply_text())
 
-    def test_restart_sets_flag_and_shutdown(self):
-        self.owner("restart", "/restart")
+    def test_restart_delays_flag_until_after_ephemeral(self):
+        # The restart flag + shutdown must happen AFTER the 30s ephemeral
+        # deletion, not immediately — or the ack would never be deleted.
+        import threading as th
+        spawned = []
+        orig_thread = th.Thread
+
+        class SpyThread(orig_thread):
+            def start(self):
+                spawned.append(self)
+                super().start()
+
+        orig_ttl = ron_owner.EPHEMERAL_TTL
+        ron_owner.EPHEMERAL_TTL = 0  # shrink the wait for the test
+        th.Thread = SpyThread
+        try:
+            self.owner("restart", "/restart")
+        finally:
+            th.Thread = orig_thread
+            ron_owner.EPHEMERAL_TTL = orig_ttl
         self.assertIn("Restarting", self.reply_text())
-        flag = ron_owner.restart_flag_path()
-        self.assertTrue(os.path.exists(flag))
+        # Not yet: nothing exits before the ephemeral window.
+        self.assertFalse(ron_daemon._SHUTDOWN.is_set())
+        self.assertFalse(os.path.exists(ron_owner.restart_flag_path()))
+        self.assertEqual(len(spawned), 1)
+        spawned[0].join(timeout=10)
+        self.assertTrue(os.path.exists(ron_owner.restart_flag_path()))
         self.assertTrue(ron_daemon._SHUTDOWN.is_set())
 
 
