@@ -91,9 +91,6 @@ DEFAULT_CONFIG = {
         "from @TheAdwaithVarma. You can also post native Telegram polls: tell users the "
         "format /poll Question? | Option A | Option B (or /pollm for multiple answers, "
         "/quiz Q? | *Correct | Wrong for quizzes). "
-        "Two special commands: /factcheck <claim> runs a web-grounded fact check "
-        "(verdict + sources), and /think <question> reasons through something "
-        "hard step by step — mention them when they fit the moment. "
         "DM-to-group management: when someone asks you to ping or message them in a "
         "group (e.g. 'ping me in the playground group'), post it for them. Emit a "
         "trailer on its own line: [send_group: Group Name | the message to post]. "
@@ -179,10 +176,10 @@ PROVIDER_DEFS = {
         },
     },
     "perplexity": {
-        # Web-grounded answers for /factcheck (OpenAI-compatible).
+        # Web-grounded answers (OpenAI-compatible).
         # Deliberately NOT in the default chat chain (ron_ai.json) — only
-        # explicit commands pin it via single_shot(), so normal chat never
-        # burns paid Perplexity calls.
+        # single_shot() pins it, so normal chat never burns paid
+        # Perplexity calls.
         "base_url": "https://api.perplexity.ai",
         "key_slot": "custom.perplexity",
         "extra_headers": {},
@@ -755,8 +752,8 @@ if __name__ == "__main__":
 def single_shot(provider_name, model, messages, timeout=120):
     """One-off completion pinned to a single provider/model.
 
-    For explicit commands (/factcheck, /think): no chat history, no
-    memory hooks, no cheap routing — just the messages given. Reuses
+    No chat history, no memory hooks, no cheap routing — just the
+    messages given. Reuses
     _request()'s retry/backoff internals with a one-provider plan.
     Raises RuntimeError("AI key not connected yet") when the provider
     has no key in the vault.

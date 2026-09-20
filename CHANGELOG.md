@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.10.0 — 2026-09-21
+
+`/factcheck` and `/think` removed (owner-approved).
+
+- Both commands, their routing, handlers, quota scopes, system-prompt
+  mentions, and owner quota-ping paths are gone. `/factcheck` /
+  `/think` now fall through to the conversational AI like any other
+  unknown command.
+- Deleted `ron_search` (web search backend, only used by `/factcheck`)
+  and `ron_cmdquota` (per-command quotas, only used by these two
+  scopes). `/imagine` and image-reading quotas are untouched — they
+  live in `ron_imagen` / `ron_vision` with their own owner pings.
+- `ron_ai.single_shot` stays as a general one-off completion utility.
+- Tests: `test_spotcmds.py` removed; `TestSingleShot` coverage kept in
+  new `tests/test_single_shot.py`. 211/214 green (3 pre-existing
+  failures: `cryptography` not installed in this VM's python —
+  `test_backup`, `test_memory`, `test_summary` — identical before
+  this change).
+
 ## 1.9.2 — 2026-09-21
 
 Owner quota visibility.
