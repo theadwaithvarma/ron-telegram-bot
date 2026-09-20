@@ -28,9 +28,8 @@ import subprocess
 import sys
 import time
 
-# Install dir: override with RON_BOT_DIR, otherwise the watchdog assumes
-# it lives next to ron_daemon.py.
-DIR = os.environ.get("RON_BOT_DIR") or os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser("~")
+DIR = os.path.join(HOME, "workspace", "telegram-bot")
 DAEMON = os.path.join(DIR, "ron_daemon.py")
 DAEMON_LOG = os.path.join(DIR, "ron_daemon.log")
 HEARTBEAT = os.path.join(DIR, "ron_heartbeat.json")
@@ -90,7 +89,7 @@ def daemon_pids():
 
     Matches the script path regardless of how python was invoked
     (bare `python3 ron_daemon.py` or the full
-    `/usr/bin/python3 /path/to/ron_daemon.py`).
+    `/usr/bin/python3 /home/hatch/workspace/telegram-bot/ron_daemon.py`).
     """
     try:
         out = subprocess.run(
@@ -220,9 +219,17 @@ def kill_pid(pid, name="daemon"):
 def start_daemon():
     """Launch the daemon detached. Returns True if a process appears."""
     log("starting daemon")
+    # A heartbeat file left by a dead daemon would look like a *hung*
+    # current daemon (stale mtime > HEARTBEAT_STALE_SECS) and get the fresh
+    # process killed before its first beat. Remove it so the new daemon
+    # starts under the "no heartbeat yet" grace period instead.
+    try:
+        os.unlink(HEARTBEAT)
+    except OSError:
+        pass
     try:
         subprocess.Popen(
-            [sys.executable, DAEMON],
+            ["/usr/bin/python3", DAEMON],
             cwd=DIR, stdin=subprocess.DEVNULL,
             stdout=open(DAEMON_LOG, "a"), stderr=subprocess.STDOUT,
             start_new_session=True)

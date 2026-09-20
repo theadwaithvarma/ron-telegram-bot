@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.7.0 — 2026-09-20
+
+The bot can now see. Send it a photo in DM (or mention it with a photo in
+a group) and it describes what it sees, powered by Gemini vision.
+
+- **Image reading** — photos arrive via a worker-thread pipeline
+  (`ron_vision.py`): largest Telegram size → RGB → max 768px → JPEG q80 →
+  base64 to `gemini-flash-lite-latest` (fallback `gemini-3.8-flash`).
+  Quota: 5 successful reads per rolling 6 hours for everyone; the owner
+  is exempt. Group photos are only read when the bot is mentioned in the
+  caption or the photo replies to the bot. Image bytes never touch
+  history, memory, logs or disk — history keeps `[photo]` + caption, and
+  vision runs with no history or memory attached. `/health` reports image
+  reads from the last 24h. Photos sent as files get a "resend as photo"
+  notice.
+- **Rich in-bubble buttons fixed** — button rows were being sent with an
+  invalid block type and silently fell back to a keyboard *under* the
+  message bubble. Messages carrying buttons now go out as valid
+  `InputRichBlockButtons` blocks (`ron_richblocks.py`: Markdown → blocks,
+  one buttons block per row), with the classic keyboard and plain-text
+  fallbacks preserved.
+- **Button label sanitizer** — the AI kept leaking Markdown and raw
+  `Label -> https://...` link syntax into button text. Labels are now
+  stripped of all formatting server-side, and misplaced link syntax is
+  rescued into a proper URL button instead of showing raw junk.
+- **Watchdog hardening** — two restart-loop bugs fixed: (1) `start_daemon()`
+  now unlinks the stale `ron_heartbeat.json` before launching, so a fresh
+  daemon is never misread as "hung" and SIGTERMed before its first beat;
+  (2) `ron-watchdog.service` uses `KillMode=process`, so restarting the
+  watchdog no longer kills the detached daemon (and no longer counts as a
+  crash → hour-long backoff).
+- 224/224 tests green, including 10 new vision tests and 5 new button-label
+  sanitizer tests.
+
 ## 1.6.0 — 2026-09-20
 
 Owner-only maintenance mode: Adwaith can now quiet the bot for everyone

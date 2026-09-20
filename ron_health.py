@@ -121,6 +121,9 @@ def build_health_card(info):
         cache_line = "⚡ cache n/a"
     lines.append(cache_line)
 
+    n = info.get("images_24h")
+    lines.append(f"🖼 images read (24h): {n if n is not None else 'n/a'}")
+
     bts = info.get("backup_ts")
     # Flag a backup pipeline that is failing: no good snapshot in 36h
     # while runs keep erroring. Surfaces in /health so a dead 3am cron

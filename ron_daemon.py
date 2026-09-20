@@ -37,6 +37,20 @@ try:
     import ron_health
 except Exception:
     ron_health = None
+# Rich-message blocks builder (Bot API 10.3): markdown -> blocks form so
+# buttons render INSIDE the bubble. None-safe — without it, button replies
+# fall back to the classic under-bubble keyboard.
+try:
+    import ron_richblocks
+except Exception:
+    ron_richblocks = None
+
+# Image reading (photos -> Gemini vision). None-safe — without it the bot
+# tells users photos aren't supported instead of crashing.
+try:
+    import ron_vision
+except Exception:
+    ron_vision = None
 
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 from dynamic_credentials import dynamic_credential_entry, read_json_response
@@ -494,19 +508,19 @@ def _dm_approval(user_id, text, pending_id):
     """DM a Yes/No approval request. Returns True if Telegram accepted it.
 
     Preferred path: sendRichMessage with a blocks-form message — the ask
-    as a text block plus the consent buttons as a Bot API 10.3 rich
-    buttons block (Yes = success/green, No = danger/red). Any failure
-    falls back to the classic plain message + inline keyboard; the
-    privacy guarantee holds either way (silent on failure, never degrade).
+    as paragraph block(s) plus one buttons block per row (Yes =
+    success/green, No = danger/red), rendering INSIDE the bubble. Any
+    failure falls back to the classic plain message + inline keyboard
+    (buttons under the bubble); the privacy guarantee holds either way
+    (silent on failure, never degrade).
     """
     try:
-        blocks = [rich_text_block(text),
-                  rich_buttons_block(
-                      ron_privacy.approval_button_rows(pending_id))]
-        r = rich_mod.api_json("sendRichMessage", {
-            "chat_id": user_id,
-            "rich_message": {"blocks": blocks},
-        })
+        if ron_richblocks is None:
+            raise RuntimeError("no blocks builder")
+        blocks = ron_richblocks.text_blocks(text)
+        blocks.extend(rich_buttons_blocks(
+            ron_privacy.approval_button_rows(pending_id)))
+        r = send_blocks(user_id, blocks)
         if r.get("ok"):
             return True
         print(f"[ron_daemon] rich approval send not ok: {str(r)[:120]}",
@@ -1330,81 +1344,119 @@ def strip_trailer_syntax(reply):
     return TOPIC_TAIL_RE.sub("", reply).strip()
 
 
+def _clean_btn_label(s):
+    """Button labels are plain text — strip Markdown the AI sometimes leaks
+    in (**bold**, `code`, ||spoiler||, ==highlight==) and collapse spaces."""
+    s = re.sub(r"(\*\*|__|`|~~|\|\||==)", "", s or "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def parse_trailers(reply):
     """Pull [buttons: ...] / [links: ...] trailer lines into an inline keyboard."""
     btns = (BTN_RE.search(reply) or BTN_TAIL_RE.search(reply) or [None, None])[1]
     links = (LINK_RE.search(reply) or LINK_TAIL_RE.search(reply) or [None, None])[1]
     clean = strip_trailer_syntax(reply)
     kb = []
+    link_row = []
+    # Spoiler markers contain the "|" separator — erase them before the
+    # split, or "||x||" shatters into phantom buttons.
+    if btns:
+        btns = btns.replace("||", "")
     if btns:
         # callback_data is capped at 64 bytes by Telegram — truncate by bytes,
         # not chars, so multibyte labels can't produce BUTTON_DATA_INVALID.
-        row = [{"text": b[:40], "callback_data": _cb64("q:" + b)}
-               for b in (x.strip() for x in btns.split("|")) if b][:8]
+        row = []
+        for b in (x.strip() for x in btns.split("|")):
+            if not b:
+                continue
+            # The AI sometimes puts link syntax inside [buttons: ...] —
+            # rescue it as a real URL button instead of showing raw junk.
+            if "->" in b:
+                label, url = (x.strip() for x in b.split("->", 1))
+                if url.startswith("http"):
+                    link_row.append({"text": _clean_btn_label(label)[:40],
+                                     "url": url})
+                    continue
+            label = _clean_btn_label(b)
+            if label:
+                row.append({"text": label[:40],
+                            "callback_data": _cb64("q:" + label)})
+            if len(row) >= 8:
+                break
         if row:
             kb.append(row)
     if links:
-        row = []
         for part in (x.strip() for x in links.split("|") if x.strip()):
             if "->" not in part:
                 continue
             label, url = (x.strip() for x in part.split("->", 1))
             if url.startswith("http"):
-                row.append({"text": label[:40], "url": url})
-        if row:
-            kb.append(row[:8])
+                link_row.append({"text": _clean_btn_label(label)[:40],
+                                 "url": url})
+    if link_row:
+        kb.append(link_row[:8])
     return clean, {"inline_keyboard": kb} if kb else None
 
 
 # ---------------------------------------------------------------------------
 # Rich message buttons (Bot API 10.3) — used "whenever necessary".
 #
-# Rule: rich buttons where the bot owns the full message (fixed-format DMs
-# like the privacy approval ask). Where the message body is AI-generated
-# markdown, we keep the classic styled inline keyboard via reply_markup —
-# converting markdown to blocks is out of scope and buys nothing.
+# In-bubble buttons REQUIRE the blocks form of rich_message
+# ({"blocks": [...]}); the classic reply_markup keyboard always renders
+# UNDER the bubble. So: messages that carry buttons go out as blocks
+# (paragraph/blockquote/list/pre blocks + one buttons block per row).
 # ---------------------------------------------------------------------------
 _RICH_BTN_STYLES = ("primary", "success", "danger", "link")
+# RichMessageButton takes the same actions as an inline keyboard button.
+_RICH_BTN_ACTIONS = ("callback_data", "url", "web_app", "login_url",
+                     "switch_inline_query",
+                     "switch_inline_query_current_chat",
+                     "switch_inline_query_chosen_chat", "copy_text")
 
 
-def rich_buttons_block(rows, align="left"):
-    """Build an InputRichBlockButtons block from keyboard rows.
+def rich_buttons_block(row, align="left"):
+    """Build ONE InputRichBlockButtons block from a single row (1-8 buttons).
 
-    Each row holds 1-8 button dicts: {"text", exactly one of
-    "callback_data"/"url", optional "style"}. Returns the block dict for
-    rich_message["blocks"].
+    Each button holds {"text", exactly ONE action from _RICH_BTN_ACTIONS,
+    optional "style"}. The block renders as a button row INSIDE the message
+    bubble — this is the fix for buttons landing under the bubble.
     """
     if align not in ("left", "center", "right"):
         align = "left"
+    if not row or len(row) > 8:
+        raise ValueError("rich button row must hold 1-8 buttons")
     btns = []
-    for row in rows:
-        if not row or len(row) > 8:
-            raise ValueError("rich button row must hold 1-8 buttons")
-        for b in row:
-            actions = [k for k in ("callback_data", "url") if b.get(k)]
-            if len(actions) != 1:
-                raise ValueError(
-                    "RichMessageButton needs exactly one action")
-            rb = {"text": (b.get("text") or "")[:64]}
-            if "callback_data" in b:
-                # 64-byte cap, UTF-8 safe (same rule as inline keyboards).
-                rb["callback_data"] = _cb64(b["callback_data"])
-            else:
-                rb["url"] = b["url"]
-            style = b.get("style")
-            if style in _RICH_BTN_STYLES:
-                rb["style"] = style
-            elif "callback_data" in b:
-                rb["style"] = "primary"
-            btns.append(rb)
-    if not btns:
-        raise ValueError("no buttons to build a block from")
+    for b in row:
+        actions = [k for k in _RICH_BTN_ACTIONS if b.get(k) is not None]
+        if len(actions) != 1:
+            raise ValueError("RichMessageButton needs exactly one action")
+        rb = {"text": (b.get("text") or "")[:64]}
+        if actions[0] == "callback_data":
+            # 64-byte cap, UTF-8 safe (same rule as inline keyboards).
+            rb["callback_data"] = _cb64(b["callback_data"])
+        else:
+            rb[actions[0]] = b[actions[0]]
+        style = b.get("style")
+        if style in _RICH_BTN_STYLES:
+            rb["style"] = style
+        elif actions[0] == "callback_data":
+            rb["style"] = "primary"
+        btns.append(rb)
     return {"type": "buttons", "buttons": btns, "align": align}
 
 
+def rich_buttons_blocks(rows, align="left"):
+    """One InputRichBlockButtons block per row (Telegram: 1-8 per row)."""
+    if not rows:
+        raise ValueError("no buttons to build a block from")
+    return [rich_buttons_block(row, align) for row in rows]
+
+
 def rich_text_block(text):
-    """Plain-text block for a blocks-form rich message."""
-    return {"type": "text", "text": {"type": "text", "text": text or ""}}
+    """Single paragraph block. (The old {"type": "text", ...} shape was
+    rejected by the API — "type text is unsupported". Verified 2026-09-20:
+    the text block is {"type": "paragraph", "text": RichText}.)"""
+    return {"type": "paragraph", "text": text or ""}
 
 
 def strip_markdown(t):
@@ -1594,6 +1646,11 @@ def _handle_health(chat_id):
     except Exception:
         pass
     try:
+        if ron_vision is not None:
+            info["images_24h"] = ron_vision.stats().get("images_24h")
+    except Exception:
+        pass
+    try:
         with open(os.path.join(HOME, "workspace", "telegram-bot",
                                "ron_backup.json"),
                   "r", encoding="utf-8") as f:
@@ -1743,17 +1800,58 @@ def draft_update(chat_id, draft_id, text):
     return False, backoff
 
 
+def send_blocks(chat_id, blocks, reply_to=None, thread_id=None,
+                business_connection_id=None):
+    """Blocks-form rich send (Bot API 10.3): buttons ride INSIDE the bubble.
+
+    Returns the API response dict ({"ok": ...}). Never raises — failures
+    come back as {"ok": False} so callers can degrade gracefully.
+    """
+    payload = {"chat_id": chat_id, "rich_message": {"blocks": blocks}}
+    if reply_to:
+        payload["reply_parameters"] = {"message_id": reply_to}
+    if thread_id:
+        payload["message_thread_id"] = thread_id
+    if business_connection_id:
+        payload["business_connection_id"] = business_connection_id
+    try:
+        return rich_mod.api_json("sendRichMessage", payload)
+    except Exception as e:
+        print(f"[ron_daemon] blocks send error: {e}", flush=True)
+        return {"ok": False, "error": str(e)[:150]}
+
+
 def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
                       business_connection_id=None):
-    """Trailer parsing + styled buttons + rich send with safe fallbacks."""
+    """Trailer parsing + IN-BUBBLE rich buttons with safe fallbacks.
+
+    When the reply carries [buttons:]/[links:] trailers, the message goes
+    out in blocks form (paragraph/quote/list/code blocks converted from
+    the markdown, plus one buttons block per row) so the buttons render
+    inside the bubble. Any failure degrades to the classic markdown +
+    under-bubble keyboard, then plain text — the reply always lands.
+    """
     clean, kb = parse_trailers(reply)
     if not clean:
         clean = "On it ✓"  # trailer-only/empty reply: say something
-    if kb:  # Bot API 10.3 styled buttons
-        for row in kb["inline_keyboard"]:
-            for b in row:
-                if "callback_data" in b:
-                    b["style"] = "primary"
+    rows = kb["inline_keyboard"] if kb else []
+    if rows and ron_richblocks is not None:
+        try:
+            blocks = ron_richblocks.markdown_to_blocks(clean)
+            blocks.extend(rich_buttons_blocks(rows))
+            r = send_blocks(chat_id, blocks, reply_to, thread_id,
+                            business_connection_id)
+            if r.get("ok"):
+                return r
+            print(f"[ron_daemon] blocks send not ok, falling back to "
+                  f"keyboard: {str(r)[:120]}", flush=True)
+        except Exception as e:
+            print(f"[ron_daemon] blocks build/send error: {e}", flush=True)
+    # No buttons, no blocks builder, or blocks failed: the classic path.
+    for row in rows:  # Bot API 10.3 styled buttons on the keyboard fallback
+        for b in row:
+            if "callback_data" in b:
+                b["style"] = "primary"
     try:
         send_rich(chat_id, clean, kb, reply_to, thread_id,
                   business_connection_id)
@@ -1821,13 +1919,13 @@ def canned_reply(text, chat_id):
     return variants[abs(hash((str(chat_id), norm))) % len(variants)]
 
 
-def stream_ai_reply(chat_id, user_id, user_name, text):
-    """Native draft streaming for 1:1 chats (Bot API sendMessageDraft): the
-    reply animates in a draft bubble as tokens arrive (ChatGPT-style),
-    throttled to stay under Telegram's rate limits. The client's native Stop
-    button halts generation via the stopped_message_generation update.
-    Drafts auto-expire; the final sendRichMessage is the persistent reply.
-    Falls back to a single send on any failure."""
+def _stream_with_draft(chat_id, produce):
+    """Shared native-draft streaming core (Bot API sendMessageDraft).
+
+    produce(on_token, stop_event) runs the AI call and returns the full
+    reply text. Handles the stop-event slot, throttled draft pushes, and
+    the final rich send. Returns the reply text.
+    """
     stop_event = threading.Event()
     STOP_EVENTS[chat_id] = stop_event
     buf = []
@@ -1858,10 +1956,7 @@ def stream_ai_reply(chat_id, user_id, user_name, text):
                 next_push_ok[0] = now + backoff
 
     try:
-        reply = ron_ai.chat_stream(chat_id, text, user_name, on_token,
-                                   stop_event=stop_event,
-                                   system_extra=group_context(),
-                                   user_id=user_id, is_private=True)
+        reply = produce(on_token, stop_event)
     finally:
         # Only clear our own slot — a newer concurrent stream in this chat
         # may have registered its event after us.
@@ -1872,11 +1967,48 @@ def stream_ai_reply(chat_id, user_id, user_name, text):
     # on generation failure the exception propagates and the caller's
     # single-send fallback replies — never an expired preview with nothing.
     send_rich_with_kb(chat_id, reply)
+    return reply
+
+
+def stream_ai_reply(chat_id, user_id, user_name, text):
+    """Native draft streaming for 1:1 chats (Bot API sendMessageDraft): the
+    reply animates in a draft bubble as tokens arrive (ChatGPT-style),
+    throttled to stay under Telegram's rate limits. The client's native Stop
+    button halts generation via the stopped_message_generation update.
+    Drafts auto-expire; the final sendRichMessage is the persistent reply.
+    Falls back to a single send on any failure."""
+    reply = _stream_with_draft(
+        chat_id,
+        lambda on_token, stop_event: ron_ai.chat_stream(
+            chat_id, text, user_name, on_token,
+            stop_event=stop_event, system_extra=group_context(),
+            user_id=user_id, is_private=True))
     handle_group_sends(chat_id, user_id, user_name, reply)
     handle_send_topic(chat_id, user_id, user_name, reply)
     handle_topic_actions(chat_id, user_name, reply)
     # Phase 6: return the reply text (truthy, like the old True) so the
     # caller can store it in the answer cache.
+    return reply
+
+
+def stream_vision_reply(chat_id, user_id, user_name, caption, image_b64):
+    """Vision variant of stream_ai_reply: same draft streaming, Gemini
+    vision backend. History stores "[photo]" — never image bytes.
+
+    Vision replies skip the group-send/topic-action side effects: the
+    vision prompt is memory-blind by construction (no private facts in,
+    none can leak out), and bracket text in a photo description must not
+    trigger cross-chat actions.
+    """
+    reply = _stream_with_draft(
+        chat_id,
+        lambda on_token, stop_event: ron_ai.vision_stream(
+            image_b64, caption, on_token, stop_event))
+    try:
+        ron_ai._save_turn(chat_id, ("[photo] " + (caption or "")).strip(),
+                          user_name, reply, user_id)
+    except Exception:
+        pass
     return reply
 
 
@@ -2051,6 +2183,80 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
     t.start()
 
 
+def ai_vision_reply(chat_id, user_id, user_name, caption, file_id,
+                    private=True, reply_to=None, thread_id=None,
+                    business_connection_id=None):
+    """Photo -> vision answer, run off the poll loop like ai_reply.
+
+    The Telegram download happens inside the worker thread so a slow
+    fetch never stalls update polling. Quota is recorded only after a
+    successful fetch — a failed download never consumes one of the 5.
+
+    Differences from the text path, all deliberate:
+    - No semantic cache: image bytes can't be keyed meaningfully, and the
+      5-per-6h cap already bounds cost.
+    - No degraded queue: image bytes can't be queued and replayed later,
+      so a dead vision backend gets an honest message instead.
+    - Vision failures never feed the shared brain-failure counter: the
+      vision backend (Gemini-only) is independent of the text chain, so a
+      vision quota exhaustion must not push text chat into degraded mode.
+    - The vision prompt carries no memory/history: it is memory-blind by
+      construction, so nothing private can leak through a photo answer.
+    """
+    def _go():
+        cur = threading.current_thread()
+        try:
+            if ron_vision is None:
+                return
+            try:
+                image_b64 = ron_vision.fetch_photo_b64(file_id)
+            except Exception as e:
+                print(f"[ron_daemon] photo fetch failed: {e}", flush=True)
+                send_rich_with_kb(chat_id, "Couldn't grab that photo — "
+                                  "try sending it again. \U0001F4F8",
+                                  reply_to, thread_id, business_connection_id)
+                return
+            ron_vision.record_use(user_id, OWNER_ID)
+            lm = ron_ai.light_mode_enabled()
+            try:
+                if private and not business_connection_id and not lm:
+                    stream_vision_reply(chat_id, user_id, user_name,
+                                        caption, image_b64)
+                else:
+                    # groups / business / light mode: single send.
+                    send_typing(chat_id, business_connection_id)
+                    reply = ron_ai.vision_stream(image_b64, caption)
+                    try:
+                        ron_ai._save_turn(
+                            chat_id, ("[photo] " + (caption or "")).strip(),
+                            user_name, reply, user_id)
+                    except Exception:
+                        pass
+                    if lm:
+                        reply += ron_ai.light_mode_notice(user_id)
+                    send_rich_with_kb(chat_id, reply, reply_to, thread_id,
+                                      business_connection_id)
+            except Exception as e:
+                msg = str(e)
+                if "not connected yet" in msg:
+                    reply = ("My AI brain isn't plugged in yet \u2014 "
+                             "the human's hooking up the API key, one sec. \U0001F527")
+                elif "rate limited" in msg:
+                    reply = ("Whoa, too many requests at once \u2014 "
+                             "give it a minute and try again. \u23F3")
+                else:
+                    reply = "Couldn't read that image \u2014 try again in a bit. \U0001F9E0"
+                    print(f"[ron_daemon] vision error: {e}", flush=True)
+                send_rich_with_kb(chat_id, reply, reply_to, thread_id,
+                                  business_connection_id)
+        finally:
+            _untrack(cur)
+
+    t = threading.Thread(target=_go, daemon=True)
+    _track(t)
+    t.start()
+
+
 def _entity_text(text, entity):
     """Slice a message entity using Telegram's UTF-16 offsets.
 
@@ -2077,6 +2283,68 @@ def _u16_len(s):
 def _cb64(s):
     """Truncate to Telegram's 64-byte callback_data limit (UTF-8 safe)."""
     return s.encode("utf-8")[:64].decode("utf-8", "ignore")
+
+
+def _vision_limit_text(retry_after):
+    """Provider-neutral image-cap notice with a human wait estimate."""
+    secs = int(retry_after)
+    if secs >= 3600:
+        wait = f"~{secs // 3600}h {(secs % 3600) // 60}m"
+    else:
+        wait = f"~{max(1, (secs + 59) // 60)}m"  # round up: "come back in"
+    return ("I've hit my image-reading limit for now — send another photo "
+            f"in {wait} and I'll take a look. \U0001F4F8")
+
+
+def _handle_photo(msg, chat, frm, user_id, user_name, is_private):
+    """Photo message -> vision reply.
+
+    Rules: DMs always; groups only when the bot is mentioned in the
+    caption or the photo replies to the bot (same as text). 5 images per
+    rolling 6 hours per user, owner exempt. Maintenance mode silences
+    everyone but the owner, like text. Only the largest Telegram size is
+    read; photo-documents (sent as files) aren't handled in v1.
+    """
+    chat_id = chat.get("id")
+    message_id = msg.get("message_id")
+    thread_id = msg.get("message_thread_id")
+    caption = (msg.get("caption") or "").strip()
+    if ron_vision is None:
+        send(chat_id, "I can't read images yet — the human's still "
+                      "wiring that up. \U0001F4F8",
+             reply_to=message_id, thread_id=thread_id)
+        return
+    if maintenance_on() and user_id != OWNER_ID:
+        return
+    if not is_private:
+        # Same engagement rule as text: caption mention or reply-to-bot.
+        # (Caption entities live in caption_entities, not entities.)
+        entities = msg.get("caption_entities", [])
+        mentioned = any(
+            e.get("type") == "mention"
+            and BOT_USERNAME in _entity_text(caption, e)
+            for e in entities)
+        replied_to_me = (((msg.get("reply_to_message") or {}).get("from")
+                          or {}).get("is_bot"))
+        if not (mentioned or replied_to_me):
+            print(f"[ron_daemon] photo skipped (group, no mention/reply): "
+                  f"chat={chat_id} user={user_id}", flush=True)
+            return
+    # Cap check BEFORE any download/API burn. The owner is exempt.
+    allowed, retry_after = ron_vision.check_limit(user_id, OWNER_ID)
+    if not allowed:
+        send(chat_id, _vision_limit_text(retry_after),
+             reply_to=message_id, thread_id=thread_id)
+        return
+    photos = msg.get("photo") or []
+    file_id = (photos[-1] or {}).get("file_id")  # largest size is last
+    if not file_id:
+        return
+    # The download + vision call run in ai_vision_reply's worker thread —
+    # the poll loop only did the cheap gating above.
+    ai_vision_reply(chat_id, user_id, user_name, caption, file_id,
+                    private=is_private, reply_to=message_id,
+                    thread_id=thread_id)
 
 
 def handle_update(upd):
@@ -2142,7 +2410,8 @@ def handle_update(upd):
     user_id = frm.get("id", 0)
 
     text = msg.get("text", "").strip()
-    if not text:
+    photos = msg.get("photo") or []
+    if not text and not photos:
         return
     user_name = frm.get("first_name", "there")
     is_private = chat.get("type") == "private"
@@ -2152,6 +2421,23 @@ def handle_update(upd):
     # no AI calls, no replies). /start still reaches handle_command so
     # non-owners get the "taking a break" notice and the owner can wake up.
     if maintenance_on() and user_id != OWNER_ID and cmd != "start":
+        return
+    # Photos (no text): vision path. Caption, if any, is the question.
+    if photos and not text:
+        print(f"[ron_daemon] photo msg: chat={chat_id} user={user_id} "
+              f"private={is_private} caption={bool(msg.get('caption'))}",
+              flush=True)
+        _handle_photo(msg, chat, frm, user_id, user_name, is_private)
+        return
+    if msg.get("document") and msg["document"].get("mime_type", "").startswith("image/"):
+        # Photo sent as a file: not supported in v1 — say so instead of
+        # going silent, or the user thinks the bot is broken.
+        print(f"[ron_daemon] photo-as-document ignored: chat={chat_id} user={user_id}",
+              flush=True)
+        if not (maintenance_on() and user_id != OWNER_ID):
+            send(chat_id, "I can only read photos sent as photos \U0001F4F8 — "
+                          "not as files. Resend it as a photo and I'll take a look.",
+                 reply_to=msg.get("message_id"), thread_id=msg.get("message_thread_id"))
         return
     if cmd and handle_command(chat_id, user_id, cmd, is_private, text,
                                user_name):

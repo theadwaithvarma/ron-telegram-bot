@@ -79,7 +79,12 @@ DEFAULT_CONFIG = {
         "the current topic and this person's apparent interests — never "
         "generic boilerplate like 'Study tip' or 'Code help' for someone who "
         "isn't into those things. A reply about gaming should offer gaming "
-        "follow-ups, not study advice. You may also add [links: Label -> "
+        "follow-ups, not study advice. Button labels are plain text: 2-4 "
+        "words max, no Markdown, no URLs, no arrows, no echoing the label "
+        "as the action. [buttons: ...] is for quick replies (tapping one "
+        "re-sends its label as the user's next message); [links: Label -> "
+        "https://...] is only for real URLs — never mix the two syntaxes. "
+        "You may also add [links: Label -> "
         "https://...] when a genuinely relevant link exists. "
         "If someone asks "
         "what you can do: chat, answer questions, help with code, study help, tech news "
@@ -735,39 +740,13 @@ if __name__ == "__main__":
     print(chat("selftest", "Reply with exactly: brain online"))
 
 
-def chat_stream(chat_id, user_text, user_name="there", on_token=None,
-               stop_event=None, system_extra="", user_id=0, is_private=True):
-    """Streaming conversational turn. Calls on_token(chunk) per token as the
-    model generates. If stop_event is set, generation halts early.
-    Returns the assistant's full reply text."""
-    cfg = load_config()
-    # Phase 6: rolling summary + the PROMPT_RECENT most recent raw turns,
-    # not the full raw history every call.
-    turns, summary = _prompt_turns(chat_id, user_text, user_name)
-    # Token economy: greetings/small-talk get the small model + short prompt.
-    # Light mode forces cheap routing for every message.
-    cheap = _use_cheap(user_text, cfg)
-    # Phase 4: bounded memory recall (skipped for cheap small-talk).
-    mem_extra = ""
-    if MEMORY_RECALL_HOOK is not None and not cheap:
-        try:
-            mem_extra = MEMORY_RECALL_HOOK(chat_id, user_text, is_private) or ""
-        except Exception:
-            mem_extra = ""
-    # Prompt budget: system (~2600 full / ~270 cheap) + summary (<=1200) +
-    # PROMPT_RECENT verbatim turns + bounded recall — far under the old
-    # full-history cost; the store keeps <=48 raw turns per chat.
-    summary_block = ("\n[Earlier in this chat — summarized for continuity:]\n"
-                     + summary + "\n") if summary else ""
-    system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
-              else cfg["system"]) + summary_block + (system_extra or "") + mem_extra
-    messages = [{"role": "system", "content": system}] + turns
+def _drain_stream(resp, stop_event, on_token):
+    """Read an SSE chat-completions stream to completion.
 
-    try:
-        resp = _request(cfg, messages, stream=True, timeout=120, cheap=cheap)
-    except DynamicCredentialError:
-        raise RuntimeError("AI key not connected yet")
-
+    Shared by chat_stream() and vision_stream(): stall watchdog, total
+    cap, dead-stream fail-fast, per-token callback. Returns the raw
+    concatenated text (unstripped); raises on stall/close/empty.
+    """
     parts = []
     start = time.time()
     last_data = start
@@ -808,7 +787,7 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
             delta = ((ev.get("choices") or [{}])[0].get("delta") or {}).get("content")
             if delta:
                 parts.append(delta)
-                if on_token:
+                if on_token is not None:
                     try:
                         on_token(delta)
                     except Exception:
@@ -818,8 +797,90 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
             resp.close()
         except Exception:
             pass
+    return "".join(parts)
 
-    reply = "".join(parts).strip()
+
+# Vision routing (image reading): Groq's key only serves text-only gpt-oss
+# models, so photos skip the normal chain and go straight to Gemini —
+# flash-lite first (much larger free-tier request quota), 3.8-flash behind
+# it. Same OpenAI-compatible /chat/completions transport, image as a
+# base64 data-URL content part.
+VISION_PROVIDERS = [
+    {"name": "gemini",
+     "models": ["gemini-flash-lite-latest", "gemini-3.8-flash"]},
+]
+VISION_SYSTEM = (
+    "You are Ron, a direct no-fluff assistant inside a Telegram bot. "
+    "The user sent a photo. Answer their question about it, or describe "
+    "what you see if they asked nothing. Be concise and concrete: name "
+    "visible objects, text, and notable details. If the image is blurry, "
+    "irrelevant, or you genuinely can't tell, say so plainly instead of "
+    "guessing. Keep Telegram Markdown formatting (**bold**, `code`) light."
+)
+
+
+def vision_stream(image_b64, caption="", on_token=None, stop_event=None):
+    """One vision turn: describe/answer about a base64 JPEG image.
+
+    Streams reply text via on_token like chat_stream. Raises
+    RateLimitedError when Gemini is cooling down / out of quota, or
+    RuntimeError when no key is connected — callers degrade to an honest
+    short message, never a second provider (none other can see images).
+    """
+    cfg = {"providers": VISION_PROVIDERS}
+    question = (caption or "").strip() or "Describe this image."
+    messages = [
+        {"role": "system", "content": VISION_SYSTEM},
+        {"role": "user", "content": [
+            {"type": "text", "text": question},
+            {"type": "image_url",
+             "image_url": {"url": "data:image/jpeg;base64," + image_b64}},
+        ]},
+    ]
+    try:
+        resp = _request(cfg, messages, stream=True, timeout=120)
+    except DynamicCredentialError:
+        raise RuntimeError("AI key not connected yet")
+    reply = _drain_stream(resp, stop_event, on_token).strip()
+    if not reply:
+        raise RuntimeError("AI backend returned empty reply")
+    return reply[:MAX_REPLY]
+
+
+def chat_stream(chat_id, user_text, user_name="there", on_token=None,
+               stop_event=None, system_extra="", user_id=0, is_private=True):
+    """Streaming conversational turn. Calls on_token(chunk) per token as the
+    model generates. If stop_event is set, generation halts early.
+    Returns the assistant's full reply text."""
+    cfg = load_config()
+    # Phase 6: rolling summary + the PROMPT_RECENT most recent raw turns,
+    # not the full raw history every call.
+    turns, summary = _prompt_turns(chat_id, user_text, user_name)
+    # Token economy: greetings/small-talk get the small model + short prompt.
+    # Light mode forces cheap routing for every message.
+    cheap = _use_cheap(user_text, cfg)
+    # Phase 4: bounded memory recall (skipped for cheap small-talk).
+    mem_extra = ""
+    if MEMORY_RECALL_HOOK is not None and not cheap:
+        try:
+            mem_extra = MEMORY_RECALL_HOOK(chat_id, user_text, is_private) or ""
+        except Exception:
+            mem_extra = ""
+    # Prompt budget: system (~2600 full / ~270 cheap) + summary (<=1200) +
+    # PROMPT_RECENT verbatim turns + bounded recall — far under the old
+    # full-history cost; the store keeps <=48 raw turns per chat.
+    summary_block = ("\n[Earlier in this chat — summarized for continuity:]\n"
+                     + summary + "\n") if summary else ""
+    system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
+              else cfg["system"]) + summary_block + (system_extra or "") + mem_extra
+    messages = [{"role": "system", "content": system}] + turns
+
+    try:
+        resp = _request(cfg, messages, stream=True, timeout=120, cheap=cheap)
+    except DynamicCredentialError:
+        raise RuntimeError("AI key not connected yet")
+
+    reply = _drain_stream(resp, stop_event, on_token).strip()
     if not reply:
         raise RuntimeError("AI backend returned empty reply")
     reply = reply[:MAX_REPLY]

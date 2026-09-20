@@ -21,6 +21,13 @@ Environment=HOME=/home/hatch
 EnvironmentFile=/home/hatch/.config/ron/env
 WorkingDirectory=/home/hatch/workspace/telegram-bot
 ExecStart=/usr/bin/python3 /home/hatch/workspace/telegram-bot/ron_watchdog.py --loop
+# KillMode=process: the daemon is launched detached (own session) and is
+# NOT part of this service's lifecycle. Default control-group killing
+# would SIGTERM the daemon on every watchdog restart, and the watchdog
+# would then count that SIGTERM as a "crash" and sit in backoff for up
+# to an hour instead of supervising. With process mode, restarting the
+# watchdog leaves a healthy daemon untouched.
+KillMode=process
 Restart=always
 RestartSec=30
 

@@ -1,3 +1,4 @@
 # Ron Telegram bot
 cryptography==50.0.1  # memory encryption at rest (Fernet); everything else is stdlib
 # Python 3.8+ (uses urllib, json, threading, signal from stdlib).
+Pillow==10.2.0  # vision pipeline: downscale photos before Gemini (RGB, max 768px, JPEG q80)

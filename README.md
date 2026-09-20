@@ -24,6 +24,13 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 
 ## 🚀 Features
 
+### 📷 Image Reading
+- Send Ron a photo in DM (or mention it with a photo in a group) and it describes what it sees, via Gemini vision
+- Worker-thread pipeline (`ron_vision.py`): largest Telegram size → RGB → max 768px → JPEG q80 → base64; `gemini-flash-lite-latest` with `gemini-3.8-flash` fallback
+- Fair quota: 5 reads per rolling 6 hours for everyone, owner exempt; group photos only when the bot is mentioned or replied to
+- Privacy-first: image bytes never touch history, memory, logs, or disk; history keeps `[photo]` + caption only; vision runs with no history or memory attached
+- `/health` shows image reads from the last 24h
+
 ### 💬 Conversational AI
 - **Multi-provider brain** (`ron_ai.py`) with automatic failover: Groq → Gemini → OpenRouter, each with its own model ladder, tunable in `ron_ai.json`
 - Per-provider rate-limit cooldowns, dead-key detection, and silent skipping of providers you haven't keyed — runs fine on Groq alone
@@ -46,7 +53,7 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 - **Oversharing guard**: ask something personal in a group and Ron checks with you privately before answering publicly
 
 ### 🩺 Self-Healing
-- **Watchdog supervisor** (`ron_watchdog.py`): 60-second checks for dead or hung daemons, duplicate processes, and broken configs — with exponential restart backoff and last-known-good config restore (see `ron-watchdog.service.example` for systemd)
+- **Watchdog supervisor** (`ron_watchdog.py`): 60-second checks for dead or hung daemons, duplicate processes, and broken configs — with exponential restart backoff and last-known-good config restore (see `ron-watchdog.service.example` for systemd). `KillMode=process` keeps watchdog restarts from SIGTERMing the detached daemon; the launcher clears stale heartbeats so fresh daemons are never misread as hung
 - **Degraded mode**: if every provider keeps failing, Ron queues messages to disk, tells users honestly, and replays everything on recovery — no silent drops, no duplicates
 - **Nightly encrypted backups** (`ron_backup.py` + `ron-backup.timer.example`): every night at 03:00 IST the memory DB, cache DB, and JSON state are snapshotted (SQLite online backup API — safe against the live daemon), bundled, and Fernet-encrypted with the same `RON_MEMORY_KEY` the memory DB uses. Last 7 snapshots kept; each bundle is decrypted and integrity-checked before it counts. Fails closed (loud log, never an unencrypted backup) when the key is missing
 - **`/health` status card** (`ron_health.py`): uptime, brain state, AI chain (primary / fallback-N, provider-neutral — never names backends), memory + summary counts, cache hit-rate and tokens saved, backup freshness (with a ⚠️ if the nightly run is failing), and watchdog restart count. Cheap local reads only — no AI call, works in light and degraded mode
@@ -70,7 +77,7 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 - **DM-to-group pings** — `[send_group: Group Name | message]` posts your message in a group, mentioning you (fuzzy group-name resolution)
 - **Forum topic management** — detects forum status via cached `getChat`, auto-purges stale topics when a group disables them
 - `[topic: ...]` and `[send_topic: ...]` trailers for topic actions, with explicit confirmation before destructive deletes
-- **Quick-reply buttons** — `[buttons: Label | Label]` renders keyboards; tapping a button re-sends its label as your message. Bot API 10.3 rich buttons where the bot owns the full message, styled inline keyboards elsewhere
+- **Quick-reply buttons** — `[buttons: Label | Label]` renders in-bubble rich buttons (valid `InputRichBlockButtons` blocks; one per row), with classic keyboards and plain-text fallbacks; tapping a button re-sends its label as your message. Labels are sanitized server-side (no stray Markdown or raw URLs) and misplaced link syntax is rescued into URL buttons. Bot API 10.3 rich buttons where the bot owns the full message, styled inline keyboards elsewhere
 - **Contextual links** — `[links: Label -> https://...]` for clean inline references
 
 ### 👋 Ephemeral Welcomes
