@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.8.3 — 2026-09-21
+
+`/imagine` reliability fix: some generations arrived half-done (top half
+image, bottom half grey) and were uploaded as-is. Two compounding causes
+found: the provider's CDN was killing Python-urllib connections
+mid-stream (curl downloads completed 10/10, urllib 0/10 through the same
+egress path), and the downloader trusted the first short `read()` without
+ever verifying the download was complete.
+
+- Download backend is now curl first (immune to the connection kills),
+  with the stdlib urllib path as fallback where curl isn't installed.
+- Integrity gate on every download: declared Content-Length must match
+  the bytes received, and the JPEG end-of-image marker must be present.
+  Cut-off downloads are treated as transient — retried with backoff,
+  never uploaded.
+- Reads loop until the declared length or EOF (a single socket `read()`
+  can silently return one 8KB chunk).
+- Model chain: `flux` first (full-quality diffusion — now reachable via
+  curl), `turbo` as automatic fallback when flux is saturated.
+
+
 ## 1.8.2 — 2026-09-20
 
 Spam-guard hotfix. A user hammering a quick-reply button re-sent the

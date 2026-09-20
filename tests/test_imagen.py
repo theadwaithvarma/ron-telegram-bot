@@ -128,15 +128,27 @@ class TestBuildUrl(unittest.TestCase):
         self.assertLessEqual(len(path.split("/prompt/")[1]),
                              ron_imagen.MAX_PROMPT_CHARS * 3)
 
-    def test_turbo_model_param(self):
-        # The default backend 429s under load; turbo stays up.
+    def test_flux_first_model_param(self):
+        # flux first (full-quality diffusion); turbo is the fallback.
         url = ron_imagen.build_url("a cat")
+        self.assertIn("model=flux", url)
+
+    def test_explicit_model_param(self):
+        url = ron_imagen.build_url("a cat", model="turbo")
         self.assertIn("model=turbo", url)
 
 
-def _fake_urlopen(data):
+def _fake_urlopen(data, headers=None):
+    # Models a real stream: read() returns the body once, then b"" (EOF).
+    # (A fixed return_value would loop forever under the chunked reader.)
     fake_resp = mock.MagicMock()
-    fake_resp.read.return_value = data
+    chunks = [data]
+
+    def read(n=-1):
+        return chunks.pop(0) if chunks else b""
+
+    fake_resp.read.side_effect = read
+    fake_resp.headers = headers or {}
     m = mock.patch("urllib.request.urlopen")
     urlopen = m.start()
     urlopen.return_value.__enter__.return_value = fake_resp
@@ -144,6 +156,13 @@ def _fake_urlopen(data):
 
 
 class TestFetchImage(unittest.TestCase):
+    def setUp(self):
+        # Force the urllib backend so the urlopen mocks below apply
+        # (this box has curl, which would otherwise hit the network).
+        c = mock.patch.object(ron_imagen, "_CURL_BIN", None)
+        c.start()
+        self.addCleanup(c.stop)
+
     def test_happy_path_returns_tmp_jpeg(self):
         before = set(os.listdir("/tmp"))
         m = _fake_urlopen(FAKE_JPEG)
@@ -219,14 +238,203 @@ class TestFetchRetry(unittest.TestCase):
         dl.assert_called_once()
         self.sleep.assert_not_called()
 
-    def test_retry_exhaustion_raises_unreachable(self):
+    def test_retry_exhaustion_fails_over_then_raises_unreachable(self):
+        # Every model exhausts its attempts: 3 tries on flux, then 3 on
+        # turbo, then the honest error. Each model's last attempt skips
+        # the sleep (nothing left to wait for on that model).
         with mock.patch.object(ron_imagen, "_download_once",
                                side_effect=OSError("down")) as dl:
             with self.assertRaises(RuntimeError) as cm:
                 ron_imagen.fetch_image("a cat")
-        self.assertEqual(dl.call_count, ron_imagen._FETCH_ATTEMPTS)
+        per_model = ron_imagen._FETCH_ATTEMPTS
+        n_models = len(ron_imagen._MODELS)
+        self.assertEqual(dl.call_count, per_model * n_models)
         self.assertIn("unreachable", str(cm.exception))
-        self.assertEqual(self.sleep.call_count, ron_imagen._FETCH_ATTEMPTS - 1)
+        self.assertEqual(self.sleep.call_count,
+                         (per_model - 1) * n_models)
+
+
+class TestTruncationGuard(unittest.TestCase):
+    """Cut-off downloads must never reach the user as half-grey images."""
+
+    def setUp(self):
+        s = mock.patch("time.sleep")
+        self.sleep = s.start()
+        self.addCleanup(s.stop)
+        # Force the urllib backend: this box has curl, which would
+        # bypass the urlopen mocks below (curl has its own tests).
+        c = mock.patch.object(ron_imagen, "_CURL_BIN", None)
+        c.start()
+        self.addCleanup(c.stop)
+
+    def test_missing_eoi_marker_rejected(self):
+        cut = b"\xff\xd8\xff" + b"\x00" * 5000  # no FFD9 tail
+        m = _fake_urlopen(cut)
+        self.addCleanup(m.stop)
+        with self.assertRaises(ron_imagen._TruncatedImage):
+            ron_imagen._download_once("http://x/")
+
+    def test_content_length_mismatch_rejected(self):
+        # Declared 5000 more bytes than the stream delivers -> cut off.
+        m = _fake_urlopen(FAKE_JPEG,
+                          headers={"Content-Length":
+                                   str(len(FAKE_JPEG) + 5000)})
+        self.addCleanup(m.stop)
+        with self.assertRaises(ron_imagen._TruncatedImage):
+            ron_imagen._download_once("http://x/")
+
+    def test_absurd_content_length_rejected_fast(self):
+        # Declared > MAX_BYTES: fail before downloading anything.
+        m = _fake_urlopen(FAKE_JPEG,
+                          headers={"Content-Length": "99999999"})
+        self.addCleanup(m.stop)
+        with self.assertRaises(RuntimeError):
+            ron_imagen._download_once("http://x/")
+
+    def test_matching_content_length_accepted(self):
+        m = _fake_urlopen(FAKE_JPEG,
+                          headers={"Content-Length": str(len(FAKE_JPEG))})
+        self.addCleanup(m.stop)
+        self.assertEqual(ron_imagen._download_once("http://x/"), FAKE_JPEG)
+
+    def test_truncated_download_retried_then_succeeds(self):
+        # First attempt returns a cut-off JPEG, retry gets the full one.
+        # Each "connection" streams its body once, then EOF.
+        cut = b"\xff\xd8\xff" + b"\x00" * 5000
+        bodies = [cut, FAKE_JPEG]
+
+        def fake_urlopen(req, *a, **k):
+            data = bodies.pop(0)
+            chunks = [data]
+
+            def read(n=-1):
+                return chunks.pop(0) if chunks else b""
+
+            fake_resp = mock.MagicMock()
+            fake_resp.read.side_effect = read
+            fake_resp.headers = {}
+            cm = mock.MagicMock()
+            cm.__enter__.return_value = fake_resp
+            return cm
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            path = ron_imagen.fetch_image("a cat")
+        try:
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), FAKE_JPEG)
+        finally:
+            os.unlink(path)
+        self.assertEqual(bodies, [])  # both attempts consumed
+        self.sleep.assert_called_once()
+
+    def test_short_socket_reads_assembled(self):
+        # The live bug: read(n) silently returns one 8KB chunk at a time.
+        # The loop must keep reading until Content-Length or EOF.
+        pieces = [FAKE_JPEG[i:i + 8192]
+                  for i in range(0, len(FAKE_JPEG), 8192)]
+
+        def read(n=-1):
+            return pieces.pop(0) if pieces else b""
+
+        fake_resp = mock.MagicMock()
+        fake_resp.read.side_effect = read
+        fake_resp.headers = {"Content-Length": str(len(FAKE_JPEG))}
+        m = mock.patch("urllib.request.urlopen")
+        urlopen = m.start()
+        urlopen.return_value.__enter__.return_value = fake_resp
+        self.addCleanup(m.stop)
+        self.assertEqual(ron_imagen._download_once("http://x/"), FAKE_JPEG)
+
+    def test_flux_failure_fails_over_to_turbo(self):
+        seen_urls = []
+
+        def fake_download(url):
+            seen_urls.append(url)
+            if "model=flux" in url:
+                raise OSError("flux saturated")
+            return FAKE_JPEG
+
+        with mock.patch.object(ron_imagen, "_download_once",
+                               side_effect=fake_download):
+            path = ron_imagen.fetch_image("a cat")
+        try:
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), FAKE_JPEG)
+        finally:
+            os.unlink(path)
+        flux_urls = [u for u in seen_urls if "model=flux" in u]
+        turbo_urls = [u for u in seen_urls if "model=turbo" in u]
+        self.assertEqual(len(flux_urls), ron_imagen._FETCH_ATTEMPTS)
+        self.assertEqual(len(turbo_urls), 1)
+        # flux tried first, turbo only after flux gave up
+        self.assertTrue(seen_urls[-1] in turbo_urls)
+
+
+class TestDownloadBackend(unittest.TestCase):
+    """curl first (reliable through this egress path), urllib fallback."""
+
+    def test_curl_preferred_when_available(self):
+        with mock.patch.object(ron_imagen, "_CURL_BIN", "/usr/bin/curl"), \
+             mock.patch.object(ron_imagen, "_download_via_curl",
+                               return_value=FAKE_JPEG) as curl, \
+             mock.patch.object(ron_imagen, "_download_via_urllib") as ulib:
+            self.assertEqual(ron_imagen._download_once("http://x/"),
+                             FAKE_JPEG)
+        curl.assert_called_once_with("http://x/")
+        ulib.assert_not_called()
+
+    def test_curl_transient_falls_back_to_urllib(self):
+        with mock.patch.object(ron_imagen, "_CURL_BIN", "/usr/bin/curl"), \
+             mock.patch.object(
+                 ron_imagen, "_download_via_curl",
+                 side_effect=ron_imagen._TruncatedImage("cut")) as curl, \
+             mock.patch.object(ron_imagen, "_download_via_urllib",
+                               return_value=FAKE_JPEG) as ulib:
+            self.assertEqual(ron_imagen._download_once("http://x/"),
+                             FAKE_JPEG)
+        curl.assert_called_once()
+        ulib.assert_called_once_with("http://x/")
+
+    def test_curl_definitive_skips_urllib(self):
+        with mock.patch.object(ron_imagen, "_CURL_BIN", "/usr/bin/curl"), \
+             mock.patch.object(
+                 ron_imagen, "_download_via_curl",
+                 side_effect=RuntimeError("provider returned no image")), \
+             mock.patch.object(ron_imagen, "_download_via_urllib") as ulib:
+            with self.assertRaises(RuntimeError):
+                ron_imagen._download_once("http://x/")
+        ulib.assert_not_called()
+
+    def test_no_curl_uses_urllib(self):
+        with mock.patch.object(ron_imagen, "_CURL_BIN", None), \
+             mock.patch.object(ron_imagen, "_download_via_urllib",
+                               return_value=FAKE_JPEG) as ulib:
+            self.assertEqual(ron_imagen._download_once("http://x/"),
+                             FAKE_JPEG)
+        ulib.assert_called_once_with("http://x/")
+
+
+class TestValidateImage(unittest.TestCase):
+    def test_happy_path(self):
+        self.assertEqual(
+            ron_imagen._validate_image(FAKE_JPEG, len(FAKE_JPEG)), FAKE_JPEG)
+
+    def test_short_download_rejected(self):
+        with self.assertRaises(ron_imagen._TruncatedImage):
+            ron_imagen._validate_image(FAKE_JPEG, len(FAKE_JPEG) + 100)
+
+    def test_missing_eoi_rejected(self):
+        with self.assertRaises(ron_imagen._TruncatedImage):
+            ron_imagen._validate_image(b"\xff\xd8\xff" + b"\x00" * 5000)
+
+    def test_non_jpeg_definitive(self):
+        with self.assertRaises(RuntimeError):
+            ron_imagen._validate_image(b"<html>nope</html>" * 100)
+
+    def test_too_large_definitive(self):
+        with self.assertRaises(RuntimeError):
+            ron_imagen._validate_image(b"\xff\xd8\xff" + b"\x00" * 10,
+                                       ron_imagen.MAX_BYTES + 5)
 
 
 class TestSendPhoto(unittest.TestCase):
