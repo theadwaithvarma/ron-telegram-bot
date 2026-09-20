@@ -2442,6 +2442,10 @@ def _handle_imagine(chat_id, user_id, user_name, text, is_private,
     if not allowed:
         send(chat_id, _imagen_limit_text(retry_after),
              reply_to=reply_to, thread_id=thread_id)
+        _notify_owner_quota_block(
+            "/imagine", user_id, user_name,
+            ron_imagen.usage(user_id, OWNER_ID),
+            ron_imagen.LIMIT_N, ron_imagen.LIMIT_WINDOW_SECS)
         return True
     _ai_imagine_reply(chat_id, user_id, user_name, prompt,
                       private=is_private, reply_to=reply_to,
@@ -2526,6 +2530,34 @@ _THINK_WINDOW = 6 * 3600
 _VERDICT_MODEL = "openai/gpt-oss-120b"   # renders fact-check verdicts
 _VERDICT_FALLBACK_MODEL = _THINK_MODEL
 
+# Owner quota-block pings: (scope_label, user_id) -> last ping epoch.
+# Throttled to one ping per window so a user hammering a capped command
+# doesn't spam the owner.
+_quota_ping_ts = {}
+
+
+def _notify_owner_quota_block(label, user_id, user_name, used, limit,
+                              window_secs):
+    """DM the owner when someone hits a command quota cap.
+
+    The owner is exempt and never triggers this. Throttled: at most one
+    ping per (label, user) per window.
+    """
+    if user_id == OWNER_ID:
+        return
+    now = time.time()
+    key = (label, user_id)
+    if now - _quota_ping_ts.get(key, 0) < window_secs:
+        return
+    _quota_ping_ts[key] = now
+    name = user_name or "?"
+    try:
+        send(OWNER_ID,
+             f"🚦 Quota: {name} ({user_id}) hit the {label} cap — "
+             f"{used}/{limit} per {window_secs // 3600}h.")
+    except Exception:
+        pass  # owner ping is best-effort; never break the user flow
+
 _FACTCHECK_SYSTEM = (
     "You are a precise fact-checker with live web search. Given a claim, "
     "verify it against current sources. Reply in this exact shape:\n"
@@ -2605,6 +2637,11 @@ def _handle_factcheck(chat_id, user_id, user_name, text, is_private,
         send(chat_id,
              _cmd_limit_text("fact-check", _FACTCHECK_N, 6, retry_after),
              reply_to=reply_to, thread_id=thread_id)
+        _notify_owner_quota_block(
+            "/factcheck", user_id, user_name,
+            ron_cmdquota.usage("factcheck", user_id, OWNER_ID,
+                               _FACTCHECK_N, _FACTCHECK_WINDOW),
+            _FACTCHECK_N, _FACTCHECK_WINDOW)
         return True
     _ai_spot_reply("factcheck", chat_id, user_id, user_name, query,
                    "\U0001F50D Fact-checking…",
@@ -2639,6 +2676,11 @@ def _handle_think(chat_id, user_id, user_name, text, is_private,
         send(chat_id,
              _cmd_limit_text("deep-think", _THINK_N, 6, retry_after),
              reply_to=reply_to, thread_id=thread_id)
+        _notify_owner_quota_block(
+            "/think", user_id, user_name,
+            ron_cmdquota.usage("think", user_id, OWNER_ID,
+                               _THINK_N, _THINK_WINDOW),
+            _THINK_N, _THINK_WINDOW)
         return True
     _ai_spot_reply("think", chat_id, user_id, user_name, query,
                    "\U0001F9E0 Thinking deeply…",
@@ -2767,6 +2809,10 @@ def _handle_photo(msg, chat, frm, user_id, user_name, is_private):
     if not allowed:
         send(chat_id, _vision_limit_text(retry_after),
              reply_to=message_id, thread_id=thread_id)
+        _notify_owner_quota_block(
+            "image reads", user_id, user_name,
+            ron_vision.usage(user_id, OWNER_ID),
+            ron_vision.LIMIT_N, ron_vision.LIMIT_WINDOW_SECS)
         return
     photos = msg.get("photo") or []
     file_id = (photos[-1] or {}).get("file_id")  # largest size is last

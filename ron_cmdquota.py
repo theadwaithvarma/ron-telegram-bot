@@ -71,3 +71,15 @@ def record_use(scope, user_id, owner_id, n, window_secs, now=None):
         uses.append(now)
         entry[str(user_id)] = uses
         _save_limits(d)
+
+
+def usage(scope, user_id, owner_id, n, window_secs, now=None):
+    """Current in-window use count (owner reports 0 — exempt)."""
+    if user_id == owner_id:
+        return 0
+    now = time.time() if now is None else now
+    with _lock:
+        d = _load_limits()
+        uses = _prune(d.get(str(scope), {}).get(str(user_id), []),
+                      now, window_secs)
+        return len(uses)

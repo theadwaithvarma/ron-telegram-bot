@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.9.2 — 2026-09-21
+
+Owner quota visibility.
+
+- Whenever any user hits a quota cap (`/factcheck`, `/think`,
+  `/imagine`, image reads), the owner now gets a DM with the usage:
+  `🚦 Quota: <name> (<id>) hit the /factcheck cap — 10/10 per 6h.`
+- Throttled to one ping per user per command per window, so a user
+  hammering a capped command doesn't spam the owner. The owner is
+  exempt and never triggers a ping; a failed ping never breaks the
+  user flow.
+- New `usage()` getters on `ron_cmdquota`, `ron_imagen`, `ron_vision`
+  reporting the current in-window count.
+- 11 new tests (ping throttle, owner exemption, usage counts,
+  handler-level owner ping). 335/335 green.
+
 ## 1.9.1 — 2026-09-21
 
 `/factcheck` now works with zero API keys.

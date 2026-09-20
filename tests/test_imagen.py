@@ -533,7 +533,7 @@ class TestImagineHook(unittest.TestCase):
             self.assertTrue(self._cmd("/imagine a fox"))
         fetch.assert_not_called()  # zero provider burn
         w.assert_not_called()
-        sent = self.send.call_args[0][1]
+        sent = self.send.call_args_list[0][0][1]  # user notice is first
         self.assertIn("image-generation limit", sent)
         self.assertNotIn("pollinations", sent.lower())
 
@@ -553,6 +553,25 @@ class TestImagineHook(unittest.TestCase):
     def test_limit_text_formatting(self):
         self.assertIn("~5h 0m", ron_daemon._imagen_limit_text(5 * 3600 + 30))
         self.assertIn("~3m", ron_daemon._imagen_limit_text(150))
+
+    def test_limit_block_pings_owner_once(self):
+        ron_daemon._quota_ping_ts.clear()
+        self.addCleanup(ron_daemon._quota_ping_ts.clear)
+        for _ in range(10):
+            ron_imagen.record_use(USER_A, OWNER)
+        self.assertTrue(self._cmd("/imagine a fox"))
+        self.assertTrue(self._cmd("/imagine a fox"))  # hammer again
+        owner_pings = [c for c in self.send.call_args_list
+                       if c[0][0] == OWNER]
+        self.assertEqual(len(owner_pings), 1)  # throttled to one ping
+        self.assertIn("10/10", owner_pings[0][0][1])
+        self.assertIn("/imagine", owner_pings[0][0][1])
+
+    def test_usage_counts_window(self):
+        for _ in range(4):
+            ron_imagen.record_use(USER_A, OWNER)
+        self.assertEqual(ron_imagen.usage(USER_A, OWNER), 4)
+        self.assertEqual(ron_imagen.usage(OWNER, OWNER), 0)
 
 
 class TestImagineWorker(unittest.TestCase):

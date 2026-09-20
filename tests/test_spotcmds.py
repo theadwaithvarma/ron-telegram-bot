@@ -502,5 +502,69 @@ class TestFactcheckVerdict(unittest.TestCase):
             ss.assert_not_called()  # no verdict without evidence
 
 
+class TestOwnerQuotaPing(unittest.TestCase):
+    def setUp(self):
+        ron_daemon._quota_ping_ts.clear()
+        p = mock.patch.object(ron_daemon, "send")
+        self.send = p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(ron_daemon._quota_ping_ts.clear)
+
+    def test_first_block_pings_owner(self):
+        ron_daemon._notify_owner_quota_block(
+            "/factcheck", USER_A, "Testy", 10, 10, 6 * 3600)
+        self.send.assert_called_once()
+        chat_id, text = self.send.call_args[0][:2]
+        self.assertEqual(chat_id, OWNER)
+        self.assertIn("/factcheck", text)
+        self.assertIn("10/10", text)
+        self.assertIn("6h", text)
+
+    def test_second_block_same_window_stays_quiet(self):
+        ron_daemon._notify_owner_quota_block(
+            "/factcheck", USER_A, "Testy", 10, 10, 6 * 3600)
+        ron_daemon._notify_owner_quota_block(
+            "/factcheck", USER_A, "Testy", 10, 10, 6 * 3600)
+        self.send.assert_called_once()  # throttled
+
+    def test_different_scope_still_pings(self):
+        ron_daemon._notify_owner_quota_block(
+            "/factcheck", USER_A, "Testy", 10, 10, 6 * 3600)
+        ron_daemon._notify_owner_quota_block(
+            "/think", USER_A, "Testy", 15, 15, 6 * 3600)
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_owner_never_pinged(self):
+        ron_daemon._notify_owner_quota_block(
+            "/factcheck", OWNER, "Adwaith", 0, 10, 6 * 3600)
+        self.send.assert_not_called()
+
+    def test_send_failure_does_not_raise(self):
+        self.send.side_effect = RuntimeError("net down")
+        ron_daemon._notify_owner_quota_block(
+            "/factcheck", USER_A, "Testy", 10, 10, 6 * 3600)
+        # no exception — the user flow must never break on a ping
+
+
+class TestCmdQuotaUsage(unittest.TestCase):
+    def setUp(self):
+        _mk_quota_file(self)
+
+    def test_usage_counts_window(self):
+        for _ in range(3):
+            ron_cmdquota.record_use("factcheck", USER_A, OWNER, 10, 6 * 3600)
+        self.assertEqual(
+            ron_cmdquota.usage("factcheck", USER_A, OWNER, 10, 6 * 3600), 3)
+
+    def test_usage_owner_zero(self):
+        self.assertEqual(
+            ron_cmdquota.usage("factcheck", OWNER, OWNER, 10, 6 * 3600), 0)
+
+    def test_usage_scope_isolation(self):
+        ron_cmdquota.record_use("factcheck", USER_A, OWNER, 10, 6 * 3600)
+        self.assertEqual(
+            ron_cmdquota.usage("think", USER_A, OWNER, 15, 6 * 3600), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

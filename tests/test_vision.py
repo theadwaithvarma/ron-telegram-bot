@@ -128,6 +128,13 @@ class TestVisionLimits(unittest.TestCase):
         st = ron_vision.stats()
         self.assertEqual(st["images_24h"], 2)
 
+    def test_usage_counts_window(self):
+        for _ in range(3):
+            ron_vision.record_use(USER_A, OWNER)
+        self.assertEqual(ron_vision.usage(USER_A, OWNER), 3)
+        self.assertEqual(ron_vision.usage(USER_B, OWNER), 0)
+        self.assertEqual(ron_vision.usage(OWNER, OWNER), 0)
+
 
 class TestVisionImagePrep(unittest.TestCase):
     def test_downscale_bounds_longest_side(self):
@@ -323,8 +330,10 @@ class TestPhotoHook(unittest.TestCase):
             ron_vision.record_use(USER_A, OWNER)
         self._handle(_photo_msg(caption="one more"))
         self.vision_reply.assert_not_called()  # no worker, no API burn
-        self.send.assert_called_once()
-        sent_text = self.send.call_args[0][1]
+        user_notices = [c for c in self.send.call_args_list
+                        if c[0][0] != OWNER]
+        self.assertEqual(len(user_notices), 1)
+        sent_text = user_notices[0][0][1]
         self.assertIn("image-reading limit", sent_text)
         self.assertNotIn("groq", sent_text.lower())
         self.assertNotIn("gemini", sent_text.lower())

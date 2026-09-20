@@ -137,6 +137,19 @@ def record_use(user_id, owner_id, now=None):
         _save_limits(d)
 
 
+def usage(user_id, owner_id, now=None):
+    """Current in-window read count (owner reports 0 — exempt)."""
+    if user_id == owner_id:
+        return 0
+    now = time.time() if now is None else now
+    with _lock:
+        d = _load_limits()
+        key = str(user_id)
+        return len([t for t in d.get(key, [])
+                    if isinstance(t, (int, float))
+                    and now - t < LIMIT_WINDOW_SECS])
+
+
 def stats():
     """Small usage summary for /health: images read in the last 24h."""
     now = time.time()
