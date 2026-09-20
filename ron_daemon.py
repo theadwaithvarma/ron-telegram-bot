@@ -377,10 +377,13 @@ def _memory_context(chat_id, user_text, is_private):
         lim = int(cfg.get("recall_limit", 3))
         chars = int(cfg.get("recall_chars", 700))
         bits = []
-        for f in mem.recall_facts(str(chat_id), user_text, limit=lim):
-            bits.append("- " + f["text"])
-        for m in mem.recall(str(chat_id), user_text, limit=lim):
-            bits.append("- (earlier) " + m["text"][:160])
+        # Phase 5: one ranked pass — facts weighted above messages, then
+        # relevance-ranked history. Same bounded output format as before.
+        for item in mem.recall_all(str(chat_id), user_text, limit=lim):
+            if item["kind"] == "fact":
+                bits.append("- " + item["text"])
+            else:
+                bits.append("- (earlier) " + item["text"][:160])
         if not is_private:
             # Facts P approved for this group — via consent rows only,
             # never by merging another chat's memory. Relevance-gated:

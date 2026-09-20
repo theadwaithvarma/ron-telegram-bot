@@ -17,6 +17,18 @@ LOCKED DESIGN (Adwaith, 2026-09-20):
 - Raw messages expire via prune_expired(); facts persist until forgotten
   or contradicted.
 
+Phase 5 — memory lifecycle (2026-09-20):
+- Negation-aware contradiction replacement: a negation marker ("not",
+  "n't", "never", ...) in the new fact flips meaning, so 1 shared
+  content word suffices to supersede. supersession_chain() walks a
+  fact's full lineage oldest -> newest, chat-scoped.
+- Complete forgetting: forget() expands matched facts to their full
+  chains and removes orphan consent / pending-approval rows; returns
+  the total deleted (int), with forget_detailed() for the breakdown.
+- Richer retrieval: recall_ranked() (FTS5 bm25 relevance, recency
+  tiebreak, AND-then-OR fallback) and recall_all() (facts weighted
+  above messages, unified ranked list). Still deterministic, zero LLM.
+
 Cross-chat disclosure (refinement, 2026-09-20): matching a fact learned in
 a DM with person P to P's Telegram user_id in a group happens ONLY to ask
 P's consent PRIVATELY via DM. The fact stays stored under the DM's
@@ -66,6 +78,30 @@ _CHANGE_WORDS = frozenset({
     "updated", "update", "corrected", "correction", "rather", "shifted",
     "rescheduled", "postponed", "cancelled", "canceled", "replaced",
 })
+
+# Phase 5: negation markers. A negation flips a fact's meaning ("exam is
+# Monday" -> "exam is not Monday"), so when the NEW fact carries one, a
+# single shared content word is enough to link it to the old fact —
+# weaker overlap suffices because the flip itself is the signal.
+_NEGATION_WORDS = frozenset({
+    "not", "no", "never", "no longer", "stopped", "isn't", "wasn't",
+    "aren't", "don't", "doesn't", "didn't", "won't", "can't", "cannot",
+})
+
+
+def _has_negation(text):
+    """True if the new fact contains a negation marker.
+
+    Checks the raw text (not content words): most markers ("not", "no",
+    "n't") are stopwords or too short to survive content_words(), but
+    they still flip meaning, so they must be detected separately.
+    """
+    t = (text or "").lower()
+    if "n't" in t:  # isn't, wasn't, aren't, don't, doesn't, didn't, ...
+        return True
+    if "no longer" in t:
+        return True
+    return bool(re.search(r"\b(not|no|never|stopped|cannot)\b", t))
 
 
 def _fts_query(text):
@@ -225,6 +261,58 @@ class MemoryStore:
         return [{"id": r[0], "role": r[1], "text": self._dec(r[2]), "ts": r[3]}
                 for r in rows]
 
+    def _bm25_message_hits(self, cid, fq):
+        """(rowid -> bm25) candidates for one FTS query, chat-scoped.
+
+        Two-step on purpose: contentless FTS5 tables do not support being
+        scanned, so never JOIN them — pull (rowid, bm25) pairs from the
+        index first, then fetch the real rows by id.
+        """
+        pairs = self._db.execute(
+            "SELECT rowid, bm25(messages_fts) FROM messages_fts"
+            " WHERE messages_fts MATCH ?", (fq,)).fetchall()
+        if not pairs:
+            return []
+        score = {r: s for r, s in pairs}
+        q = ",".join("?" * len(score))
+        rows = self._db.execute(
+            "SELECT id, role, text_enc, ts FROM messages"
+            f" WHERE id IN ({q}) AND chat_id=?",
+            (*score.keys(), cid)).fetchall()
+        out = [{"id": r[0], "role": r[1], "text": self._dec(r[2]),
+                "ts": r[3], "_bm25": score[r[0]]} for r in rows]
+        # Relevance dominates: bm25() is negative, more negative = better
+        # match, so ascending bm25 wins. Recency only breaks exact ties
+        # (e.g. two identical messages) — an older relevant message
+        # always outranks a newer irrelevant one.
+        out.sort(key=lambda h: (h["_bm25"], -h["ts"]))
+        return out
+
+    def recall_ranked(self, chat_id, query, limit=5):
+        """Keyword recall over this chat's messages, relevance-ranked.
+
+        FTS5 bm25() relevance first, recency as tiebreak. Tries an AND
+        query over the tokens first; if nothing matches, retries with OR
+        over the top tokens so partial matches still surface. Decrypted
+        on read, chat-scoped, bounded. Zero LLM calls.
+        """
+        cid = str(chat_id)
+        toks = [t for t in re.findall(r"\w{2,}", (query or "").lower())
+                if t not in _STOPWORDS][:12]
+        if not toks:
+            return []
+        and_q = " AND ".join('"%s"' % t.replace('"', "") for t in toks)
+        with self._lock:
+            hits = self._bm25_message_hits(cid, and_q)
+            if not hits:
+                # AND was too strict (no single message has every term):
+                # fall back to OR so the best partial matches surface.
+                or_q = " OR ".join('"%s"' % t.replace('"', "")
+                                   for t in toks[:6])
+                hits = self._bm25_message_hits(cid, or_q)
+        return [{"id": h["id"], "role": h["role"], "text": h["text"],
+                 "ts": h["ts"]} for h in hits[:max(int(limit), 0)]]
+
     def _delete_messages(self, ids):
         if not ids:
             return 0
@@ -270,7 +358,9 @@ class MemoryStore:
                 if re.sub(r"\s+", " ", f["text"].lower()) == norm:
                     return f["id"]  # already known
             new_words = content_words(text)
+            negated = _has_negation(text)
             supersede = None
+            supersede_kind = ""
             best = 0
             for f in existing:
                 w = content_words(f["text"])
@@ -281,13 +371,22 @@ class MemoryStore:
                 # words, or 1 shared word plus an explicit change marker
                 # ("moved", "now", "instead", ...) means the new fact
                 # replaces the old one rather than duplicating it.
-                if (len(shared) >= 2 or
-                        (shared and bool(new_words & _CHANGE_WORDS))):
-                    if len(shared) > best:
-                        best, supersede = len(shared), f["id"]
+                # Phase 5: a negation marker in the NEW fact ("not", "n't",
+                # "never", ...) flips meaning, so 1 shared content word is
+                # enough to confidently link and replace the old fact.
+                if len(shared) >= 2:
+                    rule, strength = "contradiction/update", len(shared)
+                elif shared and (new_words & _CHANGE_WORDS):
+                    rule, strength = "contradiction/update", len(shared)
+                elif shared and negated:
+                    rule, strength = "negation", len(shared)
+                else:
+                    continue
+                if strength > best:
+                    best, supersede, supersede_kind = strength, f["id"], rule
             note = ""
             if supersede is not None:
-                note = f"replaces fact #{supersede} (contradiction/update)"
+                note = f"replaces fact #{supersede} ({supersede_kind})"
                 self._db.execute(
                     "UPDATE facts SET updated_ts=? WHERE id=?",
                     (now, supersede))
@@ -333,6 +432,52 @@ class MemoryStore:
                 "note": r[3], "superseded_by": r[4], "chat_id": str(chat_id),
                 "created_ts": r[5], "updated_ts": r[6]}
 
+    def supersession_chain(self, chat_id, fact_id):
+        """Full supersession chain containing fact_id, oldest -> newest.
+
+        Follows superseded_by links in both directions (ancestors that
+        this fact replaced, descendants that replaced it). Chat-scoped:
+        the walk starts only if fact_id belongs to this chat, and every
+        link is resolved within the same chat — a foreign fact id yields
+        an empty chain, never a cross-chat walk.
+        """
+        cid = str(chat_id)
+        with self._lock:
+            start = self._db.execute(
+                "SELECT id FROM facts WHERE id=? AND chat_id=?",
+                (int(fact_id), cid)).fetchone()
+            if not start:
+                return []
+            # successor map: old fact id -> newer fact id that replaced it.
+            rows = self._db.execute(
+                "SELECT id, superseded_by FROM facts WHERE chat_id=?",
+                (cid,)).fetchall()
+        succ = {r[0]: r[1] for r in rows if r[1] is not None}
+        # predecessor map: newer fact id -> old fact id it replaced.
+        # remember() only ever builds linear chains, but setdefault keeps
+        # this safe even if the data ever branches.
+        pred = {}
+        for fid, sid in succ.items():
+            pred.setdefault(sid, fid)
+        # Walk back to the oldest ancestor, then forward to the newest.
+        cur = int(fact_id)
+        while cur in pred:
+            cur = pred[cur]
+        ids = []
+        while cur is not None:
+            ids.append(cur)
+            cur = succ.get(cur)
+        with self._lock:
+            q = ",".join("?" * len(ids))
+            rmap = {r[0]: r for r in self._db.execute(
+                "SELECT id, kind, text_enc, note, superseded_by,"
+                " created_ts, updated_ts FROM facts"
+                f" WHERE id IN ({q})", ids).fetchall()}
+        return [{"id": r[0], "kind": r[1], "text": self._dec(r[2]),
+                 "note": r[3], "superseded_by": r[4], "chat_id": cid,
+                 "created_ts": r[5], "updated_ts": r[6]}
+                for r in (rmap[i] for i in ids)]
+
     def recall_facts(self, chat_id, query=None, limit=5):
         """Active facts for this chat, keyword-ranked when query given."""
         fq = _fts_query(query) if query else None
@@ -358,6 +503,25 @@ class MemoryStore:
                         for r in rows]
             return self._facts_locked(str(chat_id))[:limit]
 
+    def recall_all(self, chat_id, query, limit=5):
+        """Unified facts + messages in one ranked list for this chat.
+
+        Facts are weighted above messages (distilled signal beats raw
+        history), then relevance-ranked messages fill the rest. Every
+        item carries "kind": "fact" or "message" (the row type — this
+        overwrites the fact's own kind field, always 'fact' in practice).
+        Chat-scoped, bounded to `limit` items total, zero LLM calls.
+        """
+        cid = str(chat_id)
+        limit = max(int(limit), 0)
+        toks = [t for t in re.findall(r"\w{2,}", (query or "").lower())
+                if t not in _STOPWORDS]
+        facts = self.recall_facts(cid, query if toks else None, limit=limit)
+        msgs = self.recall_ranked(cid, query, limit=limit) if toks else []
+        items = [{**f, "kind": "fact"} for f in facts]
+        items += [{**m, "kind": "message"} for m in msgs]
+        return items[:limit]
+
     def dm_facts(self, user_id):
         """Active facts learned in a DM with this user (chat_id == user_id).
 
@@ -382,11 +546,21 @@ class MemoryStore:
             self._db.commit()
             return cur.rowcount
 
-    def forget(self, chat_id, query):
-        """Delete facts + messages in this chat matching query. Returns count."""
+    def forget_detailed(self, chat_id, query):
+        """Forget with a breakdown: {"facts", "messages", "consents",
+        "pendings"} counts.
+
+        Every FTS-matched fact expands to its FULL supersession chain
+        (ancestors + descendants) so no stale version survives, and any
+        consent / pending-approval rows pointing at a deleted fact are
+        removed too — orphan rows would break consented_facts lookups
+        and re-ask approvals for facts that no longer exist.
+        """
         fq = _fts_query(query)
+        zero = {"facts": 0, "messages": 0, "consents": 0, "pendings": 0}
         if not fq:
-            return 0
+            return dict(zero)
+        cid = str(chat_id)
         with self._lock:
             # Two-step: never JOIN a contentless FTS5 table.
             frids = [r[0] for r in self._db.execute(
@@ -400,15 +574,44 @@ class MemoryStore:
                 q = ",".join("?" * len(frids))
                 fids = [r[0] for r in self._db.execute(
                     f"SELECT id FROM facts WHERE id IN ({q}) AND chat_id=?",
-                    (*frids, str(chat_id))).fetchall()]
+                    (*frids, cid)).fetchall()]
             if mrids:
                 q = ",".join("?" * len(mrids))
                 mids = [r[0] for r in self._db.execute(
-                    f"SELECT id FROM messages WHERE id IN ({q}) AND chat_id=?",
-                    (*mrids, str(chat_id))).fetchall()]
-        n = self._delete_facts(fids)
-        n += self._delete_messages(mids)
-        return n
+                    f"SELECT id FROM messages WHERE id IN ({q})"
+                    " AND chat_id=?",
+                    (*mrids, cid)).fetchall()]
+            # Expand each matched fact to its full chain: forgetting one
+            # version forgets the whole lineage (old contradictions and
+            # newer replacements alike).
+            chain_ids = set()
+            for fid in fids:
+                for f in self.supersession_chain(cid, fid):
+                    chain_ids.add(f["id"])
+            fids = sorted(chain_ids)
+        out = dict(zero)
+        out["facts"] = self._delete_facts(fids)
+        out["messages"] = self._delete_messages(mids)
+        if fids:
+            with self._lock:
+                q = ",".join("?" * len(fids))
+                out["consents"] = self._db.execute(
+                    f"DELETE FROM consents WHERE fact_id IN ({q})",
+                    fids).rowcount
+                out["pendings"] = self._db.execute(
+                    "DELETE FROM pending_approvals"
+                    f" WHERE fact_id IN ({q})", fids).rowcount
+                self._db.commit()
+        return out
+
+    def forget(self, chat_id, query):
+        """Delete facts + messages in this chat matching query.
+
+        Matched facts expand to their full supersession chains; consent
+        and pending-approval rows for deleted facts go too. Returns the
+        total rows deleted as an int (daemon call site compatible).
+        """
+        return sum(self.forget_detailed(chat_id, query).values())
 
     def forget_latest_fact(self, chat_id):
         """Delete the most recently updated active fact in this chat."""

@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.3.0 — 2026-09-20
+
+Memory lifecycle release: memory now handles change, forgetting, and recall
+like it should — negation-aware updates, complete forgetting, and relevance-ranked
+recall.
+
+- **Negation-aware contradiction replacement** (`ron_memory.py`) — a negated
+  fact ("my exam is not Monday") now supersedes the old one ("my exam is
+  Monday") on a single shared word, since the negation itself is the signal.
+  `supersession_chain()` walks a fact's full lineage oldest → newest,
+  strictly chat-scoped
+- **Complete forgetting** — `forget` expands matched facts to their whole
+  supersession chains and removes orphan consent / pending-approval rows for
+  deleted facts. `forget_detailed()` returns the per-kind breakdown;
+  `forget()` keeps its int return for compatibility
+- **Richer retrieval** — `recall_ranked()` ranks with FTS5 `bm25()` relevance
+  (recency breaks ties only), AND-then-OR fallback; `recall_all()` returns
+  one unified facts-plus-messages list, facts weighted above messages. The
+  daemon's memory block uses it directly
+- Still deterministic, zero LLM calls, per-chat isolation untouched
+
 ## 1.2.0 — 2026-09-20
 
 Privacy-first memory release: the bot now remembers per chat, encrypted at
