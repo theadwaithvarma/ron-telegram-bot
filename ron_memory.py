@@ -689,6 +689,22 @@ class MemoryStore:
                 (str(chat_id), str(key), self._enc(value), time.time()))
             self._db.commit()
 
+    def count_summaries(self):
+        """Number of chats holding a rolling history summary. Phase 7.
+
+        Counts rows only — summary content is never read. Best-effort:
+        returns 0 (not raises) if the table is missing or the DB errors,
+        so a status command can never break on this.
+        """
+        try:
+            with self._lock:
+                r = self._db.execute(
+                    "SELECT COUNT(DISTINCT chat_id) FROM chat_meta "
+                    "WHERE key='summary'").fetchone()
+            return int(r[0]) if r else 0
+        except Exception:
+            return 0
+
     # -- consents -------------------------------------------------------
     def has_consent(self, group_chat_id, user_id, fact_id):
         with self._lock:

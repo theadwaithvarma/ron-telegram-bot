@@ -1,0 +1,22 @@
+[Unit]
+Description=Ron Telegram bot — nightly encrypted state snapshot (Phase 7)
+# Runs ron_backup.py: snapshots ron_memory.db / ron_cache.db + JSON state,
+# encrypts with RON_MEMORY_KEY (read from the watchdog override, same
+# source as the daemon), keeps 7 daily snapshots. No network needed.
+# Failure is loud in the log but never touches the live daemon.
+
+[Service]
+Type=oneshot
+# The bot tree is root-owned and the daemon runs as root with HOME pinned
+# to /home/hatch — the backup needs the same so it can read the systemd
+# override (0600) that carries RON_MEMORY_KEY.
+User=root
+Environment=HOME=/home/hatch
+ExecStart=/usr/bin/python3 /home/hatch/workspace/telegram-bot/ron_backup.py
+# Append to the same log the documented cron line would use.
+StandardOutput=append:/home/hatch/workspace/telegram-bot/ron_backup.log
+StandardError=append:/home/hatch/workspace/telegram-bot/ron_backup.log
+# Don't hammer a struggling box: if the box was down at 03:00, the timer's
+# Persistent=true catches up once — this keeps a single missed run from
+# queueing retries.
+Nice=10

@@ -134,6 +134,16 @@ _provider_cooldown = {}
 _rate_limit_lock = threading.Lock()
 COOLDOWN_AFTER_RATELIMIT_SECS = 30.0
 
+
+def get_provider_cooldowns():
+    """Copy of {provider_name: cooldown_until_monotonic}. Phase 7 /health.
+
+    Read-only snapshot for status reporting — never mutate the returned
+    dict (it is a copy, so mutating it is merely useless).
+    """
+    with _rate_limit_lock:
+        return dict(_provider_cooldown)
+
 # Multi-provider failover (2026-09-20): the bot no longer depends on a
 # single AI backend. Providers are tried in order; each one needs its key
 # in the vault (dynamic_credential_entry("custom.<name>")). A provider with

@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.5.0 — 2026-09-20
+
+Final hardening: the bot now backs itself up and reports its own health —
+the last pieces before calling it release-stable and self-sufficient.
+
+- **Nightly encrypted snapshots** (`ron_backup.py`, new) — every night at
+  03:00 IST the memory DB and cache DB are copied with SQLite's online
+  backup API (consistent snapshot, safe against the live daemon's writers),
+  bundled with the JSON state files into a tar.gz, and Fernet-encrypted
+  with the same `RON_MEMORY_KEY` the memory DB uses (key read from the
+  daemon's environment or the systemd override — never printed, logged, or
+  stored; derivation imported from `ron_memory`, not duplicated). Last 7
+  daily snapshots kept, older pruned; every bundle is decrypted and
+  integrity-checked (`PRAGMA quick_check` + JSON parse) before the run
+  counts as good. Missing key → loud log + non-zero exit, and no
+  unencrypted backup is ever written (fails closed, like the memory
+  store). Scheduled via `ron-backup.timer` (systemd; cron one-liner
+  documented in the README for cron-based boxes)
+- **`/health` command** (`ron_health.py`, new) — compact status card:
+  uptime, brain state, AI chain health by position (primary / fallback-N —
+  provider-neutral, backend names never appear), memory on/off + summary
+  counts, cache hit-rate and tokens saved, backup freshness (⚠️ flagged
+  when the nightly run is failing), watchdog restart count. Cheap local
+  reads only — no AI call, works in light mode and degraded mode, follows
+  the existing command routing (DMs + groups)
+- Small supporting changes: `ron_ai.get_provider_cooldowns()`,
+  `MemoryStore.count_summaries()` (counts rows only, never reads summary
+  content), daemon stashes probe results for the card instead of probing
+  live on every `/health`
+- Still zero new pip dependencies; all existing features untouched
+
 ## 1.4.0 — 2026-09-20
 
 Token savings round two: the bot now skips API calls for questions it already

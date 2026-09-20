@@ -31,6 +31,12 @@ try:
     import ron_cache
 except Exception:
     ron_cache = None
+# Phase 7: /health status card builders (pure functions, no daemon import).
+# None-safe like ron_cache — /health degrades to "n/a" without it.
+try:
+    import ron_health
+except Exception:
+    ron_health = None
 
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 from dynamic_credentials import dynamic_credential_entry, read_json_response
@@ -54,6 +60,23 @@ _INFLIGHT_LOCK = threading.Lock()
 # Guards read-modify-write of the small state JSON files (the poll loop and
 # reply threads both touch known_topics.json).
 _FILE_LOCK = threading.RLock()
+# Phase 7: daemon start time for /health uptime. Set once at import.
+_START_TS = time.time()
+# Phase 7: last provider probe results, refreshed by the startup health
+# ping and the degraded-mode recovery loop. /health reads this — no live
+# probing on the status path, so the card is instant and free.
+_LAST_PROBE = {}
+_PROBE_LOCK = threading.Lock()
+
+
+def _record_probe_results(results):
+    """Best-effort stash of probe_providers() output for /health."""
+    try:
+        with _PROBE_LOCK:
+            _LAST_PROBE.clear()
+            _LAST_PROBE.update(results)
+    except Exception:
+        pass
 
 
 def _atomic_write_json(path, obj):
@@ -274,6 +297,7 @@ def _recovery_loop():
         except Exception as e:
             print(f"[ron_daemon] recovery probe failed: {e}", flush=True)
             continue
+        _record_probe_results(results)
         healthy = [n for n, (ok, _) in results.items() if ok]
         if not healthy:
             continue
@@ -293,6 +317,7 @@ def _health_ping():
     except Exception as e:
         print(f"[ron_daemon] startup health probe failed: {e}", flush=True)
         return
+    _record_probe_results(results)
     for name, (ok, detail) in results.items():
         print(f"[ron_daemon] health: {name} {'OK' if ok else 'DOWN'} - "
               f"{detail}", flush=True)
@@ -1427,6 +1452,10 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
     if cmd == "ping":
         send(chat_id, "\U0001F3D3 pong \u2014 alive and polling.")
         return True
+    if cmd == "health":
+        # Phase 7: compact status card. Cheap local reads only — no AI
+        # call, works in light mode and degraded mode alike.
+        return _handle_health(chat_id)
     if cmd in ("poll", "pollm", "quiz"):
         return handle_poll_command(chat_id, cmd, text)
     if cmd == "id":
@@ -1458,6 +1487,89 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
         _record_turn(chat_id, user_id, user_name, text, ack)
         return True
     return False
+
+
+def _handle_health(chat_id):
+    """Phase 7 /health: assemble status info and send the card.
+
+    All reads are local and cheap (no AI call). Every section is
+    best-effort — a broken JSON file or missing module degrades to "n/a",
+    never to an exception, because a status command must not fail.
+    Provider names never leave this function: the card uses chain
+    positions only (primary / fallback-N).
+    """
+    if ron_health is None:
+        send(chat_id, "health status unavailable (module missing)")
+        return True
+    info = {"start_ts": _START_TS}
+    try:
+        info["degraded"] = _brain_down()
+    except Exception:
+        pass
+    try:
+        chain = (ron_ai.load_config().get("providers")
+                 or ron_ai.DEFAULT_PROVIDERS)
+        cooldowns = ron_ai.get_provider_cooldowns()
+        with _PROBE_LOCK:
+            probe_res = dict(_LAST_PROBE)
+        now_m = time.monotonic()
+        providers = []
+        for i, pr in enumerate(chain):
+            name = str(pr.get("name") or "").lower()
+            label = "primary" if i == 0 else f"fallback-{i}"
+            until = cooldowns.get(name, 0)
+            if until > now_m:
+                providers.append((label, "cooling", until - now_m))
+            elif name in probe_res:
+                ok, detail = probe_res[name]
+                if ok:
+                    providers.append((label, "ok", None))
+                elif "no key" in str(detail or ""):
+                    providers.append((label, "no_key", None))
+                else:
+                    providers.append((label, "down", None))
+            else:
+                providers.append((label, "unknown", None))
+        info["providers"] = providers
+    except Exception:
+        pass
+    try:
+        info["memory_on"] = mem is not None
+        if mem is not None:
+            info["summaries"] = mem.count_summaries()
+    except Exception:
+        pass
+    try:
+        if ron_cache is not None:
+            st = ron_cache.get_stats()
+            info["cache_hits"] = st.get("hits")
+            info["cache_misses"] = st.get("misses")
+            info["cache_tokens"] = st.get("tokens_saved_est")
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(HOME, "workspace", "telegram-bot",
+                               "ron_backup.json"),
+                  "r", encoding="utf-8") as f:
+            bst = json.load(f)
+            info["backup_ts"] = bst.get("last_good_ts")
+            info["backup_error"] = bst.get("last_error")
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(HOME, "workspace", "telegram-bot",
+                               "ron_watchdog.json"),
+                  "r", encoding="utf-8") as f:
+            info["restarts"] = json.load(f).get("total_restarts")
+    except Exception:
+        pass
+    try:
+        card = ron_health.build_health_card(info)
+    except Exception as e:
+        print(f"[ron_daemon] health card failed: {e}", flush=True)
+        card = "Ron health: status temporarily unavailable."
+    send(chat_id, card)
+    return True
 
 
 BOT_USERNAME = "ronrebootedbot"

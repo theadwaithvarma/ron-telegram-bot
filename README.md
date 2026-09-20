@@ -48,6 +48,8 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 ### 🩺 Self-Healing
 - **Watchdog supervisor** (`ron_watchdog.py`): 60-second checks for dead or hung daemons, duplicate processes, and broken configs — with exponential restart backoff and last-known-good config restore (see `ron-watchdog.service.example` for systemd)
 - **Degraded mode**: if every provider keeps failing, Ron queues messages to disk, tells users honestly, and replays everything on recovery — no silent drops, no duplicates
+- **Nightly encrypted backups** (`ron_backup.py` + `ron-backup.timer.example`): every night at 03:00 IST the memory DB, cache DB, and JSON state are snapshotted (SQLite online backup API — safe against the live daemon), bundled, and Fernet-encrypted with the same `RON_MEMORY_KEY` the memory DB uses. Last 7 snapshots kept; each bundle is decrypted and integrity-checked before it counts. Fails closed (loud log, never an unencrypted backup) when the key is missing
+- **`/health` status card** (`ron_health.py`): uptime, brain state, AI chain (primary / fallback-N, provider-neutral — never names backends), memory + summary counts, cache hit-rate and tokens saved, backup freshness (with a ⚠️ if the nightly run is failing), and watchdog restart count. Cheap local reads only — no AI call, works in light and degraded mode
 
 ### ⚡ Live Streaming Replies
 - Long answers **stream in real time** into 1:1 chats via Telegram's native message drafts (`sendMessageDraft`), with an instant "Thinking…" placeholder and throttled draft growth
@@ -60,6 +62,7 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 | `/poll` | `/poll Question? \| Option A \| Option B` |
 | `/pollm` | Multi-answer poll — `/pollm Q? \| A \| B \| C` |
 | `/quiz` | Quiz mode — `/quiz Q? \| *Correct \| Wrong \| Wrong` |
+| `/health` | Compact status card — uptime, AI chain, memory, cache, backup, restarts |
 
 ### 🛠️ Group Power Tools
 - **DM-to-group pings** — `[send_group: Group Name | message]` posts your message in a group, mentioning you (fuzzy group-name resolution)
@@ -80,6 +83,8 @@ Handles `business_connection` and `business_message` updates — Ron can answer 
 - Update-offset persistence — no re-processing on restart
 - Heartbeat file so the watchdog can spot a hung process
 - Provider-neutral rate-limit replies instead of generic error text
+- Nightly backups run via the `ron-backup.timer` systemd timer (see `ron-backup.service.example`); on boxes with cron instead, this one-liner does the same job:
+  `30 21 * * * HOME=/home/hatch /usr/bin/python3 /home/hatch/workspace/telegram-bot/ron_backup.py >> /home/hatch/workspace/telegram-bot/ron_backup.log 2>&1` (21:30 UTC == 03:00 IST)
 
 ---
 
@@ -136,6 +141,10 @@ ron-telegram-bot/
 ├── ron_daemon.py      # Long-polling daemon — routing, commands, trailer handlers, degraded mode
 ├── ron_ai.py          # Multi-provider chat backend — failover, cheap routing, history
 ├── ron_cache.py       # Phase 6 semantic answer cache (stdlib only, per-chat SQLite)
+├── ron_backup.py      # Phase 7 nightly encrypted snapshots (Fernet, same key as memory)
+├── ron_health.py      # Phase 7 /health status card builders (pure functions)
+├── ron-backup.service.example  # systemd oneshot unit for the nightly backup
+├── ron-backup.timer.example    # systemd timer — daily 03:00 IST schedule
 ├── ron_ai.json        # Provider/model chain config (no secrets)
 ├── ron_memory.py      # Encrypted per-chat memory (SQLite + Fernet, FTS5 recall)
 ├── ron_privacy.py     # Disclosure consent + oversharing guard
@@ -149,7 +158,7 @@ ron-telegram-bot/
 ├── requirements.txt   # cryptography (memory encryption); rest is stdlib (Python 3.8+)
 ├── .env.example       # Template for required/optional config
 ├── CHANGELOG.md       # Version history
-└── VERSION            # Current version (1.2.0)
+└── VERSION            # Current version (1.5.0)
 ```
 
 ---
