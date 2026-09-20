@@ -1831,6 +1831,72 @@ def _clean_btn_label(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+# ---------------------------------------------------------------------------
+# Contextual button filter (2026-09-21): the model kept emitting generic
+# boilerplate quick-replies ("Ask", "Summary", "Fix code") on replies they
+# had nothing to do with — e.g. "Summary" on a casual one-liner, "Fix
+# code" on a non-code topic. parse_trailers now drops any quick-reply
+# label that isn't grounded in the reply's own topic. [links:] trailers
+# (real URLs) are untouched — only quick replies get filtered.
+
+# Labels that are never contextual, whatever the reply is about.
+# Compared against the normalized label: lowercase, punctuation stripped.
+_BUTTON_DENY = frozenset({
+    "ask", "ask me", "ask more", "ask anything",
+    "help", "help me", "need help",
+    "more info", "more information", "learn more", "tell me more",
+    "explain more", "show more", "read more", "get started",
+    "try again", "try it", "click here",
+})
+
+# A label promising to act on code is only honest if the reply shows code.
+_CODE_LABEL_RE = re.compile(r"\b(fix|debug)\b", re.I)
+# A label promising a summary is only honest if the reply is long enough
+# to be worth summarizing — kills "Summary" on casual one-liners.
+_SUMMARY_LABEL_RE = re.compile(r"\b(summar|recap|tl;?dr|key points)\b", re.I)
+_SUMMARY_MIN_REPLY_CHARS = 400
+
+# Words too generic to prove a label is about the reply's topic.
+_BUTTON_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for",
+    "with", "from", "about", "this", "that", "these", "those",
+    "it", "its", "your", "you", "yours", "my", "me",
+    "more", "most", "how", "what", "when", "why", "which", "who",
+    "can", "will", "would", "should", "could",
+    "tell", "show", "give", "get", "best", "top",
+})
+
+
+def _button_fits_context(label, visible):
+    """True if a quick-reply label is grounded in the reply's topic.
+
+    `visible` is the reply with all trailer syntax already stripped, so a
+    label can't match its own trailer text. Rules, in order:
+    1. Boilerplate labels are always dropped.
+    2. Code-action labels ("Fix this", "Debug it") need code in the reply.
+    3. Summary labels need a reply long enough to summarize.
+    4. Otherwise the label must share a real topic word (>=4 letters, not
+       a stopword) with the reply. Tiny labels ("Yes"/"No"/"Ok") pass —
+       they're harmless and usually answer a question in the reply.
+    """
+    norm = re.sub(r"[^a-z0-9 ]", "", (label or "").lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if not norm or norm in _BUTTON_DENY:
+        return False
+    low_visible = (visible or "").lower()
+    if _CODE_LABEL_RE.search(norm):
+        if "```" not in visible and not re.search(r"`[^`\n]+`", visible or ""):
+            return False
+        return True
+    if _SUMMARY_LABEL_RE.search(norm):
+        return len(visible or "") >= _SUMMARY_MIN_REPLY_CHARS
+    words = [w for w in re.findall(r"[a-z]{4,}", norm)
+             if w not in _BUTTON_STOPWORDS]
+    if not words:
+        return True
+    return any(w in low_visible for w in words)
+
+
 def parse_trailers(reply):
     """Pull [buttons: ...] / [links: ...] trailer lines into an inline keyboard."""
     btns = (BTN_RE.search(reply) or BTN_TAIL_RE.search(reply) or [None, None])[1]
@@ -1865,6 +1931,13 @@ def parse_trailers(reply):
                 b = label
             label = _clean_btn_label(b)
             if label:
+                # 2026-09-21: drop quick replies that aren't about this
+                # reply's topic ("Summary" on a one-liner, "Fix code" on a
+                # non-code topic). Off-topic buttons are worse than none.
+                if not _button_fits_context(label, clean):
+                    print(f"[ron_daemon] trailer: off-topic button dropped: "
+                          f"{label!r}", flush=True)
+                    continue
                 row.append({"text": label[:40],
                             "callback_data": _cb64("q:" + label)})
             if len(row) >= 8:

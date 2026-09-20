@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.15.1 — 2026-09-21
+
+Contextual quick-reply buttons: the model kept emitting generic boilerplate
+("Ask", "Summary", "Fix code") on replies they had nothing to do with.
+
+- **Daemon-side filter** (`_button_fits_context`, wired into
+  `parse_trailers` so both the classic keyboard and the in-bubble rich
+  buttons get it): boilerplate labels are always dropped; code-action
+  labels ("Fix this", "Debug it") survive only when the reply shows code;
+  summary labels survive only on replies long enough to summarize (>=400
+  chars); every other label must share a real topic word with the reply.
+  Tiny labels ("Yes"/"No") pass through. Dropped buttons log loudly
+  (`[ron_daemon] trailer: off-topic button dropped: …`). `[links:]`
+  trailers (real URLs) are untouched.
+- **Prompt retrained**: buttons default to NONE, every label must contain
+  a topic word from the reply, casual one-liners get no buttons at all.
+- 11 new tests; 468 run, only the 3 pre-existing `cryptography` loader
+  errors (system Python lacks the package).
+
 ## 1.15.0 — 2026-09-21
 
 Rich-text fix loop: the whole live-fire matrix is green against the real

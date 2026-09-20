@@ -505,7 +505,8 @@ class TrailerFixesTest(unittest.TestCase):
 
     def test_lone_markers_stripped_from_labels(self):
         clean, kb = ron_daemon.parse_trailers(
-            "Hi\n[buttons: *star* alone | _under_ score]")
+            "Star score update: you are not alone\n"
+            "[buttons: *star* alone | _under_ score]")
         self.assertEqual([b["text"] for b in kb["inline_keyboard"][0]],
                          ["star alone", "under score"])
 
@@ -522,6 +523,6 @@ class TrailerFixesTest(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             clean, kb = ron_daemon.parse_trailers(
-                "Hi\n[buttons: docs -> not-a-url]")
+                "Read the docs first\n[buttons: docs -> not-a-url]")
         self.assertEqual(kb["inline_keyboard"][0][0]["text"], "docs")
         self.assertIn("non-http", buf.getvalue())

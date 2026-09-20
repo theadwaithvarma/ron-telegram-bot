@@ -10,6 +10,8 @@ both the rich path and the classic keyboard fallback.
 """
 import os
 import sys
+import contextlib
+import io
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -175,14 +177,16 @@ class TestTrailerLabelSanitizer(unittest.TestCase):
 
     def test_markdown_stripped_from_labels(self):
         clean, kb = ron_daemon.parse_trailers(
-            "Pick one\n[buttons: Open **Muse** | `code` thing | ||spoiler|| x]")
+            "Open Muse docs for code samples\n"
+            "[buttons: Open **Muse** | `code` samples | ||spoiler|| docs]")
         row = kb["inline_keyboard"][0]
         self.assertEqual([b["text"] for b in row],
-                         ["Open Muse", "code thing", "spoiler x"])
+                         ["Open Muse", "code samples", "spoiler docs"])
 
     def test_link_syntax_inside_buttons_rescued(self):
         clean, kb = ron_daemon.parse_trailers(
-            "News\n[buttons: 🔵 Read more -> https://example.com/a | Chat]")
+            "News chat is here\n"
+            "[buttons: 🔵 Read more -> https://example.com/a | Chat]")
         rows = kb["inline_keyboard"]
         self.assertEqual(rows[0][0]["text"], "Chat")  # quick-reply row
         self.assertEqual(rows[1][0]["text"], "🔵 Read more")  # URL row
@@ -195,17 +199,90 @@ class TestTrailerLabelSanitizer(unittest.TestCase):
 
     def test_empty_labels_dropped(self):
         clean, kb = ron_daemon.parse_trailers(
-            "Hi\n[buttons:  |   | Real]")
+            "Hi, real deal\n[buttons:  |   | Real]")
         self.assertEqual([b["text"] for b in kb["inline_keyboard"][0]],
                          ["Real"])
 
     def test_callback_data_matches_visible_label(self):
         # Tapping re-sends the label; data must echo the CLEANED text.
         clean, kb = ron_daemon.parse_trailers(
-            "Hi\n[buttons: **Hey** there]")
+            "Hi there friend\n[buttons: **Hey** there]")
         b = kb["inline_keyboard"][0][0]
         self.assertEqual(b["text"], "Hey there")
         self.assertEqual(b["callback_data"], "q:Hey there")
+
+
+class TestContextualButtonFilter(unittest.TestCase):
+    """v1.15.1: quick-reply buttons must be grounded in the reply's topic.
+
+    Generic boilerplate ("Ask", "Summary", "Fix code") on unrelated
+    replies gets dropped by parse_trailers; labels that name the reply's
+    actual topic survive. [links:] trailers are unaffected.
+    """
+
+    def _labels(self, reply):
+        clean, kb = ron_daemon.parse_trailers(reply)
+        if not kb:
+            return []
+        return [b["text"] for b in kb["inline_keyboard"][0]]
+
+    def test_summary_dropped_on_casual_reply(self):
+        self.assertEqual(
+            self._labels("haha nice one\n[buttons: Summary]"), [])
+
+    def test_summarize_kept_on_long_reply(self):
+        long_reply = "Deep dive into Valorant agents. " * 30  # >400 chars
+        self.assertEqual(
+            self._labels(long_reply + "\n[buttons: Summarize key points]"),
+            ["Summarize key points"])
+
+    def test_fix_code_dropped_without_code(self):
+        self.assertEqual(
+            self._labels("Valorant is fun\n[buttons: Fix code]"), [])
+
+    def test_fix_code_kept_with_code(self):
+        reply = ("Here's the patch:\n```python\nx = 1\n```\n"
+                 "[buttons: Fix this code]")
+        self.assertEqual(self._labels(reply), ["Fix this code"])
+
+    def test_ask_always_dropped(self):
+        long_reply = "Long explanation about taxes. " * 30
+        self.assertEqual(
+            self._labels(long_reply + "\n[buttons: Ask]"), [])
+
+    def test_contextual_label_kept(self):
+        self.assertEqual(
+            self._labels("Valorant agents tier list\n"
+                        "[buttons: Best Valorant agents]"),
+            ["Best Valorant agents"])
+
+    def test_offtopic_label_dropped(self):
+        self.assertEqual(
+            self._labels("Valorant agents tier list\n[buttons: Study tip]"),
+            [])
+
+    def test_mixed_labels_only_good_survive(self):
+        self.assertEqual(
+            self._labels("Valorant agents tier list\n"
+                        "[buttons: Summary | Best Valorant agents | Ask]"),
+            ["Best Valorant agents"])
+
+    def test_yes_no_survive(self):
+        self.assertEqual(
+            self._labels("Want me to go deeper?\n[buttons: Yes | No]"),
+            ["Yes", "No"])
+
+    def test_links_trailer_unaffected(self):
+        clean, kb = ron_daemon.parse_trailers(
+            "Hi\n[links: Random -> https://example.com/x]")
+        self.assertEqual(kb["inline_keyboard"][0][0]["url"],
+                         "https://example.com/x")
+
+    def test_dropped_buttons_are_logged(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ron_daemon.parse_trailers("haha nice\n[buttons: Summary]")
+        self.assertIn("off-topic button dropped", buf.getvalue())
 
 
 if __name__ == "__main__":
