@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Owner power commands (v1.12.0) tests: gating, bans, broadcast two-step,
+"""Owner power commands (v1.13.0) tests: gating, bans, broadcast two-step,
 /quiet expiry, /forgetuser scoping, ephemeral auto-delete, /model pinning,
-clean-restart flag, and the ron_ai hooks (AI_CALL_HOOK, user_id tagging).
+clean-restart flag, /del + /edit of the bot's own messages, and the ron_ai
+hooks (AI_CALL_HOOK, user_id tagging).
 
 No network, no Telegram. Run: python3 -m unittest discover tests -v
 (from ~/workspace/ron-telegram-bot)
@@ -14,14 +15,31 @@ import tempfile
 import time
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, REPO)
 
-import ron_owner
-import ron_daemon
+
+def _load_repo_module(name):
+    """Load the REPO's <name>.py as the canonical module object.
+
+    ron_daemon.py puts the live dir first on sys.path (its line-27 tweak),
+    so whichever test module imports the daemon first caches the LIVE
+    ron_owner/ron_daemon in sys.modules. Register the repo copies first so
+    this file — and the daemon it loads — test repo code, not deployed code.
+    """
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(REPO, name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ron_owner = _load_repo_module("ron_owner")
+ron_daemon = _load_repo_module("ron_daemon")
 
 OWNER = ron_daemon.OWNER_ID
 OTHER = 999888777  # a random non-owner user
-REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _load_repo_ron_ai():
@@ -702,6 +720,170 @@ class AiHookTest(unittest.TestCase):
         turns, _summary = ron_ai._prompt_turns(111, "again", "Kaviya")
         for t in turns:
             self.assertEqual(set(t.keys()), {"role", "content"})
+
+
+class DelEditTest(PowerBase):
+    """Owner /del and /edit: reply-based, own messages only, ephemeral."""
+
+    OWN = {"message_id": 100, "text": "hello there",
+           "from": {"id": 111, "is_bot": True,
+                    "username": ron_daemon.BOT_USERNAME}}
+    OTHER_BOT = {"message_id": 101, "text": "not mine",
+                 "from": {"id": 222, "is_bot": True,
+                          "username": "someotherbot"}}
+    HUMAN = {"message_id": 102, "text": "a human said this",
+             "from": {"id": 333, "is_bot": False, "username": "kaviya"}}
+    PHOTO = {"message_id": 103, "photo": [{"file_id": "x"}],
+             "from": {"id": 111, "is_bot": True,
+                      "username": ron_daemon.BOT_USERNAME}}
+
+    # -- pure resolvers ------------------------------------------------
+    def test_del_requires_reply(self):
+        mid, hint = ron_owner.resolve_del_target(None, "ronrebootedbot")
+        self.assertIsNone(mid)
+        self.assertIn("Reply", hint)
+        mid, hint = ron_owner.resolve_del_target({}, "ronrebootedbot")
+        self.assertIsNone(mid)
+
+    def test_del_refuses_foreign_messages(self):
+        for msg in (self.HUMAN, self.OTHER_BOT):
+            mid, hint = ron_owner.resolve_del_target(msg, "ronrebootedbot")
+            self.assertIsNone(mid)
+            self.assertIn("own messages", hint)
+
+    def test_del_accepts_own_message(self):
+        mid, hint = ron_owner.resolve_del_target(self.OWN, "ronrebootedbot")
+        self.assertEqual(mid, 100)
+        self.assertIsNone(hint)
+
+    def test_parse_edit_args(self):
+        self.assertEqual(ron_owner.parse_edit_args("new text"),
+                         (False, "new text"))
+        self.assertEqual(ron_owner.parse_edit_args("--no-buttons new text"),
+                         (True, "new text"))
+        self.assertEqual(ron_owner.parse_edit_args("--no-buttons"),
+                         (True, ""))
+        # Flag is only special as the first token.
+        self.assertEqual(ron_owner.parse_edit_args("keep --no-buttons"),
+                         (False, "keep --no-buttons"))
+        self.assertEqual(ron_owner.parse_edit_args(""), (False, ""))
+
+    def test_edit_target_validation(self):
+        mid, hint = ron_owner.resolve_edit_target(self.OWN, "ronrebootedbot",
+                                                  "new")
+        self.assertEqual((mid, hint), (100, None))
+        # No text -> usage.
+        mid, hint = ron_owner.resolve_edit_target(self.OWN, "ronrebootedbot",
+                                                  "")
+        self.assertIsNone(mid)
+        self.assertIn("Usage", hint)
+        # No reply -> hint.
+        mid, hint = ron_owner.resolve_edit_target(None, "ronrebootedbot",
+                                                  "new")
+        self.assertIsNone(mid)
+        self.assertIn("Reply", hint)
+        # Not ours -> hint.
+        mid, hint = ron_owner.resolve_edit_target(self.HUMAN,
+                                                  "ronrebootedbot", "new")
+        self.assertIsNone(mid)
+        self.assertIn("own messages", hint)
+        # Non-text target (photo, service msg) -> clean error.
+        mid, hint = ron_owner.resolve_edit_target(self.PHOTO,
+                                                  "ronrebootedbot", "new")
+        self.assertIsNone(mid)
+        self.assertIn("text messages", hint)
+
+    # -- /del flow ------------------------------------------------------
+    def _capture_api(self):
+        calls = []
+        ron_daemon.api = lambda m, p=None, **k: calls.append((m, p)) or \
+            {"ok": True}
+        return calls
+
+    def test_del_command_flow(self):
+        calls = self._capture_api()
+        ok = self.owner("del", "/del", reply_msg=self.OWN)
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("deleteMessage",
+                                  {"chat_id": 1, "message_id": 100})])
+        self.assertIn("Deleted", self.reply_text())
+        # Ephemeral: reply + command scheduled for deletion.
+        self.assertEqual(len(FakeTimer.scheduled), 1)
+
+    def test_del_api_failure_is_clean(self):
+        ron_daemon.api = lambda *a, **k: {"ok": False,
+                                          "error": "message to delete not found"}
+        self.owner("del", "/del", reply_msg=self.OWN)
+        self.assertIn("Couldn't delete", self.reply_text())
+
+    def test_del_hint_when_no_reply(self):
+        calls = self._capture_api()
+        self.owner("del", "/del")
+        self.assertIn("Reply", self.reply_text())
+        self.assertEqual(calls, [])
+
+    def test_del_refuses_foreign_message(self):
+        calls = self._capture_api()
+        self.owner("del", "/del", reply_msg=self.HUMAN)
+        self.assertIn("own messages", self.reply_text())
+        self.assertEqual(calls, [])
+
+    # -- /edit flow -----------------------------------------------------
+    def test_edit_command_flow(self):
+        calls = self._capture_api()
+        ok = self.owner("edit", "/edit fixed text", reply_msg=self.OWN)
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        method, params = calls[0]
+        self.assertEqual(method, "editMessageText")
+        self.assertEqual(params["chat_id"], 1)
+        self.assertEqual(params["message_id"], 100)
+        self.assertEqual(params["text"], "fixed text")
+        # No flag -> reply_markup omitted, buttons preserved.
+        self.assertNotIn("reply_markup", params)
+        self.assertIn("Edited", self.reply_text())
+        self.assertEqual(len(FakeTimer.scheduled), 1)
+
+    def test_edit_no_buttons_clears_keyboard(self):
+        calls = self._capture_api()
+        self.owner("edit", "/edit --no-buttons fresh text",
+                   reply_msg=self.OWN)
+        method, params = calls[0]
+        self.assertEqual(method, "editMessageText")
+        self.assertEqual(params["text"], "fresh text")
+        kb = json.loads(params["reply_markup"])
+        self.assertEqual(kb, {"inline_keyboard": []})
+        self.assertIn("Edited", self.reply_text())
+
+    def test_edit_no_buttons_without_text_is_usage(self):
+        calls = self._capture_api()
+        self.owner("edit", "/edit --no-buttons", reply_msg=self.OWN)
+        self.assertIn("Usage", self.reply_text())
+        self.assertEqual(calls, [])
+
+    def test_edit_api_failure_is_clean(self):
+        ron_daemon.api = lambda *a, **k: {"ok": False,
+                                          "error": "message can't be edited"}
+        self.owner("edit", "/edit x", reply_msg=self.OWN)
+        self.assertIn("Couldn't edit", self.reply_text())
+
+    def test_edit_refuses_non_text_target(self):
+        calls = self._capture_api()
+        self.owner("edit", "/edit x", reply_msg=self.PHOTO)
+        self.assertIn("text messages", self.reply_text())
+        self.assertEqual(calls, [])
+
+    def test_del_edit_refuse_nonowner(self):
+        for cmd, text in (("del", "/del"), ("edit", "/edit x")):
+            with self.subTest(cmd=cmd):
+                self.sent.clear()
+                FakeTimer.scheduled.clear()
+                ok = ron_daemon.handle_command(1, OTHER, cmd, True, text,
+                                               cmd_msg_id=7,
+                                               reply_msg=self.OWN)
+                self.assertTrue(ok)
+                self.assertIn("Only Adwaith", self.reply_text())
+                self.assertEqual(len(FakeTimer.scheduled), 1)
 
 
 if __name__ == "__main__":

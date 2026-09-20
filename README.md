@@ -91,6 +91,8 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 | `/users` | Owner only — full user roster |
 | `/forgetuser` | Owner only — wipe one user's data (DM chat fully, group turns) |
 | `/model` | Owner only — show or re-pin the AI provider chain |
+| `/del` | Owner only — delete one of the bot's own messages (send as a reply to it) |
+| `/edit` | Owner only — rewrite one of the bot's own text messages (send as a reply; `--no-buttons` strips its inline keyboard) |
 
 All owner commands are **ephemeral** — the command and the reply auto-delete after 30 seconds.
 | `/start` | Owner only during maintenance — wakes the bot back up for everyone |

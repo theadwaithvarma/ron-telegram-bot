@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.13.0 — 2026-09-21
+
+Owner-only message surgery (ephemeral like all power commands):
+
+- `/del` — delete one of the bot's own messages. Must be sent as a reply
+  to the target, so ownership is verifiable (the bot's own messages only —
+  never other users', even where it's admin).
+- `/edit <new text>` — rewrite one of the bot's own text messages, sent as
+  a reply to it. Plain `/edit` leaves inline buttons untouched;
+  `/edit --no-buttons <new text>` strips the inline keyboard too.
+  Non-text targets (photos, service messages) get a clean error.
+
 ## 1.12.0 — 2026-09-21
 
 Owner power commands (all owner-only, all ephemeral — the command and the

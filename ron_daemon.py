@@ -1889,7 +1889,7 @@ def _broadcast_fanout(chats, btext, notify_chat, owner_id, cmd_msg_id):
 
 def handle_command(chat_id, user_id, cmd, is_private, text="",
                    user_name="there", reply_to=None, thread_id=None,
-                   cmd_msg_id=None):
+                   cmd_msg_id=None, reply_msg=None):
     if cmd == "shutdown":
         # Owner-only maintenance mode: the bot goes quiet for everyone
         # except the owner. /start (owner) wakes it back up.
@@ -2004,6 +2004,55 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
         _owner_reply(chat_id, user_id, cmd_msg_id,
                      f"\u2709\uFE0F Sent to {dest}." if ok
                      else f"Send failed: {err}")
+        return True
+    if cmd == "del":
+        # Owner-only: delete one of the bot's own messages. Reply-based —
+        # /del must be sent as a reply to the target, so ownership is
+        # verifiable (the bot may be admin in groups, where deleteMessage
+        # could otherwise remove someone else's message). Own messages
+        # only — never other users'.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        target, hint = ron_owner.resolve_del_target(reply_msg, BOT_USERNAME)
+        if hint is not None:
+            _owner_reply(chat_id, user_id, cmd_msg_id, hint)
+            return True
+        r = api("deleteMessage",
+                {"chat_id": chat_id, "message_id": target})
+        if not (isinstance(r, dict) and r.get("ok")):
+            err = str((r or {}).get("error", "unknown"))[:80]
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         f"Couldn't delete it: {err}")
+            return True
+        _owner_reply(chat_id, user_id, cmd_msg_id, "Deleted.")
+        return True
+    if cmd == "edit":
+        # Owner-only: rewrite one of the bot's own text messages. Plain
+        # /edit <text> leaves inline buttons untouched; /edit --no-buttons
+        # <text> strips them. Reply-based, same ownership check as /del.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        no_buttons, new_text = ron_owner.parse_edit_args(_cmd_args(text))
+        target, hint = ron_owner.resolve_edit_target(reply_msg, BOT_USERNAME,
+                                                     new_text)
+        if hint is not None:
+            _owner_reply(chat_id, user_id, cmd_msg_id, hint)
+            return True
+        params = {"chat_id": chat_id, "message_id": target,
+                  "text": new_text}
+        if no_buttons:
+            # An empty inline keyboard clears the buttons; omitting
+            # reply_markup preserves whatever was there.
+            params["reply_markup"] = json.dumps({"inline_keyboard": []})
+        r = api("editMessageText", params)
+        if not (isinstance(r, dict) and r.get("ok")):
+            err = str((r or {}).get("error", "unknown"))[:80]
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         f"Couldn't edit it: {err}")
+            return True
+        _owner_reply(chat_id, user_id, cmd_msg_id, "Edited.")
         return True
     if cmd == "restart":
         # Owner-only: clean daemon restart. The ephemeral ack must actually
@@ -3210,7 +3259,8 @@ def handle_update(upd):
                                user_name,
                                reply_to=msg.get("message_id"),
                                thread_id=msg.get("message_thread_id"),
-                               cmd_msg_id=msg.get("message_id")):
+                               cmd_msg_id=msg.get("message_id"),
+                               reply_msg=msg.get("reply_to_message")):
         return
 
     # Phase 4 (silent): track group membership and check for disclosure

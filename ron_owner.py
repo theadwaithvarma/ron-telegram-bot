@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Owner-only power commands for the Ron Telegram bot (v1.12.0).
+"""Owner-only power commands for the Ron Telegram bot (v1.13.0).
 
 Self-contained logic + state for the owner's command deck: /stats, /ban,
 /unban, /broadcast, /say, /restart, /quiet, /logs, /users, /forgetuser,
-/model (and the /active ledger's ephemeral replies).
+/model, /del, /edit (and the /active ledger's ephemeral replies).
 
 Transport (sending/deleting Telegram messages) stays in ron_daemon.py —
 this module builds reply texts and owns its small JSON state files, so
@@ -480,6 +480,66 @@ def model_text(chain_info):
                      f"{p.get('status', '?')}{tag}")
     lines.append("/model <groq|gemini|openrouter> to pin one first.")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Delete / edit the bot's own messages (/del, /edit)
+# ---------------------------------------------------------------------------
+
+def _is_own_message(msg, bot_username):
+    """True when msg looks like a message sent by our bot."""
+    if not isinstance(msg, dict):
+        return False
+    frm = msg.get("from") or {}
+    return bool(frm.get("is_bot")) and \
+        str(frm.get("username", "")).lower() == str(bot_username or "").lower()
+
+
+def resolve_del_target(reply_msg, bot_username):
+    """Validate a /del target. Returns (message_id, None) on success,
+    or (None, hint) with an ephemeral hint for the owner.
+
+    Reply-based only: the command must be sent as a reply to the target,
+    so ownership can be verified. (The bot may be an admin in groups,
+    where deleteMessage could otherwise nuke someone else's message —
+    the bot's own messages only, never other users'.)
+    """
+    if not isinstance(reply_msg, dict) or not reply_msg.get("message_id"):
+        return None, "Reply to one of my messages to delete it."
+    if not _is_own_message(reply_msg, bot_username):
+        return None, "I can only delete my own messages."
+    return reply_msg["message_id"], None
+
+
+def parse_edit_args(args):
+    """Split /edit args into (no_buttons, new_text).
+
+    '--no-buttons' is only recognized as the first token and only takes
+    effect together with new text — /edit --no-buttons <text> strips the
+    inline keyboard, plain /edit <text> leaves buttons untouched.
+    """
+    toks = (args or "").split(None, 1)
+    if toks and toks[0] == "--no-buttons":
+        return True, (toks[1] if len(toks) > 1 else "").strip()
+    return False, (args or "").strip()
+
+
+def resolve_edit_target(reply_msg, bot_username, new_text):
+    """Validate an /edit target. Returns (message_id, None) on success,
+    or (None, hint). Only the bot's own *text* messages are editable —
+    service messages, photos, and other media have no editable text."""
+    if not new_text:
+        return (None,
+                "Usage: /edit [--no-buttons] <new text> \u2014 "
+                "reply to one of my messages.")
+    if not isinstance(reply_msg, dict) or not reply_msg.get("message_id"):
+        return None, "Reply to one of my text messages to edit it."
+    if not _is_own_message(reply_msg, bot_username):
+        return None, "I can only edit my own messages."
+    if "text" not in reply_msg:
+        return None, ("Can't edit that \u2014 only text messages are "
+                      "editable.")
+    return reply_msg["message_id"], None
 
 
 # ---------------------------------------------------------------------------
