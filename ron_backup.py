@@ -47,7 +47,11 @@ BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 STATUS_FILE = os.path.join(BASE_DIR, "ron_backup.json")
 KEY_ENV = "RON_MEMORY_KEY"
 # The file that feeds the daemon its environment. Parsed with a regex —
-# never executed — for the Environment=RON_MEMORY_KEY=... line.
+# never executed — for the RON_MEMORY_KEY=... line. Lives in /home/hatch
+# (persistent) because /etc on this host is wiped on every host reboot.
+PERSISTENT_ENV_FILE = os.path.join(HOME, ".config", "ron", "env")
+# Legacy location from before the 2026-09-20 re-key (kept as a fallback;
+# the path is gone on this host but harmless to check).
 OVERRIDE_PATH = "/etc/systemd/system/ron-watchdog.service.d/override.conf"
 KEEP = 7  # daily snapshots retained
 
@@ -68,41 +72,58 @@ def _log(msg):
 
 
 def _read_key(explicit=None):
-    """Return the raw key string from env or the systemd override.
+    """Return the raw key string from env, the persistent env file, or the
+    legacy systemd override.
 
-    Raises BackupError (no key material in the message) when neither
-    source has it — the caller must then fail WITHOUT writing a backup.
+    Raises BackupError (no key material in the message) when no source has
+    it — the caller must then fail WITHOUT writing a backup.
     """
     if explicit:
         return explicit
     env = os.environ.get(KEY_ENV)
     if env:
         return env
-    try:
-        with open(OVERRIDE_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
-    except OSError:
-        content = ""
-    # Try quoted values first (a passphrase key may contain spaces — a
-    # bare [^\s] capture would silently truncate it and encrypt under the
-    # wrong key, producing unrestorable "ok" snapshots), then the bare
-    # token form. Matches:
-    #   Environment=RON_MEMORY_KEY=<token>
-    #   Environment="RON_MEMORY_KEY=<anything but a quote>"
-    #   Environment='RON_MEMORY_KEY=<anything but a quote>'
-    m = re.search(r'(?m)^[ \t]*Environment[ \t]*=[ \t]*"'
-                  + re.escape(KEY_ENV) + r'=([^"]*)"', content)
-    if not m:
-        m = re.search(r"(?m)^[ \t]*Environment[ \t]*=[ \t]*'"
-                      + re.escape(KEY_ENV) + r"=([^']*)'", content)
-    if not m:
-        m = re.search(r'(?m)^[ \t]*Environment[ \t]*=[ \t]*'
-                      + re.escape(KEY_ENV) + r'=([^\s"\']+)', content)
-    if m and m.group(1):
-        return m.group(1)
+    for path, prefix in ((PERSISTENT_ENV_FILE, ""),
+                         (OVERRIDE_PATH, "Environment")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            continue
+        key = _parse_key_line(content, prefix)
+        if key:
+            return key
     raise BackupError(
-        f"{KEY_ENV} not found in environment or {OVERRIDE_PATH} — "
-        "refusing to write an unencrypted backup.")
+        f"{KEY_ENV} not found in environment, {PERSISTENT_ENV_FILE} or "
+        f"{OVERRIDE_PATH} — refusing to write an unencrypted backup.")
+
+
+def _parse_key_line(content, prefix):
+    """Extract RON_MEMORY_KEY from a KEY=... file (prefix="") or a systemd
+    Environment=... drop-in (prefix="Environment"). Returns "" when absent.
+
+    Tries quoted values first: a passphrase key may contain spaces, and a
+    bare [^\\s] capture would silently truncate it and encrypt under the
+    wrong key, producing unrestorable "ok" snapshots.
+    """
+    esc = re.escape(KEY_ENV)
+    if prefix:
+        patterns = [
+            r'(?m)^[ \t]*Environment[ \t]*=[ \t]*"' + esc + r'=([^"]*)"',
+            r"(?m)^[ \t]*Environment[ \t]*=[ \t]*'" + esc + r"=([^']*)'",
+            r'(?m)^[ \t]*Environment[ \t]*=[ \t]*' + esc + r'=([^\s"\']+)',
+        ]
+    else:
+        patterns = [
+            r'(?m)^[ \t]*' + esc + r'="([^"]*)"',
+            r"(?m)^[ \t]*" + esc + r"='([^']*)'",
+            r'(?m)^[ \t]*' + esc + r'=([^\s"\']+)',
+        ]
+    for pat in patterns:
+        m = re.search(pat, content)
+        if m and m.group(1):
+            return m.group(1)
+    return ""
 
 
 def _fernet(key_raw):

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.5.1 — 2026-09-20
+
+Reboot-survival fix, learned the hard way: a host reboot wiped the
+ephemeral `/etc/systemd/system`, taking the watchdog unit and the memory
+key's systemd override with it. The bot was down ~15 minutes; the old
+memory key was unrecoverable, so the encrypted memory DB was archived and
+re-keyed (recent chat histories survive in the plaintext JSON history).
+
+- **Persistent secrets** — `RON_MEMORY_KEY` and proxy env now live in a
+  root-only `~/.config/ron/env` file (mode 0600, on persistent storage),
+  loaded via `EnvironmentFile=` — no more secrets in `/etc`.
+- **Canonical systemd units** — new `systemd/` directory holds the real
+  `ron-watchdog.service`, `ron-backup.service`, `ron-backup.timer`, plus
+  `install.sh`, which reinstalls everything into `/etc` after a host
+  reboot (one command: `systemd/install.sh`).
+- `ron_backup.py` now also reads the key from the persistent env file
+  (env var → persistent file → legacy override), so backups work even
+  when no systemd override exists.
+
 ## 1.5.0 — 2026-09-20
 
 Final hardening: the bot now backs itself up and reports its own health —

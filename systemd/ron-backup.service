@@ -1,0 +1,26 @@
+# Ron Telegram bot — nightly encrypted state snapshot (CANONICAL COPY).
+#
+# /etc on this host is EPHEMERAL: a host reboot wipes /etc/systemd/system.
+# This file is the persistent source of truth. After any reboot, run:
+#   ~/workspace/telegram-bot/systemd/install.sh
+#
+# Runs ron_backup.py: snapshots ron_memory.db / ron_cache.db + JSON state,
+# encrypts with RON_MEMORY_KEY (from the persistent env file
+# /home/hatch/.config/ron/env — same key the live DB uses), keeps 7 daily
+# snapshots. No network needed. Failure is loud in the log but never
+# touches the live daemon.
+[Service]
+Type=oneshot
+# The bot tree is root-owned and the daemon runs as root with HOME pinned
+# to /home/hatch — the backup needs the same env file for RON_MEMORY_KEY.
+User=root
+Environment=HOME=/home/hatch
+EnvironmentFile=/home/hatch/.config/ron/env
+ExecStart=/usr/bin/python3 /home/hatch/workspace/telegram-bot/ron_backup.py
+# Append to the same log the documented cron line would use.
+StandardOutput=append:/home/hatch/workspace/telegram-bot/ron_backup.log
+StandardError=append:/home/hatch/workspace/telegram-bot/ron_backup.log
+# Don't hammer a struggling box: if the box was down at 03:00, the timer's
+# Persistent=true catches up once — this keeps a single missed run from
+# queueing retries.
+Nice=10

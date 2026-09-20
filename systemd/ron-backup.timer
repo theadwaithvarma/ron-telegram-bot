@@ -1,0 +1,13 @@
+[Unit]
+Description=Ron Telegram bot — nightly backup schedule (Phase 7)
+
+[Timer]
+# 21:30 UTC == 03:00 IST (Asia/Calcutta), daily.
+OnCalendar=*-*-* 21:30:00
+# If the box was off at 03:00, run once on next boot instead of skipping.
+Persistent=true
+# Splay a little so the backup never stampedes the watchdog's 60s checks.
+RandomizedDelaySec=180
+
+[Install]
+WantedBy=timers.target

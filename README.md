@@ -85,6 +85,7 @@ Handles `business_connection` and `business_message` updates — Ron can answer 
 - Provider-neutral rate-limit replies instead of generic error text
 - Nightly backups run via the `ron-backup.timer` systemd timer (see `ron-backup.service.example`); on boxes with cron instead, this one-liner does the same job:
   `30 21 * * * HOME=/home/hatch /usr/bin/python3 /home/hatch/workspace/telegram-bot/ron_backup.py >> /home/hatch/workspace/telegram-bot/ron_backup.log 2>&1` (21:30 UTC == 03:00 IST)
+- **Ephemeral-`/etc` hosts:** if your host wipes `/etc` on reboot (containers, some VPS images), the `systemd/` directory holds canonical unit copies plus `install.sh` — run it after any reboot to reinstall the watchdog and backup timer. Secrets live in a persistent `~/.config/ron/env` file (mode 0600), never in `/etc`.
 
 ---
 
@@ -150,6 +151,7 @@ ron-telegram-bot/
 ├── ron_privacy.py     # Disclosure consent + oversharing guard
 ├── ron_watchdog.py    # Supervisor — restarts dead/hung daemons, repairs broken configs
 ├── ron-watchdog.service.example  # systemd unit template for the watchdog
+├── systemd/             # Canonical units for ephemeral-/etc hosts + install.sh (reinstalls after reboot)
 ├── config.py          # Env-var config + .env loader (stdlib only)
 ├── stream_send.py     # Progressive draft streaming for 1:1 chats
 ├── rich_send.py       # Native rich message sender with plain-text fallback

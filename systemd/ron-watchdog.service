@@ -1,0 +1,28 @@
+# Ron Telegram bot — watchdog unit (CANONICAL COPY).
+#
+# /etc on this host is EPHEMERAL: a host reboot wipes /etc/systemd/system.
+# This file is the persistent source of truth. After any reboot, run:
+#   ~/workspace/telegram-bot/systemd/install.sh
+# which copies the units in this directory into /etc/systemd/system and
+# starts everything. Never edit the /etc copy directly — edit here.
+#
+# Environment (memory key, egress proxy) comes from the persistent,
+# root-only file /home/hatch/.config/ron/env (mode 0600), NOT from a
+# /etc drop-in, so secrets survive reboots too.
+[Unit]
+Description=Ron Telegram bot watchdog (supervises ron_daemon.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/home/hatch
+EnvironmentFile=/home/hatch/.config/ron/env
+WorkingDirectory=/home/hatch/workspace/telegram-bot
+ExecStart=/usr/bin/python3 /home/hatch/workspace/telegram-bot/ron_watchdog.py --loop
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
