@@ -10,11 +10,14 @@ import re
 import sys
 import threading
 import time
-import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 from dynamic_credentials import dynamic_credential_entry, DynamicCredentialError
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+import http_pool
 
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, "workspace", "telegram-bot")
@@ -305,6 +308,11 @@ class _PooledResponse:
 
 
 def _build_request(base_url, key, model, messages, stream, extra_headers):
+    """Build a chat-completions request.
+
+    Returns (host, path, body_bytes, headers) for the keep-alive pool —
+    the pool speaks raw HTTP, so no urllib Request object is built.
+    """
     payload = json.dumps({
         "model": model,
         "messages": messages,
@@ -320,11 +328,9 @@ def _build_request(base_url, key, model, messages, stream, extra_headers):
     if stream:
         headers["Accept"] = "text/event-stream"
     headers.update(extra_headers or {})
-    req = urllib.request.Request(
-        base_url.rstrip("/") + "/chat/completions",
-        data=payload, headers=headers)
-    req.add_header("Authorization", f"Bearer {key}")
-    return req
+    headers["Authorization"] = f"Bearer {key}"
+    u = urllib.parse.urlsplit(base_url.rstrip("/") + "/chat/completions")
+    return u.hostname, u.path or "/", payload, headers
 
 
 def _parse_retry_after(body):
@@ -391,8 +397,8 @@ def _request(cfg, messages, stream, timeout, cheap=False):
         i += 1
         attempt = 0
         while attempt < 2:
-            req = _build_request(base_url, key, model, messages, stream,
-                                 extra_headers)
+            host, path, body, headers = _build_request(
+                base_url, key, model, messages, stream, extra_headers)
             if AI_CALL_HOOK is not None:
                 try:
                     AI_CALL_HOOK(name)
@@ -400,58 +406,13 @@ def _request(cfg, messages, stream, timeout, cheap=False):
                     pass
             _API_SEMAPHORE.acquire()
             try:
-                raw = urllib.request.urlopen(req, timeout=timeout)
-            except urllib.error.HTTPError as e:
-                _API_SEMAPHORE.release()
-                try:
-                    body = e.read().decode()[:300]
-                except Exception:
-                    body = ""
-                status = e.code
-                if status == 429:
-                    saw_rate_limit = True
-                    last_err = e
-                    # Honor the provider's "try again in" wait when it's
-                    # short (bucket refills soon); a long wait means the
-                    # provider is out for a while — cool it down and move
-                    # on instead of hanging the reply thread.
-                    retry_wait = _parse_retry_after(body)
-                    with _rate_limit_lock:
-                        _provider_cooldown[name] = time.monotonic() + min(
-                            max(retry_wait, COOLDOWN_AFTER_RATELIMIT_SECS),
-                            120.0)
-                    if attempt == 0 and retry_wait <= 60.0:
-                        time.sleep(min(retry_wait, 30.0))
-                        attempt += 1
-                        continue
-                    break  # next model/provider
-                elif status in (401, 403):
-                    last_err = e
-                    # Bad/revoked key — skip the rest of this provider.
-                    while i < len(plan) and plan[i][0] == name:
-                        i += 1
-                    break
-                elif (500 <= status < 600 or _model_not_found(body)
-                        or status == 400):
-                    last_err = e
-                    # Transient (5xx) or deterministic (bad model/params):
-                    # one retry after backoff for 5xx only, then move on.
-                    if 500 <= status < 600 and attempt == 0:
-                        time.sleep(RETRY_BACKOFF_SECS)
-                        attempt += 1
-                        continue
-                    break
-                else:
-                    last_err = e
-                    break
-            except urllib.error.URLError as e:
-                _API_SEMAPHORE.release()
-                last_err = e  # transient network blip — retry/fallback
-                if attempt == 0:
-                    time.sleep(RETRY_BACKOFF_SECS)
-                    attempt += 1
-                    continue
-                break
+                # Pooled keep-alive connection: saves a fresh proxy
+                # CONNECT + TLS handshake (~0.4s) on every AI call.
+                # The _PooledStream is closed by _PooledResponse, which
+                # drains + recycles the connection (or discards it on
+                # abort) and only then releases the semaphore.
+                stream_resp = http_pool.pool_for(host).stream(
+                    "POST", path, body, headers, timeout)
             except DynamicCredentialError as e:
                 _API_SEMAPHORE.release()
                 # Surrogate went stale mid-run — treat as keyless provider.
@@ -459,8 +420,62 @@ def _request(cfg, messages, stream, timeout, cheap=False):
                 while i < len(plan) and plan[i][0] == name:
                     i += 1
                 break
+            except Exception as e:
+                _API_SEMAPHORE.release()
+                last_err = e  # transient network blip — retry/fallback
+                if attempt == 0:
+                    time.sleep(RETRY_BACKOFF_SECS)
+                    attempt += 1
+                    continue
+                break
+            status = stream_resp.status
+            if status == 200:
+                return _PooledResponse(stream_resp)
+            # Error status: read the body for classification, then recycle
+            # the connection (body fully read, so the drain is instant).
+            try:
+                err_body = stream_resp.read().decode(
+                    "utf-8", "replace")[:300]
+            except Exception:
+                err_body = ""
+            try:
+                stream_resp.close()
+            except Exception:
+                pass
+            _API_SEMAPHORE.release()
+            last_err = RuntimeError(f"HTTP {status}: {err_body}"[:150])
+            if status == 429:
+                saw_rate_limit = True
+                # Honor the provider's "try again in" wait when it's
+                # short (bucket refills soon); a long wait means the
+                # provider is out for a while — cool it down and move
+                # on instead of hanging the reply thread.
+                retry_wait = _parse_retry_after(err_body)
+                with _rate_limit_lock:
+                    _provider_cooldown[name] = time.monotonic() + min(
+                        max(retry_wait, COOLDOWN_AFTER_RATELIMIT_SECS),
+                        120.0)
+                if attempt == 0 and retry_wait <= 60.0:
+                    time.sleep(min(retry_wait, 30.0))
+                    attempt += 1
+                    continue
+                break  # next model/provider
+            elif status in (401, 403):
+                # Bad/revoked key — skip the rest of this provider.
+                while i < len(plan) and plan[i][0] == name:
+                    i += 1
+                break
+            elif (500 <= status < 600 or _model_not_found(err_body)
+                    or status == 400):
+                # Transient (5xx) or deterministic (bad model/params):
+                # one retry after backoff for 5xx only, then move on.
+                if 500 <= status < 600 and attempt == 0:
+                    time.sleep(RETRY_BACKOFF_SECS)
+                    attempt += 1
+                    continue
+                break
             else:
-                return _PooledResponse(raw)
+                break
     if saw_rate_limit:
         raise RateLimitedError("rate limited by all AI providers tried")
     raise RuntimeError(f"AI backend error: {str(last_err)[:120]}")
@@ -479,21 +494,23 @@ def probe_providers(timeout=15):
         if not key:
             out[name] = (False, "no key in vault")
             continue
-        url = spec["base_url"].rstrip("/") + "/models"
-        req = urllib.request.Request(url, headers={"User-Agent": _UA})
-        req.add_header("Authorization", f"Bearer {key}")
+        u = urllib.parse.urlsplit(spec["base_url"].rstrip("/") + "/models")
+        headers = {"User-Agent": _UA, "Authorization": f"Bearer {key}"}
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                try:
-                    n = len(json.loads(resp.read().decode()[:4000])
-                            .get("data", []))
-                    out[name] = (True, f"ok ({n} models)")
-                except Exception:
-                    out[name] = (True, "ok")
-        except urllib.error.HTTPError as e:
-            out[name] = (False, f"HTTP {e.code}")
+            # Pooled keep-alive, like chat completions.
+            status, data = http_pool.pool_for(u.hostname).get(
+                u.path or "/", headers, timeout)
         except Exception as e:
             out[name] = (False, str(e)[:80])
+            continue
+        if status != 200:
+            out[name] = (False, f"HTTP {status}")
+            continue
+        try:
+            n = len(json.loads(data.decode()[:4000]).get("data", []))
+            out[name] = (True, f"ok ({n} models)")
+        except Exception:
+            out[name] = (True, "ok")
     return out
 
 
@@ -644,7 +661,11 @@ def _prompt_turns(chat_id, user_text, user_name):
     stored = hist.get(str(chat_id), [])
     summary = _load_summary(chat_id)
     if len(stored) > SUMMARY_ROLLOVER_AT:
-        summary = _maybe_rollover(chat_id, stored, summary)
+        # The fold runs in the background: the reply must not wait for a
+        # full extra summarization round-trip on its critical path. The
+        # new summary lands for the NEXT turn; a lost worker is harmless
+        # (the next turn past the threshold retries).
+        _maybe_rollover_async(chat_id, summary)
     # Strip to role/content: stored turns may carry owner-tooling metadata
     # (e.g. user_id) that must never reach the provider API.
     turns = [{"role": t.get("role"), "content": t.get("content")}
@@ -691,6 +712,41 @@ def _maybe_rollover(chat_id, stored, prior_summary):
         return new_summary
     except Exception:
         return prior_summary
+
+
+# Rollover workers in flight, by chat id: at most one background fold per
+# chat. Guarded by _ROLLOVER_LOCK; a lost worker is harmless because the
+# next turn past SUMMARY_ROLLOVER_AT retries the fold.
+_ROLLOVER_RUNNING = set()
+_ROLLOVER_LOCK = threading.Lock()
+
+
+def _maybe_rollover_async(chat_id, prior_summary):
+    """Fold the oldest turns into the summary off the reply's critical path.
+
+    _maybe_rollover() re-reads history under the lock and no-ops when
+    another worker already folded, so concurrent workers are safe and a
+    duplicate spawn is skipped via _ROLLOVER_RUNNING.
+    """
+    ck = str(chat_id)
+    with _ROLLOVER_LOCK:
+        if ck in _ROLLOVER_RUNNING:
+            return
+        _ROLLOVER_RUNNING.add(ck)
+
+    def _run():
+        try:
+            # _maybe_rollover re-reads history itself; the `stored` arg
+            # is unused, so None is fine here.
+            _maybe_rollover(chat_id, None, prior_summary)
+        except Exception:
+            pass
+        finally:
+            with _ROLLOVER_LOCK:
+                _ROLLOVER_RUNNING.discard(ck)
+
+    threading.Thread(target=_run, daemon=True,
+                     name=f"rollover-{ck}").start()
 
 
 def _summarize_via_cheap(cfg, old_turns, prior_summary):

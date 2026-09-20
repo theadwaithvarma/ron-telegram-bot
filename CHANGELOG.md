@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.16.0 — 2026-09-21
+
+Overnight stability + speed pass: no features removed, nothing user-facing
+changed — every AI reply just starts sooner and the hot paths do less work.
+
+- **AI brain on the keep-alive pool** (`ron_ai._request` now streams
+  chat-completions through `http_pool` instead of a fresh
+  `urllib.request.urlopen` per call): one proxy CONNECT + TLS handshake
+  (~0.4s on this host) removed from every AI request before model
+  generation begins. Startup provider probes use the pool too. Retry,
+  provider-cooldown (429/401/5xx), failover order, and the API semaphore
+  (still held for the full stream lifecycle) are unchanged.
+- **Stream lifecycle hygiene** (`http_pool.stream()` + `_PooledStream`):
+  clean `[DONE]` / fully-read responses drain (bounded 3s) and recycle the
+  connection; stop-button, error, or stall paths `abort()` and discard it
+  so a dead stream is never reused.
+- **History rollover off the critical path** (`_maybe_rollover_async`):
+  folding old turns into the rolling summary used to cost a full extra
+  summarization round-trip *before* the reply's own AI call; now it runs
+  on a background thread (one per chat, guarded) and the reply goes out
+  immediately with the prior summary. A lost worker is harmless — the
+  next turn past the threshold retries.
+- **Group/topic context computed once** (`ai_reply`): the private
+  streaming path used to build `group_context()` (disk reads) and then
+  throw it away while `stream_ai_reply` rebuilt it; now it's computed
+  only on the non-streaming path that actually uses it.
+- **`note_group()` write debounce**: `known_groups.json` was rewritten on
+  every group message; unchanged entries now skip the disk write for
+  60s (the `seen` timestamp is write-only metadata — nothing reads it).
+- **`ephemeral_send.py` on the pool** (saves a handshake per ephemeral
+  send) and a **watchdog fd-leak fix** (`start_daemon` closed over the
+  log file handle once per restart).
+- 16 new tests (pool streaming recycle/abort, pooled AI transport incl.
+  429/401/5xx classification, async rollover, group-write debounce);
+  484 run, only the 3 pre-existing `cryptography` loader errors (system
+  Python lacks the package).
+
 ## 1.15.1 — 2026-09-21
 
 Contextual quick-reply buttons: the model kept emitting generic boilerplate

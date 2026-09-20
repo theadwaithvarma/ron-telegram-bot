@@ -13,6 +13,11 @@ thread owns a connection at a time. A connection the server closed while
 idle is discarded and the request retried once on a fresh connection —
 but only when no response was received, so a send is never duplicated.
 
+Streaming: stream() hands back a _PooledStream wrapping the live
+response for incremental (SSE) reading. close() drains the tail
+(bounded) and recycles the connection; abort() discards it. Every
+stream() must end in exactly one close()/abort().
+
 Proxy handling mirrors urllib: honors no_proxy via proxy_bypass() and
 reads the proxy (with credentials) from the https_proxy/https_proxy env
 vars, exactly like the rest of the daemon.
@@ -26,6 +31,12 @@ import urllib.parse
 import urllib.request
 
 _USER_AGENT = "ron-bot/1"
+
+# Cap on draining a finished stream before the connection is recycled.
+# Providers terminate the chunked SSE response right after `data: [DONE]`,
+# so the drain is normally instant; this only bounds the pathological
+# case of a server that never terminates (then the conn is discarded).
+_DRAIN_TIMEOUT_SECS = 3.0
 
 
 def _proxy_for(host):
@@ -89,25 +100,46 @@ class _ConnPool:
         except queue.Full:  # pragma: no cover - unbounded queue
             _close_quietly(conn)
 
-    def post(self, path, body, content_type, timeout=65):
-        """POST and return (status, body_bytes). Retries once on a stale
-        pooled connection — only when no response arrived, so nothing is
-        ever sent twice."""
-        headers = {"Content-Type": content_type,
-                   "User-Agent": _USER_AGENT,
-                   "Connection": "keep-alive"}
+    def _request_once(self, method, path, body, headers, timeout):
+        """One attempt: returns (conn, resp), or raises on conn failure."""
+        conn = self._checkout()
+        try:
+            conn.timeout = timeout
+            conn.request(method, path, body=body, headers=headers)
+            return conn, conn.getresponse()
+        except Exception:
+            _close_quietly(conn)
+            raise
+
+    def request(self, method, path, body, headers, timeout=65):
+        """Send one request and return (status, body_bytes).
+
+        headers is the full header dict (must include Content-Type when a
+        body is sent). Retries once on a stale pooled connection — only
+        when no response arrived, so nothing is ever sent twice.
+        """
+        hdrs = dict(headers or {})
+        hdrs.setdefault("User-Agent", _USER_AGENT)
+        hdrs["Connection"] = "keep-alive"
         last_err = None
         for attempt in (0, 1):
-            conn = self._checkout() if attempt == 0 else self._new()
             try:
-                conn.timeout = timeout
-                conn.request("POST", path, body=body, headers=headers)
-                resp = conn.getresponse()
+                if attempt == 0:
+                    conn, resp = self._request_once(
+                        method, path, body, hdrs, timeout)
+                else:
+                    conn = self._new()
+                    try:
+                        conn.timeout = timeout
+                        conn.request(method, path, body=body, headers=hdrs)
+                        resp = conn.getresponse()
+                    except Exception:
+                        _close_quietly(conn)
+                        raise
             except Exception as e:
                 # Nothing came back — the pooled connection was probably
                 # closed by the server while idle. Discard and retry fresh.
                 last_err = e
-                _close_quietly(conn)
                 continue
             try:
                 data = resp.read()  # must fully drain before reuse
@@ -119,6 +151,116 @@ class _ConnPool:
             self._checkin(conn)
             return resp.status, data
         raise last_err  # both attempts failed before any response
+
+    def post(self, path, body, content_type, timeout=65, extra_headers=None):
+        """POST and return (status, body_bytes). Retries once on a stale
+        pooled connection — only when no response arrived, so nothing is
+        ever sent twice."""
+        headers = {"Content-Type": content_type}
+        headers.update(extra_headers or {})
+        return self.request("POST", path, body, headers, timeout)
+
+    def get(self, path, headers=None, timeout=65):
+        """GET and return (status, body_bytes). Same stale-retry semantics."""
+        return self.request("GET", path, None, headers, timeout)
+
+    def stream(self, method, path, body, headers, timeout=65):
+        """Open a streaming request; returns a _PooledStream.
+
+        Raises on connection failure (after one stale-retry, like
+        request()). The caller MUST end every stream with exactly one
+        close() (drains + recycles the connection) or abort() (discards
+        it) — the _PooledStream context manager does this automatically.
+        """
+        hdrs = dict(headers or {})
+        hdrs.setdefault("User-Agent", _USER_AGENT)
+        hdrs["Connection"] = "keep-alive"
+        last_err = None
+        for attempt in (0, 1):
+            try:
+                if attempt == 0:
+                    conn, resp = self._request_once(
+                        method, path, body, hdrs, timeout)
+                else:
+                    conn = self._new()
+                    try:
+                        conn.timeout = timeout
+                        conn.request(method, path, body=body, headers=hdrs)
+                        resp = conn.getresponse()
+                    except Exception:
+                        _close_quietly(conn)
+                        raise
+            except Exception as e:
+                last_err = e
+                continue
+            return _PooledStream(self, conn, resp)
+        raise last_err
+
+
+class _PooledStream:
+    """A live HTTP response over a pooled keep-alive connection.
+
+    Exactly one owner at a time. close() drains the rest of the response
+    (bounded by _DRAIN_TIMEOUT_SECS) and returns the connection to the
+    pool; abort() closes and discards it. Use as a context manager for
+    automatic handling: clean exit -> close(), exception -> abort().
+    """
+
+    def __init__(self, pool, conn, resp):
+        self._pool = pool
+        self._conn = conn
+        self._resp = resp
+        self._done = False
+
+    # Read passthrough for SSE consumers (readline loop etc.).
+    def readline(self, *args):
+        return self._resp.readline(*args)
+
+    def read(self, *args):
+        return self._resp.read(*args)
+
+    def __iter__(self):
+        return self._resp.__iter__()
+
+    @property
+    def status(self):
+        return self._resp.status
+
+    def getheader(self, *args):
+        return self._resp.getheader(*args)
+
+    def close(self):
+        """End the stream cleanly: drain, then recycle the connection."""
+        if self._done:
+            return
+        self._done = True
+        try:
+            # Bound the drain: providers terminate the chunk right after
+            # `data: [DONE]`, so this is normally instant. (The next
+            # checkout resets conn.timeout anyway.)
+            self._conn.timeout = _DRAIN_TIMEOUT_SECS
+            self._resp.read()
+        except Exception:
+            _close_quietly(self._conn)
+            return
+        self._pool._checkin(self._conn)
+
+    def abort(self):
+        """End the stream uncleanly: discard the connection, never reuse."""
+        if self._done:
+            return
+        self._done = True
+        _close_quietly(self._conn)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()
+        else:
+            self.abort()
+        return False
 
 
 _pools = {}

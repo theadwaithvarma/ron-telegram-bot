@@ -13,28 +13,29 @@ Usage:
 import os
 import sys
 import json
-import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import BOT_TOKEN, read_json_response
-
-BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+from config import BOT_TOKEN
+import http_pool
 
 
 def api(method, payload):
+    """Telegram API call over the keep-alive connection pool (saves a
+    fresh proxy CONNECT + TLS handshake per ephemeral send)."""
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(f"{BASE}/{method}", data=data,
-                                 headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return read_json_response(resp)
+        status, raw = http_pool.pool_for("api.telegram.org").post(
+            f"/bot{BOT_TOKEN}/{method}", data, "application/json", 30)
     except Exception as e:
-        body = ""
-        try:
-            body = e.read().decode()[:200]
-        except Exception:
-            pass
-        return {"ok": False, "error": f"{e} {body}"[:250]}
+        return {"ok": False, "error": str(e)[:250]}
+    if status != 200:
+        return {"ok": False, "error":
+                f"HTTP {status}: "
+                f"{raw[:120].decode('utf-8', 'replace')}"[:250]}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": f"bad JSON: {e}"[:250]}
 
 
 def ephemeral_send(chat_id, user_id, text, rich=False, fmt="markdown",

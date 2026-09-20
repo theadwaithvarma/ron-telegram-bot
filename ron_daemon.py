@@ -1338,15 +1338,33 @@ def load_known_groups():
         return {}
 
 
+# note_group() fires on every group message; without a guard each one
+# costs a full read + atomic rewrite of known_groups.json. Titles rarely
+# change and "seen" is write-only metadata, so unchanged entries skip
+# the disk write for _GROUP_WRITE_DEBOUNCE seconds.
+_GROUP_WRITE_TS = {}  # chat_id -> last known_groups.json write (epoch)
+_GROUP_WRITE_DEBOUNCE = 60.0
+
+
 def note_group(chat_id, title):
     """Remember a group/supergroup the bot can post in."""
     if not chat_id or not title:
         return
+    key = str(chat_id)
     try:
         with _FILE_LOCK:
             groups = load_known_groups()
-            groups[str(chat_id)] = {"title": title, "seen": time.time()}
+            prev = groups.get(key) or {}
+            now = time.time()
+            last_write = _GROUP_WRITE_TS.get(key, 0.0)
+            if (prev.get("title") == title
+                    and now - last_write < _GROUP_WRITE_DEBOUNCE):
+                return  # unchanged recently — skip the disk write
+            groups[key] = {"title": title, "seen": now}
             _atomic_write_json(KNOWN_GROUPS_FILE, groups)
+            _GROUP_WRITE_TS[key] = now
+            if len(_GROUP_WRITE_TS) > 5000:
+                _GROUP_WRITE_TS.clear()
     except Exception as e:
         print(f"[ron_daemon] note_group error: {e}", flush=True)
 
@@ -3061,17 +3079,6 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                         print(f"[ron_daemon] cache hit (chat={chat_id})",
                               flush=True)
                         return
-                extra = group_context()
-                if not private and _MEM_MODULES:
-                    # Phase 4 backstop: the deterministic tripwire catches
-                    # most personal questions, but if one slips through the
-                    # model must still not answer it publicly.
-                    extra += ron_privacy.GROUP_PRIVACY_RULE
-                if thread_id and not private:
-                    tname = topic_name(chat_id, thread_id)
-                    if tname:
-                        extra += (f"\nYou are replying inside the '{tname}' topic. "
-                                  "When the user says 'this topic', they mean it.")
                 # Business account reply: no draft streaming — drafts are a
                 # preview in the bot's own chats, but this reply must go out
                 # on the business account as one final message.
@@ -3113,8 +3120,23 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                             _record_brain_failure(emsg)
                         print(f"[ron_daemon] stream failed, single-send fallback: {e}",
                               flush=True)
-                # non-streaming path (groups, business): typing fires in the
-                # background while the AI call starts immediately.
+                # non-streaming path (groups, business, light mode):
+                # group/topic context is only needed here — the streaming
+                # path above builds its own inside stream_ai_reply, so
+                # computing it earlier did the disk reads twice per DM.
+                extra = group_context()
+                if not private and _MEM_MODULES:
+                    # Phase 4 backstop: the deterministic tripwire catches
+                    # most personal questions, but if one slips through the
+                    # model must still not answer it publicly.
+                    extra += ron_privacy.GROUP_PRIVACY_RULE
+                if thread_id and not private:
+                    tname = topic_name(chat_id, thread_id)
+                    if tname:
+                        extra += (f"\nYou are replying inside the '{tname}' topic. "
+                                  "When the user says 'this topic', they mean it.")
+                # typing fires in the background while the AI call starts
+                # immediately.
                 _kt = typing_kickoff(chat_id, business_connection_id)
                 reply = ron_ai.chat(chat_id, text, user_name,
                                     system_extra=extra, user_id=user_id,

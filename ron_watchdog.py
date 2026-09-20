@@ -227,15 +227,25 @@ def start_daemon():
         os.unlink(HEARTBEAT)
     except OSError:
         pass
+    log_fh = None
     try:
+        log_fh = open(DAEMON_LOG, "a")
         subprocess.Popen(
             ["/usr/bin/python3", DAEMON],
             cwd=DIR, stdin=subprocess.DEVNULL,
-            stdout=open(DAEMON_LOG, "a"), stderr=subprocess.STDOUT,
+            stdout=log_fh, stderr=subprocess.STDOUT,
             start_new_session=True)
     except Exception as e:
         log(f"daemon launch failed: {e}")
         return False
+    finally:
+        # The child has its own dup'd fd after fork — the parent's copy
+        # must be closed here, or the watchdog leaks one fd per restart.
+        if log_fh is not None:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
     time.sleep(6)
     pids = daemon_pids()
     if pids:
