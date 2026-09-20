@@ -7,6 +7,7 @@ Reads the Groq API key from the GROQ_API_KEY environment variable
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 
@@ -19,9 +20,16 @@ from config import (
     SYSTEM_PROMPT,
 )
 
-HISTORY_FILE = BASE_DIR / "ron_ai_history.json"
+HISTORY_FILE = str(BASE_DIR / "ron_ai_history.json")
 MAX_HISTORY = 12          # messages (user+assistant turns) kept per chat
 MAX_REPLY = 3500          # chars — Telegram-friendly cap
+# NOTE 2026-09-20: gpt-oss is a reasoning model — its hidden thinking trace
+# streams as reasoning chunks and counts against max_tokens. 800 was so small
+# that a long reasoning trace ate the whole budget (finish_reason "length")
+# before any visible content was emitted, producing empty replies. 4096 leaves
+# room for reasoning + the actual answer (Telegram caps us at ~3500 chars
+# anyway, and MAX_REPLY truncates above that).
+MAX_TOKENS = 4096
 
 DEFAULT_CONFIG = {
     "base_url": GROQ_BASE_URL,
@@ -94,6 +102,11 @@ RETRY_BACKOFF_SECS = 2.0
 # (2026-09-20: several reply threads wedged in readline() with no timeout
 # firing — this deadline guarantees they always terminate.)
 STREAM_STALL_SECS = 90.0
+# Absolute ceiling on one stream's lifetime: even a healthy slow trickle
+# must end. (4096 max_tokens at any plausible speed finishes far sooner.)
+STREAM_TOTAL_SECS = 600.0
+# Guards history read-modify-write: every reply thread shares one file.
+_HIST_LOCK = threading.RLock()
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
@@ -111,7 +124,7 @@ def _build_request(cfg, key, model, messages, stream):
         "model": model,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 800,
+        "max_tokens": MAX_TOKENS,
         **({"stream": True} if stream else {}),
     }).encode()
     headers = {
@@ -164,7 +177,8 @@ def _request(cfg, key, messages, stream, timeout):
                         f"AI backend error {status}: {body[:120]}")
             except urllib.error.URLError as e:
                 last_err = e  # transient network blip — retry/fallback
-
+            except RuntimeError:
+                raise RuntimeError("AI key not connected yet")
             if attempt == 0:
                 time.sleep(RETRY_BACKOFF_SECS)
         # this model is exhausted — fail over to the next one
@@ -190,18 +204,44 @@ def load_history():
         return {}
 
 
-def save_history(hist):
+def _save_turn(chat_id, user_text, user_name, reply):
+    """Append one completed turn to history, thread-safely.
+
+    Re-reads under a lock so two concurrent replies in the same chat can't
+    clobber each other's turns, and writes atomically (tmp+rename) so a
+    crash mid-write never leaves a torn JSON file.
+    """
+    with _HIST_LOCK:
+        hist = load_history()
+        ck = str(chat_id)
+        turns = hist.get(ck, [])
+        turns.append({"role": "user", "content": f"[{user_name}]: {user_text}"})
+        turns.append({"role": "assistant", "content": reply})
+        hist[ck] = turns[-MAX_HISTORY:]
+        _write_history(hist)
+
+
+def _write_history(hist):
     try:
-        with open(HISTORY_FILE, "w") as f:
+        tmp = HISTORY_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(hist, f)
+        os.replace(tmp, HISTORY_FILE)
     except Exception:
         pass
+
+
+def save_history(hist):
+    _write_history(hist)
 
 
 def chat(chat_id, user_text, user_name="there", system_extra=""):
     """One conversational turn. Returns the assistant's reply text."""
     cfg = load_config()
-    key = load_key()
+    try:
+        key = load_key()
+    except RuntimeError:
+        raise RuntimeError("AI key not connected yet")
     hist = load_history()
     ck = str(chat_id)
     turns = hist.get(ck, [])
@@ -211,19 +251,18 @@ def chat(chat_id, user_text, user_name="there", system_extra=""):
     messages = [{"role": "system", "content": system}] + turns
 
     try:
-        resp = _request(cfg, key, messages, stream=False, timeout=60)
+        # 120s: reasoning models can think a while before the first token
+        resp = _request(cfg, key, messages, stream=False, timeout=120)
         with resp:
             data = json.loads(resp.read().decode())
-    except DynamicCredentialError:
+    except RuntimeError:
         raise RuntimeError("AI key not connected yet")
 
     reply = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
     if not reply:
         raise RuntimeError("AI backend returned empty reply")
     reply = reply[:MAX_REPLY]
-    turns.append({"role": "assistant", "content": reply})
-    hist[ck] = turns[-MAX_HISTORY:]
-    save_history(hist)
+    _save_turn(chat_id, user_text, user_name, reply)
     return reply
 
 
@@ -237,7 +276,10 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     model generates. If stop_event is set, generation halts early.
     Returns the assistant's full reply text."""
     cfg = load_config()
-    key = load_key()
+    try:
+        key = load_key()
+    except RuntimeError:
+        raise RuntimeError("AI key not connected yet")
     hist = load_history()
     ck = str(chat_id)
     turns = hist.get(ck, [])
@@ -246,20 +288,30 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     system = cfg["system"] + (system_extra or "")
     messages = [{"role": "system", "content": system}] + turns
 
-    resp = _request(cfg, key, messages, stream=True, timeout=120)
+    try:
+        resp = _request(cfg, key, messages, stream=True, timeout=120)
+    except RuntimeError:
+        raise RuntimeError("AI key not connected yet")
 
     parts = []
-    last_data = time.time()
+    start = time.time()
+    last_data = start
     empty_streak = 0
     try:
         while True:
             if stop_event is not None and stop_event.is_set():
                 break
+            now = time.time()
             # Stall watchdog: keep-alive newlines don't count as data —
-            # only real tokens reset the clock.
-            if time.time() - last_data > STREAM_STALL_SECS:
+            # any real SSE event (content OR reasoning trace) resets it.
+            # (2026-09-20: gpt-oss can reason >90s before emitting content;
+            # resetting only on content falsely killed healthy streams.)
+            if now - last_data > STREAM_STALL_SECS:
                 raise RuntimeError(
                     f"AI stream stalled: no data for {STREAM_STALL_SECS:.0f}s")
+            if now - start > STREAM_TOTAL_SECS:
+                raise RuntimeError(
+                    f"AI stream exceeded {STREAM_TOTAL_SECS:.0f}s total")
             line = resp.readline().decode("utf-8", "replace").strip()
             if not line:
                 # A dead (server-closed) stream yields endless empty reads;
@@ -277,9 +329,9 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
                 ev = json.loads(line[5:].strip())
             except Exception:
                 continue
+            last_data = time.time()  # server is alive: content or reasoning
             delta = ((ev.get("choices") or [{}])[0].get("delta") or {}).get("content")
             if delta:
-                last_data = time.time()
                 parts.append(delta)
                 if on_token:
                     try:
@@ -296,7 +348,5 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     if not reply:
         raise RuntimeError("AI backend returned empty reply")
     reply = reply[:MAX_REPLY]
-    turns.append({"role": "assistant", "content": reply})
-    hist[ck] = turns[-MAX_HISTORY:]
-    save_history(hist)
+    _save_turn(chat_id, user_text, user_name, reply)
     return reply

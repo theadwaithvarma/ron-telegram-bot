@@ -30,9 +30,9 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 - Clean Telegram Markdown formatting, never raw artifact soup
 
 ### ⚡ Live Streaming Replies
-- Long answers **stream in real time** into 1:1 chats via progressive rich drafts (Telegram Bot API 10.1 `sendRichMessage`)
-- Graceful fallback to plain messages when rich drafts aren't available
-- Honors Telegram 10.3's `stopped_message_generation` — the stop button actually stops Ron mid-reply
+- Long answers **stream in real time** into 1:1 chats via Telegram's native message drafts (`sendMessageDraft`), with an instant "Thinking…" placeholder and throttled draft growth
+- Native stop control (`can_stop` / `keep_on_stop`) with graceful fallback, honoring Telegram 10.3's `stopped_message_generation` — the stop button actually stops Ron mid-reply
+- The finished reply is delivered as a rich message (`sendRichMessage`) with full formatting
 
 ### 📊 Native Polls & Quizzes
 | Command | Usage |

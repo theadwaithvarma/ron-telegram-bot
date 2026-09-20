@@ -3,12 +3,13 @@
 
 Replies to everyone: DMs from any user, and group messages that mention
 the bot or reply to it. (Owner-only pause was lifted 2026-09-20.)
-Replies use ron_ai.py (Groq backend), streaming live via rich drafts for
-long 1:1 answers, sent as native rich messages (Bot API 10.1
-sendRichMessage) with contextual quick-reply buttons.
+Replies use ron_ai.py (Groq backend), streaming live via Telegram's native
+message drafts (sendMessageDraft) for long 1:1 answers, finalized as native
+rich messages (sendRichMessage) with contextual quick-reply buttons.
 
-Run: nohup python3 ron_daemon.py >/tmp/ron_daemon.log 2>&1 &
-State: offset persisted to ron_daemon.offset (next to the scripts)
+Run: copy .env.example to .env, fill it in, then
+     nohup python3 ron_daemon.py >ron_daemon.log 2>&1 &
+State: offset persisted next to the script (ron_daemon.offset)
 """
 import json
 import os
@@ -33,8 +34,9 @@ from config import (
     telegram_api_base,
 )
 
-OFFSET_FILE = BASE_DIR / "ron_daemon.offset"
+OFFSET_FILE = str(BASE_DIR / "ron_daemon.offset")
 BASE = telegram_api_base()
+PLAYGROUND = "-1003920795086"
 
 # Graceful shutdown: restarts must not eat in-flight replies. The poll loop
 # saves the update offset as soon as a reply thread is spawned, so killing
@@ -43,6 +45,17 @@ BASE = telegram_api_base()
 _SHUTDOWN = threading.Event()
 _INFLIGHT = set()
 _INFLIGHT_LOCK = threading.Lock()
+# Guards read-modify-write of the small state JSON files (the poll loop and
+# reply threads both touch known_topics.json).
+_FILE_LOCK = threading.RLock()
+
+
+def _atomic_write_json(path, obj):
+    """Write JSON via tmp+rename so a crash mid-write never leaves a torn file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
 def _track(t):
@@ -120,7 +133,7 @@ LINK_TAIL_RE = re.compile(r"\[links:\s*([^\]]+?)\s*\]\s*$", re.I)
 # resolves the group and posts the message mentioning the requester.
 # Only the requester themself is ever mentioned — no pinging other people.
 # ---------------------------------------------------------------------------
-KNOWN_GROUPS_FILE = BASE_DIR / "known_groups.json"
+KNOWN_GROUPS_FILE = str(BASE_DIR / "known_groups.json")
 
 GROUP_RE = re.compile(r"^\[send_group:\s*(.+?)\s*\]\s*$", re.M | re.I)
 GROUP_TAIL_RE = re.compile(r"\[send_group:\s*([^\]]+?)\s*\]\s*$", re.I)
@@ -139,10 +152,10 @@ def note_group(chat_id, title):
     if not chat_id or not title:
         return
     try:
-        groups = load_known_groups()
-        groups[str(chat_id)] = {"title": title, "seen": time.time()}
-        with open(KNOWN_GROUPS_FILE, "w") as f:
-            json.dump(groups, f, ensure_ascii=False)
+        with _FILE_LOCK:
+            groups = load_known_groups()
+            groups[str(chat_id)] = {"title": title, "seen": time.time()}
+            _atomic_write_json(KNOWN_GROUPS_FILE, groups)
     except Exception as e:
         print(f"[ron_daemon] note_group error: {e}", flush=True)
 
@@ -170,12 +183,13 @@ def forum_status(group_id):
 
 def purge_topics(group_id):
     """Forget every topic remembered for a group (topics were disabled)."""
-    topics = load_known_topics()
-    if topics.pop(str(group_id), None) is not None:
-        save_known_topics(topics)
-        _FORUM_STATUS[str(group_id)] = (False, time.time())
-        print(f"[ron_daemon] topics disabled in {group_id}, purged",
-              flush=True)
+    with _FILE_LOCK:
+        topics = load_known_topics()
+        if topics.pop(str(group_id), None) is not None:
+            save_known_topics(topics)
+            _FORUM_STATUS[str(group_id)] = (False, time.time())
+            print(f"[ron_daemon] topics disabled in {group_id}, purged",
+                  flush=True)
 
 
 def group_context():
@@ -230,7 +244,7 @@ def group_context():
 # Forum topics: track topic id <-> name per group, reply inside the same
 # topic, and manage topics (create/rename/close/reopen/delete) via trailers.
 # ---------------------------------------------------------------------------
-KNOWN_TOPICS_FILE = BASE_DIR / "known_topics.json"
+KNOWN_TOPICS_FILE = str(BASE_DIR / "known_topics.json")
 
 TOPIC_RE = re.compile(r"^\[topic:\s*(.+?)\s*\]\s*$", re.M | re.I)
 TOPIC_TAIL_RE = re.compile(r"\[topic:\s*([^\]]+?)\s*\]\s*$", re.I)
@@ -247,9 +261,9 @@ def load_known_topics():
 
 
 def save_known_topics(t):
+    # Callers hold _FILE_LOCK (read-modify-write); the write itself is atomic.
     try:
-        with open(KNOWN_TOPICS_FILE, "w") as f:
-            json.dump(t, f, ensure_ascii=False)
+        _atomic_write_json(KNOWN_TOPICS_FILE, t)
     except Exception as e:
         print(f"[ron_daemon] save topics error: {e}", flush=True)
 
@@ -258,15 +272,16 @@ def note_topic(group_id, thread_id, name=None, closed=None):
     """Remember a forum topic the bot has seen."""
     if not group_id or not thread_id:
         return
-    topics = load_known_topics()
-    g = topics.setdefault(str(group_id), {})
-    tid = str(thread_id)
-    t = g.setdefault(tid, {"name": "General" if tid == "1" else f"topic {tid}"})
-    if name:
-        t["name"] = name
-    if closed is not None:
-        t["closed"] = bool(closed)
-    save_known_topics(topics)
+    with _FILE_LOCK:
+        topics = load_known_topics()
+        g = topics.setdefault(str(group_id), {})
+        tid = str(thread_id)
+        t = g.setdefault(tid, {"name": "General" if tid == "1" else f"topic {tid}"})
+        if name:
+            t["name"] = name
+        if closed is not None:
+            t["closed"] = bool(closed)
+        save_known_topics(topics)
 
 
 def topic_name(group_id, thread_id):
@@ -391,9 +406,10 @@ def handle_topic_actions(origin_chat_id, user_name, reply,
             ok, res = forum_api("deleteForumTopic",
                                 {"chat_id": gid, "message_thread_id": tid})
             if ok:
-                topics = load_known_topics()
-                topics.get(str(gid), {}).pop(str(tid), None)
-                save_known_topics(topics)
+                with _FILE_LOCK:
+                    topics = load_known_topics()
+                    topics.get(str(gid), {}).pop(str(tid), None)
+                    save_known_topics(topics)
                 print(f"[ron_daemon] topic '{tname}' deleted in {gid}",
                       flush=True)
             else:
@@ -422,7 +438,7 @@ def handle_send_topic(origin_chat_id, user_id, user_name, reply):
         name = (user_name or "you").strip() or "you"
         text = f"{name} \u2014 {message.strip()}"
         entities = [{"type": "text_mention", "offset": 0,
-                     "length": len(name), "user": {"id": user_id}}]
+                     "length": _u16_len(name), "user": {"id": user_id}}]
         ok, res = forum_api("sendMessage", {
             "chat_id": gid, "message_thread_id": tid,
             "text": text[:4000], "entities": entities})
@@ -455,7 +471,7 @@ def send_group_ping(group_chat_id, user_id, first_name, message):
     name = (first_name or "you").strip() or "you"
     text = f"{name} \u2014 {message.strip()}"
     entities = [{"type": "text_mention", "offset": 0,
-                 "length": len(name), "user": {"id": user_id}}]
+                 "length": _u16_len(name), "user": {"id": user_id}}]
     try:
         # NOTE: entities is nested — must go over JSON, not the urlencode api().
         r = rich_mod.api_json("sendMessage", {
@@ -512,7 +528,9 @@ def parse_trailers(reply):
     clean = strip_trailer_syntax(reply)
     kb = []
     if btns:
-        row = [{"text": b[:40], "callback_data": "q:" + b[:50]}
+        # callback_data is capped at 64 bytes by Telegram — truncate by bytes,
+        # not chars, so multibyte labels can't produce BUTTON_DATA_INVALID.
+        row = [{"text": b[:40], "callback_data": _cb64("q:" + b)}
                for b in (x.strip() for x in btns.split("|")) if b][:8]
         if row:
             kb.append(row)
@@ -554,7 +572,12 @@ def send_rich(chat_id, text, reply_markup=None, reply_to=None, thread_id=None):
         print(f"[ron_daemon] rich send error: {e}", flush=True)
     plain = strip_markdown(text)
     if reply_markup:
-        return send_markup(chat_id, plain, reply_markup, reply_to)
+        r2 = send_markup(chat_id, plain, reply_markup, reply_to)
+        if r2.get("ok"):
+            return r2
+        # Bad keyboard (oversized button etc.) — drop it, keep the text.
+        print(f"[ron_daemon] markup send not ok, retrying plain: "
+              f"{str(r2)[:120]}", flush=True)
     return send(chat_id, plain, reply_to, thread_id)
 
 
@@ -567,13 +590,18 @@ def send_rich(chat_id, text, reply_markup=None, reply_to=None, thread_id=None):
 # rule: the bot acts like an AI, not scripted responses.
 # ---------------------------------------------------------------------------
 def parse_command(text):
-    """Return the command name for '/cmd' or '/cmd@ronrebootedbot', else None."""
+    """Return the command name for '/cmd' or '/cmd@ronrebootedbot', else None.
+    Commands addressed to a different bot ('/cmd@otherbot') are ignored."""
     if not text.startswith("/"):
         return None
     rest = text[1:].split(None, 1)
     if not rest:
         return None
-    token = rest[0].split("@")[0]
+    token = rest[0]
+    if "@" in token:
+        token, _, target = token.partition("@")
+        if target.lower() != BOT_USERNAME.lower():
+            return None
     return token.lower() or None
 
 
@@ -597,6 +625,10 @@ def handle_command(chat_id, user_id, cmd, is_private, text=""):
             })
         return True
     return False
+
+
+# BOT_USERNAME comes from config (BOT_USERNAME env, defaults to the bot's
+# handle); commands like /poll@otherbot are ignored via parse_command.
 
 
 POLL_USAGE = (
@@ -657,31 +689,64 @@ def handle_poll_command(chat_id, cmd, text):
     return True
 
 
-STREAM_MIN_CHARS = 80   # first live preview appears sooner on slow trickles
 DRAFT_PUSH_SECS = 3.0    # min seconds between draft pushes — Telegram 429s
-                         # sendRichMessageDraft hammered faster than ~1/s
+                         # drafts hammered faster than ~1/s
 DRAFT_MIN_GROWTH = 40    # only push when the text actually grew this much
+DRAFT_MAX = 4096         # sendMessageDraft text cap
 TRAILER_LINE_RE = re.compile(r"^\[(buttons|links):.*$", re.M | re.I)
 STOP_EVENTS = {}  # chat_id -> threading.Event, set when user hits Stop
 _RE_429 = re.compile(r"retry after (\d+)", re.I)
+# can_stop/keep_on_stop are Bot API 10.3 (weeks old): probe once, then commit.
+# None = untested, True = native stop works, False = omit for this process.
+_DRAFT_STOP_OK = None
+
+
+def _draft_id():
+    """Non-zero draft id, unique per reply. Drafts are per-chat, and only one
+    stream runs per chat, so a millisecond timestamp is plenty."""
+    return (int(time.time() * 1000) & 0x7FFFFFFF) or 1
 
 
 def draft_update(chat_id, draft_id, text):
-    """Progressive rich draft (1:1 chats only). Returns (ok, retry_after_secs).
-    429s are backed off, not hammered — the final send still lands regardless."""
+    """Push a native streaming draft (private chats only, Bot API 9.3+).
+    Empty text shows the native "Thinking…" placeholder. Returns
+    (ok, retry_after_secs). 429s are backed off, not hammered — the final
+    rich send still lands regardless."""
+    global _DRAFT_STOP_OK
+    payload = {"chat_id": chat_id, "draft_id": draft_id,
+               "text": text[:DRAFT_MAX]}
+    if _DRAFT_STOP_OK is not False:
+        payload["can_stop"] = True      # 10.3: native Stop button
+        payload["keep_on_stop"] = True  # 10.3: keep partial draft on stop
     try:
-        r = rich_mod.api_json("sendRichMessageDraft", {
-            "chat_id": chat_id,
-            "draft_id": draft_id,
-            "rich_message": {"markdown": text},
-            "can_stop": True,  # Bot API 10.3 native Stop button
-        })
+        r = rich_mod.api_json("sendMessageDraft", payload)
     except Exception as e:
         print(f"[ron_daemon] draft error: {e}", flush=True)
         return False, 0
     if r.get("ok"):
+        if _DRAFT_STOP_OK is None:
+            _DRAFT_STOP_OK = True
+            print("[ron_daemon] draft: native stop supported", flush=True)
         return True, 0
     err = str(r.get("error"))[:160]
+    # The first call of a stream always uses empty text (always valid), so a
+    # 400 here means the server doesn't know the 10.3 stop params — retry
+    # once without them and omit them for the rest of the process.
+    if _DRAFT_STOP_OK is None and ("can_stop" in err or "keep_on_stop" in err
+                                   or "bad request" in err.lower()):
+        _DRAFT_STOP_OK = False
+        print(f"[ron_daemon] draft: stop params unsupported ({err}), "
+              "retrying without", flush=True)
+        payload.pop("can_stop", None)
+        payload.pop("keep_on_stop", None)
+        try:
+            r = rich_mod.api_json("sendMessageDraft", payload)
+        except Exception as e:
+            print(f"[ron_daemon] draft error: {e}", flush=True)
+            return False, 0
+        if r.get("ok"):
+            return True, 0
+        err = str(r.get("error"))[:160]
     m = _RE_429.search(err)
     backoff = int(m.group(1)) if m else 5
     print(f"[ron_daemon] draft not ok (backoff {backoff}s): {err}", flush=True)
@@ -691,8 +756,8 @@ def draft_update(chat_id, draft_id, text):
 def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None):
     """Trailer parsing + styled buttons + rich send with safe fallbacks."""
     clean, kb = parse_trailers(reply)
-    if not clean and not kb:
-        clean = "On it \u2713"  # trailer-only reply: say something
+    if not clean:
+        clean = "On it ✓"  # trailer-only/empty reply: say something
     if kb:  # Bot API 10.3 styled buttons
         for row in kb["inline_keyboard"]:
             for b in row:
@@ -709,42 +774,54 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None):
 
 
 def stream_ai_reply(chat_id, user_id, user_name, text):
-    """True token streaming for 1:1 chats: live rich drafts as tokens arrive,
-    then the final rich message with buttons. Falls back to single send.
-    The 10.3 Stop button halts generation via STOP_EVENTS."""
-    draft_id = int(chat_id) % 2000000000
+    """Native draft streaming for 1:1 chats (Bot API sendMessageDraft): the
+    reply animates in a draft bubble as tokens arrive (ChatGPT-style),
+    throttled to stay under Telegram's rate limits. The client's native Stop
+    button halts generation via the stopped_message_generation update.
+    Drafts auto-expire; the final sendRichMessage is the persistent reply.
+    Falls back to a single send on any failure."""
     stop_event = threading.Event()
     STOP_EVENTS[chat_id] = stop_event
     buf = []
+    draft_id = _draft_id()
     last_push = [0.0]
     last_push_len = [0]
-    last_typing = [0.0]
+    next_push_ok = [0.0]  # 429 backoff deadline
     send_typing(chat_id)
+    # empty text = native "Thinking…" placeholder, shown immediately
+    draft_update(chat_id, draft_id, "")
 
     def on_token(tok):
         buf.append(tok)
         cur = "".join(buf)
         now = time.time()
-        # keep "typing..." alive until the reply lands (expires after ~5s)
-        if now - last_typing[0] >= 4.0:
-            last_typing[0] = now
-            send_typing(chat_id)
-        # live draft preview: throttled + only on real growth, or Telegram 429s
-        if (len(cur) >= STREAM_MIN_CHARS
-                and len(cur) - last_push_len[0] >= DRAFT_MIN_GROWTH
-                and now - last_push[0] >= DRAFT_PUSH_SECS):
-            ok, backoff = draft_update(
-                chat_id, draft_id, strip_trailer_syntax(cur))
-            last_push_len[0] = len(cur)
-            # on 429, sit out the requested backoff before the next push
-            last_push[0] = now + (backoff if not ok else 0)
+        # live draft update: throttled + only on real growth + past backoff.
+        # plain text only — partial markdown mid-generation is not worth
+        # the 400s; the final rich send carries the formatting.
+        if (len(cur) - last_push_len[0] >= DRAFT_MIN_GROWTH
+                and now - last_push[0] >= DRAFT_PUSH_SECS
+                and now >= next_push_ok[0]):
+            snippet = strip_markdown(strip_trailer_syntax(cur)).strip()
+            ok, backoff = draft_update(chat_id, draft_id, snippet)
+            if ok:
+                last_push_len[0] = len(cur)
+                last_push[0] = now
+            elif backoff:
+                next_push_ok[0] = now + backoff
 
     try:
         reply = ron_ai.chat_stream(chat_id, text, user_name, on_token,
                                    stop_event=stop_event,
                                    system_extra=group_context())
     finally:
-        STOP_EVENTS.pop(chat_id, None)
+        # Only clear our own slot — a newer concurrent stream in this chat
+        # may have registered its event after us.
+        if STOP_EVENTS.get(chat_id) is stop_event:
+            STOP_EVENTS.pop(chat_id, None)
+
+    # short reply (nothing streamed) or post-stream: single rich send.
+    # on generation failure the exception propagates and the caller's
+    # single-send fallback replies — never an expired preview with nothing.
     send_rich_with_kb(chat_id, reply)
     handle_group_sends(chat_id, user_id, user_name, reply)
     handle_send_topic(chat_id, user_id, user_name, reply)
@@ -779,8 +856,8 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
             except Exception as e:
                 msg = str(e)
                 if "not connected yet" in msg:
-                    reply = ("My AI brain isn't plugged in yet \u2014 the owner's "
-                             "hooking up the API key, one sec. \U0001F527")
+                    reply = ("My AI brain isn't plugged in yet \u2014 "
+                             "the human's hooking up the API key, one sec. \U0001F527")
                 elif "rate limited" in msg:
                     reply = ("Groq's rate-limiting me right now \u2014 "
                              "give it a minute and try again. \u23F3")
@@ -801,12 +878,51 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
     t.start()
 
 
+def _entity_text(text, entity):
+    """Slice a message entity using Telegram's UTF-16 offsets.
+
+    Bot API entity offset/length are UTF-16 code units; Python string indices
+    are code points, so emoji before an entity would shift a naive slice.
+    Decode via UTF-16 to stay aligned.
+    """
+    try:
+        u16 = text.encode("utf-16-le")
+        start = entity.get("offset", 0) * 2
+        return u16[start:start + entity.get("length", 0) * 2].decode("utf-16-le")
+    except Exception:
+        return ""
+
+
+def _u16_len(s):
+    """Length of s in UTF-16 code units (for entity offset/length fields)."""
+    try:
+        return len(s.encode("utf-16-le")) // 2
+    except Exception:
+        return len(s)
+
+
+def _cb64(s):
+    """Truncate to Telegram's 64-byte callback_data limit (UTF-8 safe)."""
+    return s.encode("utf-8")[:64].decode("utf-8", "ignore")
+
+
 def handle_update(upd):
     msg = upd.get("message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     if not chat_id:
         return
+
+    # Ephemeral welcome: greet each new human member (only they see it).
+    new_members = msg.get("new_chat_members") or []
+    if new_members and chat.get("type") in ("group", "supergroup"):
+        for nm in new_members:
+            if nm.get("is_bot"):
+                continue  # skip bots, including Ron itself
+            try:
+                ephemeral_welcome(chat_id, nm, chat.get("title"))
+            except Exception as e:
+                print(f"[ron_daemon] ephemeral welcome failed: {e}", flush=True)
 
     # Learn every group the bot sees so DM-to-group requests can name them.
     if chat.get("type") in ("group", "supergroup"):
@@ -859,8 +975,10 @@ def handle_update(upd):
         return
 
     # Groups: only when mentioned or replied to.
+    # (Entity offsets are UTF-16 code units — _entity_text slices accordingly
+    # so emoji earlier in the message can't shift the mention out of reach.)
     mentioned = any(
-        e.get("type") == "mention" and BOT_USERNAME in text[e.get("offset", 0):e.get("offset", 0) + e.get("length", 0)]
+        e.get("type") == "mention" and BOT_USERNAME in _entity_text(text, e)
         for e in msg.get("entities", [])
     )
     replied_to_me = ((msg.get("reply_to_message") or {}).get("from") or {}).get("is_bot")
@@ -873,14 +991,17 @@ def handle_update(upd):
 
 
 def handle_callback(query):
-    """Quick-reply buttons: tapping one re-sends its label as the user's message."""
+    """Quick-reply buttons: tapping one re-sends its label as the user's message.
+    Every query is answered exactly once — BotFather alerts on unanswered ones.
+    (Stream Stop is now the client's native draft button; the retired inline
+    "stop" callback still lands here and is answered harmlessly.)"""
     frm = query.get("from") or {}
     data = query.get("data", "")
+    try:
+        api("answerCallbackQuery", {"callback_query_id": query["id"]})
+    except Exception:
+        pass
     if data == "demo_more":
-        try:
-            api("answerCallbackQuery", {"callback_query_id": query["id"]})
-        except Exception:
-            pass
         msg = query.get("message") or {}
         chat = msg.get("chat") or {}
         if chat.get("id"):
@@ -899,10 +1020,6 @@ def handle_callback(query):
         return
     if not data.startswith("q:"):
         return
-    try:
-        api("answerCallbackQuery", {"callback_query_id": query["id"]})
-    except Exception:
-        pass
     msg = query.get("message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
@@ -913,15 +1030,21 @@ def handle_callback(query):
                  thread_id=(msg.get("message_thread_id")))
 
 
-def ephemeral_welcome(chat_id, user):
+def ephemeral_welcome(chat_id, user, group_title=None):
     """Ephemeral welcome — visible only to the new joiner, zero group spam."""
     name = user.get("first_name", "there")
-    text = (
-        f"Welcome to Muse Playground, {name}! \U0001F389\n\n"
-        "Unofficial hangout for Muse users. Drop a message showing what "
-        "your agent can do \u2014 prompts, tips, builds, experiments.\n\n"
-        "Be kind, no spam. Not affiliated with Meta. Have fun!"
-    )
+    if str(chat_id) == PLAYGROUND:
+        text = (
+            f"Welcome to Muse Playground, {name}! \U0001F389\n\n"
+            "Unofficial hangout for Muse users. Drop a message showing what "
+            "your agent can do \u2014 prompts, tips, builds, experiments.\n\n"
+            "Be kind, no spam. Not affiliated with Meta. Have fun!"
+        )
+    else:
+        text = (
+            f"Welcome to {group_title or 'the group'}, {name}! \U0001F389\n\n"
+            "I'm Ron, the assistant here. Mention me if you need anything."
+        )
     # NOTE: must go over JSON — the urlencode api() mangles nested dicts
     # (Telegram 400s "can't parse EphemeralMessageParameters JSON object").
     return rich_mod.api_json("sendMessage", {
@@ -941,10 +1064,12 @@ def load_offset():
 
 def save_offset(offset):
     try:
-        with open(OFFSET_FILE, "w") as f:
+        tmp = OFFSET_FILE + ".tmp"
+        with open(tmp, "w") as f:
             f.write(str(offset))
-    except Exception:
-        pass
+        os.replace(tmp, OFFSET_FILE)
+    except Exception as e:
+        print(f"[ron_daemon] save offset error: {e}", flush=True)
 
 
 def main():
@@ -956,6 +1081,8 @@ def main():
                                    "allowed_updates": ["message", "callback_query",
                                                        "stopped_message_generation"]}, timeout=65)
             if not r.get("ok"):
+                print(f"[ron_daemon] getUpdates not ok: {str(r)[:150]}",
+                      flush=True)
                 time.sleep(5)
                 continue
             for upd in r.get("result", []):
@@ -964,17 +1091,24 @@ def main():
                     if "callback_query" in upd:
                         handle_callback(upd["callback_query"])
                     elif "stopped_message_generation" in upd:
-                        # 10.3 Stop button: halt the in-flight stream
+                        # 10.3 native Stop button: halt the in-flight stream
                         smg = upd["stopped_message_generation"] or {}
-                        cid = (smg.get("chat") or {}).get("id")
+                        cid = ((smg.get("chat") or {}).get("id")
+                               or ((smg.get("message") or {}).get("chat")
+                                   or {}).get("id"))
                         ev = STOP_EVENTS.get(cid)
                         if ev is not None:
+                            print(f"[ron_daemon] stop pressed, chat={cid}",
+                                  flush=True)
                             ev.set()
                     else:
                         handle_update(upd)
                 except Exception as e:
                     print(f"[ron_daemon] update error: {e}", flush=True)
-            save_offset(offset)
+                # Ack each update as handled (even on error, so a poison
+                # update can't wedge the loop) — a crash now loses at most
+                # one update instead of re-sending a whole batch.
+                save_offset(offset)
         except Exception as e:
             print(f"[ron_daemon] loop error: {e}", flush=True)
             time.sleep(5)
