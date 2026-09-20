@@ -128,6 +128,11 @@ class TestBuildUrl(unittest.TestCase):
         self.assertLessEqual(len(path.split("/prompt/")[1]),
                              ron_imagen.MAX_PROMPT_CHARS * 3)
 
+    def test_turbo_model_param(self):
+        # The default backend 429s under load; turbo stays up.
+        url = ron_imagen.build_url("a cat")
+        self.assertIn("model=turbo", url)
+
 
 def _fake_urlopen(data):
     fake_resp = mock.MagicMock()
@@ -170,9 +175,58 @@ class TestFetchImage(unittest.TestCase):
                        side_effect=OSError("down"))
         m.start()
         self.addCleanup(m.stop)
-        with self.assertRaises(Exception):
+        s = mock.patch("time.sleep")
+        s.start()
+        self.addCleanup(s.stop)
+        with self.assertRaises(RuntimeError):
             ron_imagen.fetch_image("a cat")
         self.assertEqual(set(os.listdir("/tmp")), before)
+
+
+class TestFetchRetry(unittest.TestCase):
+    def setUp(self):
+        s = mock.patch("time.sleep")
+        self.sleep = s.start()
+        self.addCleanup(s.stop)
+
+    def test_transient_flake_retried_then_succeeds(self):
+        calls = []
+
+        def fake_download(url):
+            calls.append(url)
+            if len(calls) == 1:
+                raise OSError("connection dropped")
+            return FAKE_JPEG
+
+        with mock.patch.object(ron_imagen, "_download_once",
+                               side_effect=fake_download):
+            path = ron_imagen.fetch_image("a cat")
+        try:
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), FAKE_JPEG)
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(calls), 2)
+        self.sleep.assert_called_once()
+
+    def test_definitive_error_not_retried(self):
+        with mock.patch.object(
+                ron_imagen, "_download_once",
+                side_effect=RuntimeError("provider returned no image")) \
+                as dl:
+            with self.assertRaises(RuntimeError):
+                ron_imagen.fetch_image("a cat")
+        dl.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_retry_exhaustion_raises_unreachable(self):
+        with mock.patch.object(ron_imagen, "_download_once",
+                               side_effect=OSError("down")) as dl:
+            with self.assertRaises(RuntimeError) as cm:
+                ron_imagen.fetch_image("a cat")
+        self.assertEqual(dl.call_count, ron_imagen._FETCH_ATTEMPTS)
+        self.assertIn("unreachable", str(cm.exception))
+        self.assertEqual(self.sleep.call_count, ron_imagen._FETCH_ATTEMPTS - 1)
 
 
 class TestSendPhoto(unittest.TestCase):

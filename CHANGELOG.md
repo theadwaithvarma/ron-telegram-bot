@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.8.1 — 2026-09-20
+
+Hotfix for `/imagine`: the image provider's default backend started
+429ing fresh generations (its upstream queue saturates under load),
+which surfaced as "the image service hiccuped".
+
+- Switched generation to the provider's `turbo` model — fresh 1024x1024
+  images generate reliably in a few seconds.
+- Added retry with backoff (3 attempts) for transient flakes: HTTP
+  429/5xx, dropped connections, timeouts. Definitive failures (empty
+  prompt, non-image response) still fail fast with no retry.
+
+
 ## 1.8.0 — 2026-09-20
 
 The bot can now draw. `/imagine a red fox in the snow` generates an

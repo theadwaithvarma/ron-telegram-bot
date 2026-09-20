@@ -28,12 +28,20 @@ import rich_send
 
 # Free, keyless image generation. A random seed per request so repeated
 # prompts don't return the same cached picture.
+# model=turbo: the default backend 429s under load (their upstream Sana
+# queue saturates); turbo is a faster distilled model that stays up.
 _API_BASE = "https://image.pollinations.ai/prompt"
+_MODEL = "turbo"
 _WIDTH = 1024
 _HEIGHT = 1024
 _TIMEOUT = 180  # generation can take a while on the free tier
 MAX_BYTES = 15 * 1024 * 1024  # refuse absurd downloads
 MAX_PROMPT_CHARS = 400
+
+# Transient network/provider flakes get a few retries with backoff;
+# definitive answers (empty prompt, non-image response) fail fast.
+_FETCH_ATTEMPTS = 3
+_FETCH_BACKOFF_SECS = (2, 5)
 
 # 10 images per rolling 6 hours per user; owner is exempt.
 LIMIT_N = 10
@@ -49,7 +57,20 @@ def build_url(prompt):
     q = urllib.parse.quote(prompt[:MAX_PROMPT_CHARS], safe="")
     seed = random.randint(1, 999_999_999)
     return (f"{_API_BASE}/{q}?width={_WIDTH}&height={_HEIGHT}"
-            f"&nologo=true&seed={seed}")
+            f"&nologo=true&model={_MODEL}&seed={seed}")
+
+
+def _download_once(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "ron-bot/1"})
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        data = resp.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise RuntimeError("image too large")
+    if len(data) < 1024 or not data.startswith(b"\xff\xd8\xff"):
+        # Pollinations returns JPEG; anything else is an error page —
+        # definitive, not worth retrying.
+        raise RuntimeError("provider returned no image")
+    return data
 
 
 def fetch_image(prompt):
@@ -57,22 +78,27 @@ def fetch_image(prompt):
 
     The caller must delete the file after uploading. Raises RuntimeError
     with a short reason on any failure (network, bad response, empty).
+    Transient flakes (HTTP 429/5xx, dropped connections, timeouts) are
+    retried a few times with backoff; definitive answers fail fast.
     """
     prompt = (prompt or "").strip()
     if not prompt:
         raise RuntimeError("empty prompt")
     url = build_url(prompt)
+    for attempt in range(_FETCH_ATTEMPTS):
+        try:
+            data = _download_once(url)
+            break
+        except RuntimeError:
+            raise  # definitive (empty/too large/not an image) — no retry
+        except Exception as e:
+            if attempt == _FETCH_ATTEMPTS - 1:
+                raise RuntimeError(f"image service unreachable: {e}") from e
+            time.sleep(_FETCH_BACKOFF_SECS[
+                min(attempt, len(_FETCH_BACKOFF_SECS) - 1)])
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False,
                                       dir="/tmp")
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "ron-bot/1"})
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            data = resp.read(MAX_BYTES + 1)
-        if len(data) > MAX_BYTES:
-            raise RuntimeError("image too large")
-        if len(data) < 1024 or not data.startswith(b"\xff\xd8\xff"):
-            # Pollinations returns JPEG; anything else is an error page.
-            raise RuntimeError("provider returned no image")
         tmp.write(data)
         tmp.close()
         return tmp.name
