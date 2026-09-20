@@ -80,6 +80,7 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 | `/imagine` | Generate an image — `/imagine a red fox in the snow` |
 | `/health` | Compact status card — uptime, AI chain, memory, cache, backup, restarts |
 | `/shutdown` | Owner only — maintenance mode: bot goes quiet for everyone but Adwaith |
+| `/active` | Owner only — who's around now and in the last 10 minutes |
 | `/start` | Owner only during maintenance — wakes the bot back up for everyone |
 
 ### 🛠️ Group Power Tools

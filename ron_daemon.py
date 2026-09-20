@@ -102,6 +102,17 @@ _SURROGATE = str(_entry["surrogate"]).strip()
 _SHUTDOWN = threading.Event()
 _INFLIGHT = set()
 _INFLIGHT_LOCK = threading.Lock()
+# /active (owner-only) activity ledger: which users are around right now.
+# user_id -> {"name", "username", "where", "ts"}. Written once per handled
+# update (cheap dict write, no API calls, no disk). Pruned to the 10-minute
+# window on read, so it stays small without a sweeper.
+_ACTIVITY = {}
+_ACTIVITY_LOCK = threading.Lock()
+_ACTIVITY_WINDOW = 600  # seconds: "last 10 min"
+_ACTIVITY_NOW = 60      # seconds: counts as "now"
+# thread -> user_id for replies currently being generated (the "Now"
+# section of /active). Maintained alongside _INFLIGHT.
+_INFLIGHT_USERS = {}
 # Guards read-modify-write of the small state JSON files (the poll loop and
 # reply threads both touch known_topics.json).
 _FILE_LOCK = threading.RLock()
@@ -397,9 +408,11 @@ def _health_ping():
                 print(f"[ron_daemon] owner alert failed: {e}", flush=True)
 
 
-def _track(t):
+def _track(t, user_id=None):
     with _INFLIGHT_LOCK:
         _INFLIGHT.add(t)
+        if user_id:
+            _INFLIGHT_USERS[t] = user_id
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +818,85 @@ def _approval_sweeper():
 def _untrack(t):
     with _INFLIGHT_LOCK:
         _INFLIGHT.discard(t)
+        _INFLIGHT_USERS.pop(t, None)
+
+
+# ---------------------------------------------------------------------------
+# /active activity ledger (owner-only). One dict write per handled update —
+# messages, button taps, and business chats. No API calls, no disk writes.
+# ---------------------------------------------------------------------------
+def _record_activity(user_id, first_name, username, chat_type, chat_title):
+    """Note that a user just did something. Cheap: a dict write under lock."""
+    if not user_id:
+        return
+    where = "DM" if chat_type == "private" else (chat_title or "group")
+    with _ACTIVITY_LOCK:
+        _ACTIVITY[user_id] = {
+            "name": (first_name or "there").strip() or "there",
+            "username": (username or "").strip(),
+            "where": where,
+            "ts": time.time(),
+        }
+        if len(_ACTIVITY) > 5000:
+            _prune_activity_locked(time.time())
+
+
+def _prune_activity_locked(now):
+    """Drop ledger entries older than the window. Caller holds _ACTIVITY_LOCK."""
+    cutoff = now - _ACTIVITY_WINDOW
+    for uid in [u for u, e in _ACTIVITY.items() if e["ts"] < cutoff]:
+        del _ACTIVITY[uid]
+
+
+def _relative_time(ts, now):
+    s = int(now - ts)
+    if s < 60:
+        return "just now"
+    return f"{s // 60}m ago"
+
+
+def _handle_active(chat_id):
+    """Owner-only /active: who's around now and in the last 10 minutes.
+
+    "Now" = users with a reply currently generating, plus anyone active in
+    the last 60s. "Last 10 min" = everyone else seen in the window, newest
+    first. Plain text, one message — a status command must be instant."""
+    now = time.time()
+    with _ACTIVITY_LOCK:
+        _prune_activity_locked(now)
+        entries = dict(_ACTIVITY)
+    with _INFLIGHT_LOCK:
+        inflight = set(_INFLIGHT_USERS.values())
+
+    def _label(uid):
+        e = entries.get(uid) or {}
+        name = e.get("name", "there")
+        uname = e.get("username")
+        who = f"{name} (@{uname})" if uname else name
+        return f"{who} — {e.get('where', '?')}"
+
+    now_ids = [u for u in inflight if u in entries]
+    now_ids += [u for u, e in entries.items()
+                if u not in inflight and now - e["ts"] < _ACTIVITY_NOW]
+    recent = [(u, e) for u, e in entries.items()
+              if u not in set(now_ids) and now - e["ts"] < _ACTIVITY_WINDOW]
+    recent.sort(key=lambda kv: kv[1]["ts"], reverse=True)
+
+    if not now_ids and not recent:
+        send(chat_id, "No active users in the last 10 min.")
+        return True
+    lines = []
+    if now_ids:
+        lines.append("Now:")
+        for u in now_ids:
+            tag = " · replying" if u in inflight else ""
+            lines.append(f"• {_label(u)}{tag}")
+    if recent:
+        lines.append("Last 10 min:")
+        for u, e in recent:
+            lines.append(f"• {_label(u)} · {_relative_time(e['ts'], now)}")
+    send(chat_id, "\n".join(lines))
+    return True
 
 
 def _handle_signal(signum, frame):
@@ -1157,6 +1249,9 @@ def handle_business_message(msg):
     # Skip the business owner's own messages and any bot's echoes.
     if sender and (sender == conn.get("user_id") or frm.get("is_bot")):
         return
+    # /active ledger: the other party writing in a business chat is activity.
+    _record_activity(sender, frm.get("first_name"), frm.get("username"),
+                     chat.get("type"), chat.get("title"))
     # Maintenance mode covers business chats too — customers wait quietly.
     if maintenance_on():
         return
@@ -1590,6 +1685,12 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
         send(chat_id, "Maintenance mode on \U0001F6CC — quiet for everyone "
                       "but you. Send /start to wake me back up.")
         return True
+    if cmd == "active":
+        # Owner-only: who's around right now / in the last 10 minutes.
+        if user_id != OWNER_ID:
+            send(chat_id, "Only Adwaith can use that.")
+            return True
+        return _handle_active(chat_id)
     if cmd == "start":
         if maintenance_on():
             if user_id != OWNER_ID:
@@ -2252,7 +2353,7 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
             _untrack(cur)
 
     t = threading.Thread(target=_go, daemon=True)
-    _track(t)
+    _track(t, user_id)
     t.start()
 
 
@@ -2329,7 +2430,7 @@ def ai_vision_reply(chat_id, user_id, user_name, caption, file_id,
             _untrack(cur)
 
     t = threading.Thread(target=_go, daemon=True)
-    _track(t)
+    _track(t, user_id)
     t.start()
 
 
@@ -2638,6 +2739,9 @@ def handle_update(upd):
 
     frm = msg.get("from") or {}
     user_id = frm.get("id", 0)
+    # /active ledger: note the sender on every handled message.
+    _record_activity(user_id, frm.get("first_name"), frm.get("username"),
+                     chat.get("type"), chat.get("title"))
 
     text = msg.get("text", "").strip()
     photos = msg.get("photo") or []
@@ -2757,6 +2861,12 @@ def handle_callback(query):
         api("answerCallbackQuery", {"callback_query_id": query["id"]})
     except Exception:
         pass
+    # /active ledger: a button tap counts as activity too.
+    _cb_msg = query.get("message") or {}
+    _cb_chat = _cb_msg.get("chat") or {}
+    _record_activity(frm.get("id"), frm.get("first_name"),
+                     frm.get("username"), _cb_chat.get("type"),
+                     _cb_chat.get("title"))
     # Maintenance mode covers button taps too: text messages are gated in
     # handle_update, but callback queries arrive here directly. Non-owners
     # get silence (the /start command still explains the break).

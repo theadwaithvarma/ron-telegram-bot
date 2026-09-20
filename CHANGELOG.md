@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.11.0 — 2026-09-21
+
+New owner-only `/active` command: shows who's around right now and in
+the last 10 minutes (owner-approved).
+
+- Activity ledger: every handled update (message, button tap, business
+  chat) records user_id -> {name, username, chat, timestamp} in an
+  in-memory dict — one dict write per update, no API calls, no disk.
+  Pruned to the 10-minute window on read.
+- Reply has two sections: "Now" (users with a reply currently
+  generating, tracked via the in-flight reply threads, plus anyone
+  active in the last 60s) and "Last 10 min" (everyone else in the
+  window, newest first, with relative times). Empty case:
+  "No active users in the last 10 min."
+- Non-owners get the standard owner-only refusal ("Only Adwaith can
+  use that."), same convention as /shutdown.
+- Tests: new tests/test_active.py (17 tests: recording, hooks,
+  window filtering, in-flight tracking, owner gating, empty case).
+
 ## 1.10.0 — 2026-09-21
 
 `/factcheck` and `/think` removed (owner-approved).
