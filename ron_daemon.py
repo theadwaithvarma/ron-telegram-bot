@@ -61,6 +61,13 @@ try:
 except Exception:
     ron_imagen = None
 
+# Per-command quotas (/factcheck, /think). None-safe — without it the
+# commands refuse politely instead of crashing.
+try:
+    import ron_cmdquota
+except Exception:
+    ron_cmdquota = None
+
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 from dynamic_credentials import dynamic_credential_entry
 
@@ -1626,6 +1633,14 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
         return _handle_imagine(chat_id, user_id, user_name, text,
                                is_private, reply_to=reply_to,
                                thread_id=thread_id)
+    if cmd == "factcheck":
+        return _handle_factcheck(chat_id, user_id, user_name, text,
+                                 is_private, reply_to=reply_to,
+                                 thread_id=thread_id)
+    if cmd == "think":
+        return _handle_think(chat_id, user_id, user_name, text,
+                             is_private, reply_to=reply_to,
+                             thread_id=thread_id)
     if cmd == "forget":
         # Phase 4: per-chat memory wipe. In a DM anyone can wipe their own
         # DM; in a group only the owner (group memory is shared).
@@ -2481,6 +2496,183 @@ def _ai_imagine_reply(chat_id, user_id, user_name, prompt, private=True,
                     os.unlink(path)
                 except OSError:
                     pass
+    t = threading.Thread(target=_go, daemon=True)
+    t.start()
+
+
+# --- /factcheck (Perplexity, web-grounded) and /think (Gemini, deep) ---
+# Explicit brain-switch commands. Both pin a single provider via
+# ron_ai.single_shot() — no history, no memory hooks, no cheap routing.
+# Quotas are checked BEFORE any provider call (paid/limited APIs); the
+# quota is spent only after a successful answer. Worker threads keep slow
+# answers off the update poll loop, mirroring /imagine.
+_FACTCHECK_MODEL = "sonar-pro"
+_FACTCHECK_N = 10            # 10 fact-checks per rolling 6h per user
+_FACTCHECK_WINDOW = 6 * 3600
+_THINK_MODEL = "gemini-3.8-flash"
+_THINK_N = 15                # 15 deep thinks per rolling 6h per user
+_THINK_WINDOW = 6 * 3600
+
+_FACTCHECK_SYSTEM = (
+    "You are a precise fact-checker with live web search. Given a claim, "
+    "verify it against current sources. Reply in this exact shape:\n"
+    "**Verdict:** True / False / Misleading / Unverifiable (pick one, one line)\n"
+    "Then 2-4 short sentences explaining, with inline citations. "
+    "Keep it tight — chat length, not an essay. "
+    "Telegram Markdown (**bold**), no HTML."
+)
+_THINK_SYSTEM = (
+    "You are Ron in deep-thinking mode. Think carefully step by step "
+    "through the question, then give a thorough, well-reasoned answer. "
+    "Keep the reasoning visible but concise, then the conclusion. "
+    "Telegram Markdown (**bold**, *italic* sparingly, `code`), no HTML."
+)
+
+
+def _cmd_arg(text):
+    """Strip the /command (or /command@bot) prefix, return the argument."""
+    parts = (text or "").split(None, 1)
+    if not parts:
+        return ""
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _cmd_limit_text(cmd, n, window_h, retry_after):
+    """Provider-neutral quota notice with a human wait estimate."""
+    secs = int(retry_after)
+    if secs >= 3600:
+        wait = f"~{secs // 3600}h {(secs % 3600) // 60}m"
+    else:
+        wait = f"~{max(1, (secs + 59) // 60)}m"  # round up: "come back in"
+    return (f"I've hit my {cmd} limit for now ({n} per {window_h}h) — "
+            f"try again in {wait}.")
+
+
+def _delete_ack(chat_id, ack_id):
+    try:
+        api("deleteMessage", {"chat_id": chat_id, "message_id": ack_id})
+    except Exception:
+        pass
+
+
+def _handle_factcheck(chat_id, user_id, user_name, text, is_private,
+                      reply_to=None, thread_id=None):
+    """/factcheck <claim> -> web-grounded verdict via Perplexity."""
+    query = _cmd_arg(text)
+    if not query:
+        send(chat_id,
+             "Give me a claim to check — e.g. "
+             "/factcheck the Eiffel Tower is 330m tall \U0001F50D",
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    if ron_cmdquota is None:
+        send(chat_id, "Fact-checking isn't available right now.",
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    if ron_ai._provider_key("perplexity") is None:
+        send(chat_id,
+             "Fact-checking isn't connected yet — Adwaith needs to add "
+             "the Perplexity API key first. \U0001F50D",
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    allowed, retry_after = ron_cmdquota.check_limit(
+        "factcheck", user_id, OWNER_ID, _FACTCHECK_N, _FACTCHECK_WINDOW)
+    if not allowed:
+        send(chat_id,
+             _cmd_limit_text("fact-check", _FACTCHECK_N, 6, retry_after),
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    _ai_spot_reply("factcheck", chat_id, user_id, user_name, query,
+                   "\U0001F50D Fact-checking…",
+                   "Couldn't check that right now — the fact-check "
+                   "service hiccuped. Try again in a bit. \U0001F50D",
+                   reply_to=reply_to, thread_id=thread_id)
+    return True
+
+
+def _handle_think(chat_id, user_id, user_name, text, is_private,
+                  reply_to=None, thread_id=None):
+    """/think <question> -> deep reasoning via Gemini."""
+    query = _cmd_arg(text)
+    if not query:
+        send(chat_id,
+             "Give me something to think about — e.g. "
+             "/think why do we dream? \U0001F9E0",
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    if ron_cmdquota is None:
+        send(chat_id, "Deep-thinking isn't available right now.",
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    if ron_ai._provider_key("gemini") is None:
+        send(chat_id,
+             "Deep-thinking isn't connected right now. \U0001F9E0",
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    allowed, retry_after = ron_cmdquota.check_limit(
+        "think", user_id, OWNER_ID, _THINK_N, _THINK_WINDOW)
+    if not allowed:
+        send(chat_id,
+             _cmd_limit_text("deep-think", _THINK_N, 6, retry_after),
+             reply_to=reply_to, thread_id=thread_id)
+        return True
+    _ai_spot_reply("think", chat_id, user_id, user_name, query,
+                   "\U0001F9E0 Thinking deeply…",
+                   "Couldn't think that through right now — try again "
+                   "in a bit. \U0001F9E0",
+                   reply_to=reply_to, thread_id=thread_id)
+    return True
+
+
+def _ai_spot_reply(scope, chat_id, user_id, user_name, query, ack_text,
+                   fail_text, reply_to=None, thread_id=None):
+    """Run a pinned-provider command off the poll loop.
+
+    scope "factcheck" -> Perplexity sonar-pro; "think" -> Gemini flash.
+    Ack message is deleted before the answer lands, like /imagine.
+    """
+    def _go():
+        ack_id = None
+        try:
+            r = send(chat_id, ack_text,
+                     reply_to=reply_to, thread_id=thread_id)
+            ack_id = (r.get("result") or {}).get("message_id")
+        except Exception:
+            ack_id = None
+        try:
+            if scope == "factcheck":
+                reply = ron_ai.single_shot(
+                    "perplexity", _FACTCHECK_MODEL,
+                    [{"role": "system", "content": _FACTCHECK_SYSTEM},
+                     {"role": "user", "content": query}],
+                    timeout=150)
+                n, window = _FACTCHECK_N, _FACTCHECK_WINDOW
+            else:
+                reply = ron_ai.single_shot(
+                    "gemini", _THINK_MODEL,
+                    [{"role": "system", "content": _THINK_SYSTEM},
+                     {"role": "user", "content": query}],
+                    timeout=150)
+                n, window = _THINK_N, _THINK_WINDOW
+        except Exception as e:
+            print(f"[ron_daemon] {scope} failed: {e}", flush=True)
+            if ack_id:
+                _delete_ack(chat_id, ack_id)
+            send_rich_with_kb(chat_id, fail_text,
+                              reply_to=reply_to, thread_id=thread_id)
+            return
+        # Quota is spent only now — a successful answer.
+        ron_cmdquota.record_use(scope, user_id, OWNER_ID, n, window)
+        if ack_id:
+            _delete_ack(chat_id, ack_id)
+        send_rich_with_kb(chat_id, reply,
+                          reply_to=reply_to, thread_id=thread_id)
+        try:
+            ron_ai._save_turn(chat_id, f"/{scope} {query}", user_name,
+                              reply, user_id)
+        except Exception as e:
+            print(f"[ron_daemon] {scope} history save failed: {e}",
+                  flush=True)
     t = threading.Thread(target=_go, daemon=True)
     t.start()
 

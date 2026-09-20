@@ -91,6 +91,9 @@ DEFAULT_CONFIG = {
         "from @TheAdwaithVarma. You can also post native Telegram polls: tell users the "
         "format /poll Question? | Option A | Option B (or /pollm for multiple answers, "
         "/quiz Q? | *Correct | Wrong for quizzes). "
+        "Two special commands: /factcheck <claim> runs a web-grounded fact check "
+        "(verdict + sources), and /think <question> reasons through something "
+        "hard step by step — mention them when they fit the moment. "
         "DM-to-group management: when someone asks you to ping or message them in a "
         "group (e.g. 'ping me in the playground group'), post it for them. Emit a "
         "trailer on its own line: [send_group: Group Name | the message to post]. "
@@ -174,6 +177,15 @@ PROVIDER_DEFS = {
             "HTTP-Referer": "https://t.me/ronrebootedbot",
             "X-Title": "Ron Telegram Bot",
         },
+    },
+    "perplexity": {
+        # Web-grounded answers for /factcheck (OpenAI-compatible).
+        # Deliberately NOT in the default chat chain (ron_ai.json) — only
+        # explicit commands pin it via single_shot(), so normal chat never
+        # burns paid Perplexity calls.
+        "base_url": "https://api.perplexity.ai",
+        "key_slot": "custom.perplexity",
+        "extra_headers": {},
     },
 }
 # Ordered failover chain. The model lists are user-tunable in ron_ai.json
@@ -738,6 +750,31 @@ def chat(chat_id, user_text, user_name="there", system_extra="",
 
 if __name__ == "__main__":
     print(chat("selftest", "Reply with exactly: brain online"))
+
+
+def single_shot(provider_name, model, messages, timeout=120):
+    """One-off completion pinned to a single provider/model.
+
+    For explicit commands (/factcheck, /think): no chat history, no
+    memory hooks, no cheap routing — just the messages given. Reuses
+    _request()'s retry/backoff internals with a one-provider plan.
+    Raises RuntimeError("AI key not connected yet") when the provider
+    has no key in the vault.
+    """
+    spec = PROVIDER_DEFS.get(provider_name)
+    if not spec:
+        raise RuntimeError(f"unknown AI provider: {provider_name}")
+    if _provider_key(provider_name) is None:
+        raise RuntimeError("AI key not connected yet")
+    cfg = {"providers": [{"name": provider_name, "models": [model]}]}
+    resp = _request(cfg, messages, stream=False, timeout=timeout)
+    with resp:
+        data = json.loads(resp.read().decode())
+    reply = ((data.get("choices") or [{}])[0].get("message", {})
+             .get("content", "").strip())
+    if not reply:
+        raise RuntimeError("AI backend returned empty reply")
+    return reply[:MAX_REPLY]
 
 
 def _drain_stream(resp, stop_event, on_token):

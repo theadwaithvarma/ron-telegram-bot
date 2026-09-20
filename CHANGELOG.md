@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.9.0 — 2026-09-21
+
+Two new brain-switch commands: `/factcheck` and `/think`.
+
+- `/factcheck <claim>` — pinned to Perplexity's `sonar-pro` for
+  web-grounded verdicts (True / False / Misleading / Unverifiable +
+  citations). 10 uses per rolling 6h per user, owner exempt — the API
+  is paid, so the quota is checked before any call and spent only on
+  success. Needs a Perplexity API key in the vault; without it the
+  command says so politely instead of burning anything.
+- `/think <question>` — pinned to Gemini `gemini-3.8-flash` with a
+  deep-reasoning prompt, for questions that deserve real thought.
+  15 uses per rolling 6h per user, owner exempt.
+- New `ron_ai.single_shot(provider, model, messages)`: one-off
+  completion pinned to a single provider — no history, no memory hooks,
+  no cheap routing. Reuses the battle-tested `_request()` retry/backoff
+  internals with a one-provider plan.
+- New `ron_cmdquota` module: generic sliding-window per-command quotas
+  (scope, N, window), same shape as the imagine/vision limiters.
+- Both commands run in worker threads off the poll loop, with a "…"
+  ack that's deleted before the answer lands (mirrors /imagine).
+  History keeps the Q&A so context continues.
+- The bot's capability blurb (system prompt) now mentions both commands.
+- Perplexity stays OUT of the default chat failover chain — normal chat
+  never touches the paid API.
+- 23 new tests (quota, prefix parsing, provider pinning, no-key and
+  quota-block paths, success/failure worker paths). 312/312 green.
+
 ## 1.8.5 — 2026-09-21
 
 More speed: the typing indicator + "Thinking…" draft were sent
