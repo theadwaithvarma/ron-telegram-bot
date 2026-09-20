@@ -438,6 +438,17 @@ class TestValidateImage(unittest.TestCase):
 
 
 class TestSendPhoto(unittest.TestCase):
+    def _fake_pool(self, seen):
+        """Stand-in for http_pool: records the POST, returns canned 200."""
+        fake = mock.MagicMock()
+        def post(path, body, content_type, timeout=None):
+            seen["path"] = path
+            seen["body"] = body
+            seen["ctype"] = content_type
+            return 200, b'{"ok": true, "result": {}}'
+        fake.post.side_effect = post
+        return mock.patch("http_pool.pool_for", return_value=fake)
+
     def test_multipart_shape(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
         tmp.write(FAKE_JPEG)
@@ -445,21 +456,11 @@ class TestSendPhoto(unittest.TestCase):
         self.addCleanup(os.unlink, tmp.name)
         seen = {}
 
-        def fake_urlopen(req, *a, **k):
-            seen["url"] = req.full_url
-            seen["body"] = req.data
-            seen["ctype"] = req.get_header("Content-type")
-            fake_resp = mock.MagicMock()
-            fake_resp.read.return_value = b'{"ok": true, "result": {}}'
-            cm = mock.MagicMock()
-            cm.__enter__.return_value = fake_resp
-            return cm
-
-        with mock.patch("urllib.request.urlopen", fake_urlopen):
+        with self._fake_pool(seen):
             r = ron_imagen.send_photo(777, tmp.name, caption="hi",
                                       reply_to=42, thread_id=7)
         self.assertTrue(r["ok"])
-        self.assertIn("sendPhoto", seen["url"])
+        self.assertIn("sendPhoto", seen["path"])
         self.assertIn("multipart/form-data", seen["ctype"])
         body = seen["body"]
         self.assertIn(b'name="chat_id"', body)
@@ -477,15 +478,7 @@ class TestSendPhoto(unittest.TestCase):
         self.addCleanup(os.unlink, tmp.name)
         seen = {}
 
-        def fake_urlopen(req, *a, **k):
-            seen["body"] = req.data
-            fake_resp = mock.MagicMock()
-            fake_resp.read.return_value = b'{"ok": true}'
-            cm = mock.MagicMock()
-            cm.__enter__.return_value = fake_resp
-            return cm
-
-        with mock.patch("urllib.request.urlopen", fake_urlopen):
+        with self._fake_pool(seen):
             ron_imagen.send_photo(777, tmp.name, caption="x" * 5000)
         # caption field present but truncated to Telegram's 1024 cap
         self.assertNotIn(b"x" * 5000, seen["body"])

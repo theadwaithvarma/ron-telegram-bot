@@ -27,6 +27,7 @@ import time
 import urllib.parse
 import urllib.request
 
+import http_pool
 import rich_send
 
 # Free, keyless image generation. A random seed per request so repeated
@@ -269,22 +270,16 @@ def send_photo(chat_id, path, caption="", reply_to=None, thread_id=None):
         .encode() + img + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     body = b"".join(parts)
-    url = f"https://api.telegram.org/bot{rich_send._SURROGATE}/sendPhoto"
-    req = urllib.request.Request(
-        url, data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
-                 "User-Agent": "ron-bot/1"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read(65536)
+        status, raw = http_pool.pool_for("api.telegram.org").post(
+            f"/bot{rich_send._SURROGATE}/sendPhoto",
+            body, f"multipart/form-data; boundary={boundary}", 60)
+        if status != 200:
+            raise RuntimeError(
+                f"HTTP {status}: {raw[:200].decode('utf-8', 'replace')}")
         return json.loads(raw.decode("utf-8", "replace"))
     except Exception as e:
-        body_txt = ""
-        try:
-            body_txt = e.read().decode()[:300]  # noqa
-        except Exception:
-            pass
-        return {"ok": False, "error": f"{e} {body_txt}"[:300]}
+        return {"ok": False, "error": str(e)[:300]}
 
 
 def delete_message(chat_id, message_id):

@@ -22,6 +22,8 @@ import time
 import urllib.request
 import urllib.parse
 
+import http_pool
+
 sys.path.insert(0, os.path.join(os.path.expanduser("~"), "workspace", "telegram-bot"))
 import ron_ai
 import rich_send as rich_mod
@@ -60,7 +62,7 @@ except Exception:
     ron_imagen = None
 
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
-from dynamic_credentials import dynamic_credential_entry, read_json_response
+from dynamic_credentials import dynamic_credential_entry
 
 HOME = os.path.expanduser("~")
 OFFSET_FILE = os.path.join(HOME, "workspace", "telegram-bot", "ron_daemon.offset")
@@ -92,7 +94,6 @@ def set_maintenance(on, by):
 
 _entry = dynamic_credential_entry("custom.telegram")
 _SURROGATE = str(_entry["surrogate"]).strip()
-BASE = f"https://api.telegram.org/bot{_SURROGATE}"
 
 # Graceful shutdown: restarts must not eat in-flight replies. The poll loop
 # saves the update offset as soon as a reply thread is spawned, so killing
@@ -817,14 +818,25 @@ signal.signal(signal.SIGINT, _handle_signal)
 
 
 def api(method, params=None, timeout=65):
-    url = f"{BASE}/{method}"
-    data = urllib.parse.urlencode(params or {}).encode() if params else None
-    req = urllib.request.Request(url, data=data)
+    """Telegram Bot API call over the keep-alive connection pool.
+
+    Same contract as before (parsed JSON dict, or
+    {"ok": False, "error": ...}), but reuses warm TLS connections instead
+    of paying ~0.7s of proxy CONNECT + handshake per call."""
+    body = urllib.parse.urlencode(params or {}).encode() if params else None
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return read_json_response(resp)
+        status, data = http_pool.pool_for("api.telegram.org").post(
+            f"/bot{_SURROGATE}/{method}", body,
+            "application/x-www-form-urlencoded", timeout)
     except Exception as e:
         return {"ok": False, "error": str(e)[:150]}
+    if status != 200:
+        return {"ok": False, "error":
+                f"HTTP {status}: {data[:120].decode('utf-8', 'replace')}"[:150]}
+    try:
+        return json.loads(data.decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": f"bad JSON: {e}"[:150]}
 
 
 def send(chat_id, text, reply_to=None, thread_id=None,

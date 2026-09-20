@@ -9,31 +9,38 @@ Usage:
     rich_send.py <chat_id> [--html|--markdown] <text...>
     echo "# Title" | rich_send.py <chat_id> --markdown
 """
-import os
 import sys
 import json
 import urllib.request
 import urllib.parse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import BOT_TOKEN, read_json_response
+import http_pool
+
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+from dynamic_credentials import dynamic_credential_entry
+
+_entry = dynamic_credential_entry("custom.telegram")
+_SURROGATE = str(_entry["surrogate"]).strip()
 
 
 def api_json(method, payload):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    """JSON Bot API call over the keep-alive pool (see http_pool).
+
+    Same contract as before; warm connections instead of ~0.7s of
+    proxy CONNECT + TLS handshake per call."""
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data,
-                                 headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return read_json_response(resp)
+        status, raw = http_pool.pool_for("api.telegram.org").post(
+            f"/bot{_SURROGATE}/{method}", data, "application/json", 30)
     except Exception as e:
-        body = ""
-        try:
-            body = e.read().decode()[:300]  # noqa
-        except Exception:
-            pass
-        return {"ok": False, "error": f"{e} {body}"[:300]}
+        return {"ok": False, "error": str(e)[:300]}
+    if status != 200:
+        return {"ok": False, "error":
+                f"HTTP {status}: {raw[:200].decode('utf-8', 'replace')}"[:300]}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": f"bad JSON: {e}"[:300]}
 
 
 def rich_send(chat_id, text, fmt="markdown", **kwargs):

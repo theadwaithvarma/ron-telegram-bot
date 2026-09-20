@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.8.4 — 2026-09-21
+
+Speed fix: every Telegram API call was opening a brand-new HTTPS
+connection, and through this host's proxy that's ~0.7s of CONNECT + TLS
+handshake per call. A single reply makes 3-6 of them (typing indicator,
+empty draft, draft updates, final send) — all before the AI even starts.
+
+- New `http_pool` module: a small thread-safe pool of persistent
+  keep-alive connections per host, with proxy CONNECT tunneling that
+  mirrors urllib's proxy handling (env vars + no_proxy).
+- `ron_daemon.api()`, `rich_send.api_json()`, and the imagine
+  `sendPhoto` upload now go through the pool: ~0.7s -> ~0.2s per call,
+  roughly 1.5-2s shaved off every reply, zero behavior change.
+- Stale (server-closed) pooled connections are discarded and retried
+  once on a fresh connection — but only when no response arrived, so a
+  send is never duplicated.
+- 7 new pool tests (reuse, stale retry, no-retry-after-response,
+  proxy auth, no_proxy bypass, thread safety). 286/286 green.
+
 ## 1.8.3 — 2026-09-21
 
 `/imagine` reliability fix: some generations arrived half-done (top half
