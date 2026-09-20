@@ -61,6 +61,10 @@ try:
 except Exception:
     ron_imagen = None
 
+# Owner power commands (/stats, /ban, /broadcast, ...). Hard import: it's
+# our own stdlib-only module and the owner deck depends on it.
+import ron_owner
+
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 from dynamic_credentials import dynamic_credential_entry
 
@@ -77,19 +81,48 @@ MAINT_FILE = os.path.join(HOME, "workspace", "telegram-bot",
 
 
 def maintenance_on():
-    """True when the bot is in owner-only maintenance mode."""
+    """True when the bot is in owner-only maintenance mode.
+
+    /quiet sets an expiry ("until"): once it passes, the mode auto-lifts
+    (the file is rewritten once, idempotent across threads). /shutdown
+    stays manual — it writes no expiry.
+    """
     try:
         with open(MAINT_FILE) as f:
-            return bool(json.load(f).get("maintenance"))
+            data = json.load(f)
     except (OSError, ValueError):
         return False
+    if not data.get("maintenance"):
+        return False
+    until = data.get("until")
+    if until:
+        try:
+            expired = time.time() >= float(until)
+        except (ValueError, TypeError):
+            expired = False
+        if expired:
+            try:
+                set_maintenance(False, data.get("by"))
+            except Exception:
+                pass
+            print("[ron_daemon] /quiet expired — maintenance auto-lifted",
+                  flush=True)
+            return False
+    return True
 
 
-def set_maintenance(on, by):
-    """Persist maintenance mode. Atomic write like the other state files."""
+def set_maintenance(on, by, until=None):
+    """Persist maintenance mode. Atomic write like the other state files.
+
+    until: unix timestamp for /quiet's auto-resume; None = manual mode
+    (/shutdown) that only /start lifts.
+    """
     tmp = MAINT_FILE + ".tmp"
+    payload = {"maintenance": bool(on), "by": by, "ts": time.time()}
+    if until:
+        payload["until"] = float(until)
     with open(tmp, "w") as f:
-        json.dump({"maintenance": bool(on), "by": by, "ts": time.time()}, f)
+        json.dump(payload, f)
     os.replace(tmp, MAINT_FILE)
 
 _entry = dynamic_credential_entry("custom.telegram")
@@ -855,12 +888,13 @@ def _relative_time(ts, now):
     return f"{s // 60}m ago"
 
 
-def _handle_active(chat_id):
+def _handle_active(chat_id, user_id, cmd_msg_id):
     """Owner-only /active: who's around now and in the last 10 minutes.
 
     "Now" = users with a reply currently generating, plus anyone active in
     the last 60s. "Last 10 min" = everyone else seen in the window, newest
-    first. Plain text, one message — a status command must be instant."""
+    first. Plain text, one message — a status command must be instant.
+    Ephemeral: the reply and the command vanish after EPHEMERAL_TTL."""
     now = time.time()
     with _ACTIVITY_LOCK:
         _prune_activity_locked(now)
@@ -883,7 +917,8 @@ def _handle_active(chat_id):
     recent.sort(key=lambda kv: kv[1]["ts"], reverse=True)
 
     if not now_ids and not recent:
-        send(chat_id, "No active users in the last 10 min.")
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     "No active users in the last 10 min.")
         return True
     lines = []
     if now_ids:
@@ -895,7 +930,7 @@ def _handle_active(chat_id):
         lines.append("Last 10 min:")
         for u, e in recent:
             lines.append(f"• {_label(u)} · {_relative_time(e['ts'], now)}")
-    send(chat_id, "\n".join(lines))
+    _owner_reply(chat_id, user_id, cmd_msg_id, "\n".join(lines))
     return True
 
 
@@ -931,6 +966,15 @@ def api(method, params=None, timeout=65):
         return {"ok": False, "error": f"bad JSON: {e}"[:150]}
 
 
+def _note_sent(result):
+    """Count a successful outbound message for /stats."""
+    try:
+        if isinstance(result, dict) and result.get("ok"):
+            ron_owner.note_out()
+    except Exception:
+        pass
+
+
 def send(chat_id, text, reply_to=None, thread_id=None,
          business_connection_id=None):
     params = {"chat_id": chat_id, "text": text}
@@ -942,7 +986,43 @@ def send(chat_id, text, reply_to=None, thread_id=None,
     if business_connection_id:
         # Secretary Mode: send on the business account, not as the bot.
         params["business_connection_id"] = business_connection_id
-    return api("sendMessage", params)
+    r = api("sendMessage", params)
+    _note_sent(r)
+    return r
+
+
+# Module-level indirection so tests can stub the timer without touching
+# the global threading module.
+_Timer = threading.Timer
+
+
+def _sweep_owner_msgs(chat_id, msg_ids):
+    """Delete an owner-command reply and its command message. Best-effort:
+    no delete rights in a group just means the messages stay — silent."""
+    for mid in msg_ids:
+        try:
+            api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+        except Exception:
+            pass
+
+
+def _owner_reply(chat_id, user_id, cmd_msg_id, text):
+    """Owner-command reply: send, then auto-delete the reply AND the
+    command message after ron_owner.EPHEMERAL_TTL seconds.
+
+    Used by all owner-only power commands (and /active) so owner tooling
+    leaves no trace in the chat. Deletion failures are silent.
+    """
+    try:
+        r = send(chat_id, text)  # send() records the outbound counter
+    except Exception:
+        return
+    ids = ron_owner.deletion_targets(r, cmd_msg_id)
+    if ron_owner.EPHEMERAL_TTL > 0 and ids:
+        t = _Timer(ron_owner.EPHEMERAL_TTL, _sweep_owner_msgs,
+                   args=(chat_id, ids))
+        t.daemon = True
+        t.start()
 
 
 def send_markup(chat_id, text, reply_markup, reply_to=None,
@@ -956,7 +1036,9 @@ def send_markup(chat_id, text, reply_markup, reply_to=None,
         params["reply_parameters"] = json.dumps({"message_id": reply_to})
     if business_connection_id:
         params["business_connection_id"] = business_connection_id
-    return api("sendMessage", params)
+    r = api("sendMessage", params)
+    _note_sent(r)
+    return r
 
 
 def send_typing(chat_id, business_connection_id=None):
@@ -1249,9 +1331,15 @@ def handle_business_message(msg):
     # Skip the business owner's own messages and any bot's echoes.
     if sender and (sender == conn.get("user_id") or frm.get("is_bot")):
         return
+    # Ban enforcement: banned users get total silence here too.
+    if ron_owner.is_banned(sender):
+        return
     # /active ledger: the other party writing in a business chat is activity.
     _record_activity(sender, frm.get("first_name"), frm.get("username"),
                      chat.get("type"), chat.get("title"))
+    # Owner traffic registries (/stats, /users, /broadcast targets).
+    ron_owner.note_traffic(sender, frm.get("first_name"), frm.get("username"),
+                           chat_id, chat.get("title"), chat.get("type"))
     # Maintenance mode covers business chats too — customers wait quietly.
     if maintenance_on():
         return
@@ -1633,6 +1721,7 @@ def send_rich(chat_id, text, reply_markup=None, reply_to=None, thread_id=None,
             kw["business_connection_id"] = business_connection_id
         r = rich_mod.rich_send(chat_id, text, fmt="markdown", **kw, **rp)
         if r.get("ok"):
+            _note_sent(r)  # /stats: rich sends bypass send(), count here
             return r
         print(f"[ron_daemon] rich send not ok: {str(r)[:120]}", flush=True)
     except Exception as e:
@@ -1673,8 +1762,134 @@ def parse_command(text):
     return token.lower() or None
 
 
+# ---------------------------------------------------------------------------
+# Owner power commands (v1.12.0). All owner-only, all ephemeral: the reply
+# and the command message auto-delete after ron_owner.EPHEMERAL_TTL.
+# ---------------------------------------------------------------------------
+def _owner_gate(user_id):
+    """True when the caller is the owner."""
+    return user_id == OWNER_ID
+
+
+def _owner_refuse(chat_id, user_id, cmd_msg_id):
+    _owner_reply(chat_id, user_id, cmd_msg_id, "Only Adwaith can use that.")
+
+
+def _cmd_args(text):
+    """Text after the '/cmd' or '/cmd@bot' token."""
+    parts = (text or "").split(None, 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _cache_stats():
+    try:
+        if ron_cache is not None:
+            return ron_cache.get_stats()
+    except Exception:
+        pass
+    return {"hits": 0, "misses": 0}
+
+
+def _uptime_str():
+    s = int(time.time() - _START_TS)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h}h {m}m" if h else f"{m}m {s}s"
+
+
+def _provider_chain_info(cfg=None):
+    """[(name, models, status, primary)] for the owner /model card.
+
+    Owner-only, so real provider names are fine here (unlike /health,
+    which deliberately uses position labels).
+    """
+    if cfg is None:
+        cfg = ron_ai.load_config()
+    chain = cfg.get("providers") or ron_ai.DEFAULT_PROVIDERS
+    cooldowns = ron_ai.get_provider_cooldowns()
+    with _PROBE_LOCK:
+        probe_res = dict(_LAST_PROBE)
+    now_m = time.monotonic()
+    out = []
+    for i, pr in enumerate(chain):
+        name = str(pr.get("name") or "")
+        key = name.lower()
+        until = cooldowns.get(key, 0)
+        if until > now_m:
+            status = f"cooling ({until - now_m:.0f}s)"
+        elif key in probe_res:
+            ok, detail = probe_res[key]
+            if ok:
+                status = "ok"
+            elif "no key" in str(detail or ""):
+                status = "no key"
+            else:
+                status = "down"
+        else:
+            status = "unknown"
+        out.append({"name": name, "models": pr.get("models") or [],
+                    "status": status, "primary": i == 0})
+    return out
+
+
+def _purge_user_history(user_id):
+    """Drop one user's turns from the JSON history.
+
+    Their whole DM chat (chat_id == user_id) goes; in groups, their user
+    turns go along with the assistant reply that immediately followed
+    each one. Returns the number of turns removed.
+    """
+    try:
+        hist = ron_ai.load_history()
+    except Exception:
+        return 0
+    removed = 0
+    for ck in list(hist.keys()):
+        turns = hist.get(ck) or []
+        if ck == str(user_id):
+            removed += len(turns)
+            hist.pop(ck, None)
+            continue
+        kept = []
+        skip_next_assistant = False
+        for t in turns:
+            if skip_next_assistant:
+                skip_next_assistant = False
+                if t.get("role") == "assistant":
+                    removed += 1
+                    continue
+            if t.get("role") == "user" and t.get("user_id") == user_id:
+                removed += 1
+                skip_next_assistant = True
+                continue
+            kept.append(t)
+        hist[ck] = kept
+    try:
+        ron_ai.save_history(hist)
+    except Exception:
+        pass
+    return removed
+
+
+def _broadcast_fanout(chats, btext, notify_chat, owner_id, cmd_msg_id):
+    """Send a confirmed broadcast to every known chat (worker thread —
+    never block the poll loop on a fan-out)."""
+    ok = 0
+    for cid in chats:
+        try:
+            r = send(cid, btext)
+            if isinstance(r, dict) and r.get("ok"):
+                ok += 1
+        except Exception:
+            pass
+        time.sleep(0.1)  # gentle: don't hammer the API on a big fan-out
+    _owner_reply(notify_chat, owner_id, cmd_msg_id,
+                 f"\U0001F4E3 Broadcast done: {ok}/{len(chats)} chats.")
+
+
 def handle_command(chat_id, user_id, cmd, is_private, text="",
-                   user_name="there", reply_to=None, thread_id=None):
+                   user_name="there", reply_to=None, thread_id=None,
+                   cmd_msg_id=None):
     if cmd == "shutdown":
         # Owner-only maintenance mode: the bot goes quiet for everyone
         # except the owner. /start (owner) wakes it back up.
@@ -1687,10 +1902,213 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
         return True
     if cmd == "active":
         # Owner-only: who's around right now / in the last 10 minutes.
-        if user_id != OWNER_ID:
-            send(chat_id, "Only Adwaith can use that.")
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
             return True
-        return _handle_active(chat_id)
+        return _handle_active(chat_id, user_id, cmd_msg_id)
+    if cmd == "stats":
+        # Owner-only: today's traffic snapshot. Ephemeral.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     ron_owner.stats_text(ron_owner.today_snapshot(),
+                                          _cache_stats(), _uptime_str()))
+        return True
+    if cmd in ("ban", "unban"):
+        # Owner-only: silence a user everywhere, or lift it.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        target = ron_owner.parse_user_id(_cmd_args(text))
+        if target is None:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         f"Usage: /{cmd} <user_id>")
+            return True
+        if target == OWNER_ID:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Can't ban yourself.")
+            return True
+        if cmd == "ban":
+            ron_owner.ban(target, user_id)
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         f"\U0001F6AB Banned {target} \u2014 silent from now on.")
+        else:
+            lifted = ron_owner.unban(target)
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         f"Unbanned {target}." if lifted
+                         else f"{target} wasn't banned.")
+        return True
+    if cmd == "broadcast":
+        # Owner-only: one message to every known chat. Two-step confirm —
+        # "/broadcast <text>" stages, "/broadcast yes" (within 60s) sends.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        args = _cmd_args(text)
+        if args.lower() == "yes":
+            res = ron_owner.broadcast_confirm(user_id)
+            if res[0] == "ok":
+                _, btext, chats = res
+                threading.Thread(
+                    target=_broadcast_fanout,
+                    args=(chats, btext, chat_id, user_id, cmd_msg_id),
+                    daemon=True).start()
+                _owner_reply(chat_id, user_id, cmd_msg_id,
+                             f"\U0001F4E3 Broadcasting to {len(chats)} chats\u2026")
+            else:
+                _owner_reply(chat_id, user_id, cmd_msg_id, res[1])
+            return True
+        if args.lower() == "no":
+            ron_owner.broadcast_cancel(user_id)
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Broadcast cancelled.")
+            return True
+        if not args:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Usage: /broadcast <text>")
+            return True
+        n, preview = ron_owner.broadcast_request(args, user_id)
+        if n == 0:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "No known chats to broadcast to yet.")
+            return True
+        _owner_reply(
+            chat_id, user_id, cmd_msg_id,
+            f"\U0001F4E3 Will send to {n} chats:\n{preview}\n\n"
+            "Reply /broadcast yes within 60s to confirm, "
+            "/broadcast no to cancel.")
+        return True
+    if cmd == "say":
+        # Owner-only: send text as the bot into any chat.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        parts = _cmd_args(text).split(None, 1)
+        if len(parts) < 2:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Usage: /say <chat_id> <text>")
+            return True
+        try:
+            dest = int(parts[0])
+        except ValueError:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Usage: /say <chat_id> <text>")
+            return True
+        try:
+            r = send(dest, parts[1])
+            ok = isinstance(r, dict) and r.get("ok")
+            err = "" if ok else str((r or {}).get("error", "?"))[:100]
+        except Exception as e:
+            ok, err = False, str(e)[:100]
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     f"\u2709\uFE0F Sent to {dest}." if ok
+                     else f"Send failed: {err}")
+        return True
+    if cmd == "restart":
+        # Owner-only: clean daemon restart. Drops the flag file the
+        # watchdog honors, so the relaunch doesn't burn the crash
+        # counter or enter backoff.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        try:
+            ron_owner.request_restart()
+        except Exception as e:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         f"Restart request failed: {e}")
+            return True
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     "\U0001F504 Restarting \u2014 back in about a minute.")
+        ron_owner.flush()
+        _SHUTDOWN.set()
+        return True
+    if cmd == "quiet":
+        # Owner-only: maintenance mode with auto-resume. /shutdown stays
+        # manual; /start wakes up early.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        try:
+            minutes = ron_owner.parse_quiet_minutes(_cmd_args(text))
+        except ValueError as e:
+            _owner_reply(chat_id, user_id, cmd_msg_id, str(e))
+            return True
+        until = time.time() + minutes * 60
+        set_maintenance(True, user_id, until=until)
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     ron_owner.quiet_text(minutes, until))
+        return True
+    if cmd == "logs":
+        # Owner-only: tail of the daemon log, as a code block.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        args = _cmd_args(text)
+        try:
+            n = max(1, min(60, int(args))) if args else 20
+        except ValueError:
+            n = 20
+        lines = ron_owner.tail_log(
+            os.path.join(HOME, "workspace", "telegram-bot",
+                         "ron_daemon.log"), n)
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     ron_owner.logs_text(lines))
+        return True
+    if cmd == "users":
+        # Owner-only: user roster with first/last seen. Ephemeral.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     ron_owner.users_text(ron_owner.user_roster()))
+        return True
+    if cmd == "forgetuser":
+        # Owner-only: wipe one user's attributable data — their turns
+        # everywhere, plus their whole private-DM chat (facts, summaries,
+        # bot replies). Other chats' facts are chat-scoped and untouched.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        target = ron_owner.parse_user_id(_cmd_args(text))
+        if target is None:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Usage: /forgetuser <user_id>")
+            return True
+        counts = ron_owner.forget_user(target, mem)
+        purged = _purge_user_history(target)
+        with _ACTIVITY_LOCK:
+            _ACTIVITY.pop(target, None)
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     ron_owner.forgetuser_text(target, counts, purged))
+        return True
+    if cmd == "model":
+        # Owner-only: show the provider chain, or pin one first.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        args = _cmd_args(text)
+        cfg = ron_ai.load_config()
+        if not args:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         ron_owner.model_text(_provider_chain_info(cfg)))
+            return True
+        try:
+            cfg["providers"] = ron_owner.apply_pin(cfg, args)
+        except ValueError as e:
+            _owner_reply(chat_id, user_id, cmd_msg_id, str(e))
+            return True
+        try:
+            _atomic_write_json(ron_ai.CONFIG_FILE, cfg)
+        except Exception as e:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         f"Couldn't save the chain: {e}")
+            return True
+        order = " \u2192 ".join(
+            str(p.get("name")) for p in cfg["providers"])
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     f"\U0001F9E0 Chain reordered: {order}.")
+        return True
     if cmd == "start":
         if maintenance_on():
             if user_id != OWNER_ID:
@@ -2685,6 +3103,12 @@ def handle_update(upd):
     if not chat_id:
         return
 
+    # Ban enforcement: banned users get total silence — no replies, no AI
+    # calls, and not even an activity-ledger entry. Checked before anything
+    # else, including the ephemeral welcome.
+    if ron_owner.is_banned((msg.get("from") or {}).get("id")):
+        return
+
     # Ephemeral welcome: greet each new human member (only they see it).
     new_members = msg.get("new_chat_members") or []
     if new_members and chat.get("type") in ("group", "supergroup"):
@@ -2742,6 +3166,10 @@ def handle_update(upd):
     # /active ledger: note the sender on every handled message.
     _record_activity(user_id, frm.get("first_name"), frm.get("username"),
                      chat.get("type"), chat.get("title"))
+    # Owner traffic registries (/stats, /users, /broadcast targets).
+    ron_owner.note_traffic(user_id, frm.get("first_name"),
+                           frm.get("username"), chat_id,
+                           chat.get("title"), chat.get("type"))
 
     text = msg.get("text", "").strip()
     photos = msg.get("photo") or []
@@ -2776,7 +3204,8 @@ def handle_update(upd):
     if cmd and handle_command(chat_id, user_id, cmd, is_private, text,
                                user_name,
                                reply_to=msg.get("message_id"),
-                               thread_id=msg.get("message_thread_id")):
+                               thread_id=msg.get("message_thread_id"),
+                               cmd_msg_id=msg.get("message_id")):
         return
 
     # Phase 4 (silent): track group membership and check for disclosure
@@ -2861,12 +3290,20 @@ def handle_callback(query):
         api("answerCallbackQuery", {"callback_query_id": query["id"]})
     except Exception:
         pass
+    # Ban enforcement: banned users get silence (the query above is still
+    # answered so the client doesn't spin — harmless).
+    if ron_owner.is_banned(frm.get("id")):
+        return
     # /active ledger: a button tap counts as activity too.
     _cb_msg = query.get("message") or {}
     _cb_chat = _cb_msg.get("chat") or {}
     _record_activity(frm.get("id"), frm.get("first_name"),
                      frm.get("username"), _cb_chat.get("type"),
                      _cb_chat.get("title"))
+    # Owner traffic registries (/stats, /users, /broadcast targets).
+    ron_owner.note_traffic(frm.get("id"), frm.get("first_name"),
+                           frm.get("username"), _cb_chat.get("id"),
+                           _cb_chat.get("title"), _cb_chat.get("type"))
     # Maintenance mode covers button taps too: text messages are gated in
     # handle_update, but callback queries arrive here directly. Non-owners
     # get silence (the /start command still explains the break).
@@ -2971,6 +3408,11 @@ def main():
           flush=True)
     # Phase 4: memory store (dual-write + recall hooks + approval sweeper).
     init_memory()
+    # Owner power commands (v1.12.0): state dir, periodic state flush, and
+    # the per-provider AI-call counter hook for /stats.
+    ron_owner.set_dir(os.path.join(HOME, "workspace", "telegram-bot"))
+    ron_owner.start_flusher()
+    ron_ai.AI_CALL_HOOK = ron_owner.note_ai_call
     # Phase 3: heartbeat for the watchdog, startup provider health ping,
     # and the degraded-mode recovery worker.
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
@@ -3041,6 +3483,11 @@ def main():
         if remaining == 0:
             break
         time.sleep(0.5)
+    # Persist owner-command state (stats/users/chats) on the way out.
+    try:
+        ron_owner.flush()
+    except Exception:
+        pass
     print(f"[ron_daemon] stopped (in-flight remaining: {remaining})", flush=True)
 
 

@@ -301,6 +301,27 @@ def check_once():
         return True
 
     # --- repair path ---
+    # Owner-initiated clean restart (/restart): the daemon dropped
+    # ron_restart.requested and exited on purpose. Honor it WITHOUT
+    # burning the crash counter or entering backoff — this is not a crash.
+    restart_req = os.path.join(DIR, "ron_restart.requested")
+    if os.path.exists(restart_req):
+        try:
+            os.unlink(restart_req)
+        except OSError:
+            pass
+        for pid in pids:
+            kill_pid(pid)
+        log("clean restart requested by owner — relaunching "
+            "(crash counter untouched)")
+        if start_daemon():
+            st["total_restarts"] = st.get("total_restarts", 0) + 1
+            st["last_restart_ts"] = time.time()
+            log(f"restart #{st['total_restarts']} done (clean)")
+        st["last_healthy_ts"] = now
+        save_state(st)
+        return False
+
     log(f"daemon unhealthy: {reason}")
     log(f"crash evidence (tail of ron_daemon.log):\n{crash_evidence()}")
     st["consecutive_crashes"] = st.get("consecutive_crashes", 0) + 1

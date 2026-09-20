@@ -139,6 +139,11 @@ _provider_cooldown = {}
 _rate_limit_lock = threading.Lock()
 COOLDOWN_AFTER_RATELIMIT_SECS = 30.0
 
+# Hook fired with the provider name before every /chat/completions POST
+# attempt (streaming and single-shot alike). The daemon wires it to its
+# /stats traffic counters; None keeps it a no-op. Never let it raise.
+AI_CALL_HOOK = None
+
 
 def get_provider_cooldowns():
     """Copy of {provider_name: cooldown_until_monotonic}. Phase 7 /health.
@@ -383,6 +388,11 @@ def _request(cfg, messages, stream, timeout, cheap=False):
         while attempt < 2:
             req = _build_request(base_url, key, model, messages, stream,
                                  extra_headers)
+            if AI_CALL_HOOK is not None:
+                try:
+                    AI_CALL_HOOK(name)
+                except Exception:
+                    pass
             _API_SEMAPHORE.acquire()
             try:
                 raw = urllib.request.urlopen(req, timeout=timeout)
@@ -564,7 +574,10 @@ def _save_turn(chat_id, user_text, user_name, reply, user_id=0):
         hist = load_history()
         ck = str(chat_id)
         turns = hist.get(ck, [])
-        turns.append({"role": "user", "content": f"[{user_name}]: {user_text}"})
+        # user_id tags the turn for owner tooling (/forgetuser); harmless
+        # to prompt building, which only reads role/content.
+        turns.append({"role": "user", "user_id": user_id,
+                      "content": f"[{user_name}]: {user_text}"})
         turns.append({"role": "assistant", "content": reply})
         hist[ck] = turns[-HISTORY_STORE_MAX:]
         _write_history(hist)
@@ -627,7 +640,10 @@ def _prompt_turns(chat_id, user_text, user_name):
     summary = _load_summary(chat_id)
     if len(stored) > SUMMARY_ROLLOVER_AT:
         summary = _maybe_rollover(chat_id, stored, summary)
-    turns = list(stored)
+    # Strip to role/content: stored turns may carry owner-tooling metadata
+    # (e.g. user_id) that must never reach the provider API.
+    turns = [{"role": t.get("role"), "content": t.get("content")}
+             for t in stored]
     turns.append({"role": "user", "content": f"[{user_name}]: {user_text}"})
     return turns[-PROMPT_RECENT:], summary
 

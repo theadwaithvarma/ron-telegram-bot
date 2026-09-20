@@ -661,6 +661,68 @@ class MemoryStore:
             self._db.commit()
             return out
 
+    def wipe_user(self, user_id):
+        """Purge everything attributable to one user id. Returns counts.
+
+        This covers BOTH directions:
+        1. Rows carrying the user's id anywhere (their turns in DMs,
+           groups and Business chats; their consents; pending approvals
+           targeting them; group memberships).
+        2. The user's private-DM chat (chat_id == str(user_id)) as a whole:
+           facts, chat_meta (summaries), and the bot's own turns there are
+           all part of that private conversation and go too.
+
+        Facts in OTHER chats are chat-scoped (no user attribution) and are
+        NOT touched — use wipe_chat()/forget() for those. Returns
+        {messages, facts, consents, pendings, members, meta}.
+        """
+        uid = int(user_id)
+        cid = str(uid)
+        out = {"messages": 0, "facts": 0, "consents": 0, "pendings": 0,
+               "members": 0, "meta": 0}
+        with self._lock:
+            # 1. The private-DM chat: nuke it like wipe_chat() does.
+            mids = [r[0] for r in self._db.execute(
+                "SELECT id FROM messages WHERE chat_id=?", (cid,)).fetchall()]
+            fids = [r[0] for r in self._db.execute(
+                "SELECT id FROM facts WHERE chat_id=?", (cid,)).fetchall()]
+            out["messages"] += self._delete_messages(mids)
+            out["facts"] = self._delete_facts(fids)
+            out["meta"] = self._db.execute(
+                "DELETE FROM chat_meta WHERE chat_id=?", (cid,)).rowcount
+            out["members"] += self._db.execute(
+                "DELETE FROM chat_members WHERE chat_id=?", (cid,)).rowcount
+            out["consents"] += self._db.execute(
+                "DELETE FROM consents WHERE chat_id=?", (cid,)).rowcount
+            out["pendings"] += self._db.execute(
+                "DELETE FROM pending_approvals WHERE dm_chat_id=?",
+                (cid,)).rowcount
+            # 2. The user's turns anywhere else (groups, Business chats).
+            mids = [r[0] for r in self._db.execute(
+                "SELECT id FROM messages WHERE user_id=?",
+                (uid,)).fetchall()]
+            out["messages"] += self._delete_messages(mids)
+            out["consents"] += self._db.execute(
+                "DELETE FROM consents WHERE user_id=?", (uid,)).rowcount
+            out["pendings"] += self._db.execute(
+                "DELETE FROM pending_approvals WHERE target_user_id=?",
+                (uid,)).rowcount
+            out["members"] += self._db.execute(
+                "DELETE FROM chat_members WHERE user_id=?",
+                (uid,)).rowcount
+            # Orphan cleanup: consent / approval rows that pointed at the
+            # wiped DM facts.
+            if fids:
+                q = ",".join("?" * len(fids))
+                out["consents"] += self._db.execute(
+                    f"DELETE FROM consents WHERE fact_id IN ({q})",
+                    fids).rowcount
+                out["pendings"] += self._db.execute(
+                    "DELETE FROM pending_approvals"
+                    f" WHERE fact_id IN ({q})", fids).rowcount
+            self._db.commit()
+            return out
+
     def prune_expired(self, retention_days=30):
         """Drop raw messages older than retention_days. Facts are kept."""
         cutoff = time.time() - float(retention_days) * 86400

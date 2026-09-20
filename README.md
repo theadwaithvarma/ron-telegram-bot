@@ -81,6 +81,18 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 | `/health` | Compact status card — uptime, AI chain, memory, cache, backup, restarts |
 | `/shutdown` | Owner only — maintenance mode: bot goes quiet for everyone but Adwaith |
 | `/active` | Owner only — who's around now and in the last 10 minutes |
+| `/stats` | Owner only — today's traffic, AI calls per provider, cache, uptime |
+| `/ban` / `/unban` | Owner only — silence / unsilence a user everywhere |
+| `/broadcast` | Owner only — two-step broadcast to every known chat |
+| `/say` | Owner only — send text as the bot into any chat |
+| `/restart` | Owner only — clean daemon restart via the watchdog |
+| `/quiet` | Owner only — maintenance mode that auto-resumes after N minutes |
+| `/logs` | Owner only — tail of the daemon log |
+| `/users` | Owner only — full user roster |
+| `/forgetuser` | Owner only — wipe one user's data (DM chat fully, group turns) |
+| `/model` | Owner only — show or re-pin the AI provider chain |
+
+All owner commands are **ephemeral** — the command and the reply auto-delete after 30 seconds.
 | `/start` | Owner only during maintenance — wakes the bot back up for everyone |
 
 ### 🛠️ Group Power Tools

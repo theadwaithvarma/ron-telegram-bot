@@ -825,5 +825,100 @@ class Phase5Test(unittest.TestCase):
                                                     True), "")
 
 
+class WipeUserTest(unittest.TestCase):
+    """wipe_user(): the user's turns everywhere + their whole private-DM
+    chat (facts, summaries, bot replies); other chats' facts survive."""
+
+    def setUp(self):
+        os.environ[ron_memory.KEY_ENV] = TEST_KEY
+        self.store, self.path = fresh_store()
+
+    def tearDown(self):
+        self.store.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _seed(self):
+        s = self.store
+        # User 42's private DM (chat_id "42"): full conversation.
+        s.record_message("42", 42, "user", "my exam is Monday")
+        s.record_message("42", 0, "assistant", "noted, good luck")
+        dm_fact = s.remember("42", "42 has an exam on Monday")
+        s.set_meta("42", "summary", "exam prep chat")
+        s.record_consent("42", 42, dm_fact)
+        s.note_member("42", 42, "Kaviya")
+        # User 42 also spoke in group "-100".
+        s.record_message("-100", 42, "user", "hey all")
+        s.record_message("-100", 0, "assistant", "welcome")
+        s.record_message("-100", 7, "user", "other person here")
+        group_fact = s.remember("-100", "42 likes filter coffee")
+        s.record_consent("-100", 42, group_fact)
+        s.note_member("-100", 42, "Kaviya")
+        # A pending approval targeting 42.
+        s.create_pending("overshare", "-100", 42, fact_id=group_fact,
+                         dm_chat_id="42", payload="share?")
+        # Someone else's DM is untouched.
+        s.record_message("77", 77, "user", "private stuff")
+        s.remember("77", "77 is learning guitar")
+        return dm_fact, group_fact
+
+    def test_wipe_user_scoping(self):
+        dm_fact, group_fact = self._seed()
+        out = self.store.wipe_user(42)
+        self.assertGreater(out["messages"], 0)
+        self.assertGreater(out["facts"], 0)
+        self.assertGreater(out["meta"], 0)
+        # DM chat fully gone: messages, facts, meta, consent, member.
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM messages WHERE chat_id='42'"
+            ).fetchone()[0], 0)
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM facts WHERE chat_id='42'"
+            ).fetchone()[0], 0)
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM chat_meta WHERE chat_id='42'"
+            ).fetchone()[0], 0)
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM chat_members WHERE user_id=42"
+            ).fetchone()[0], 0)
+        # 42's group turn is gone, but the group's fact and other users'
+        # turns survive (facts are chat-scoped, not user-attributed).
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM messages WHERE user_id=42"
+            ).fetchone()[0], 0)
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM messages WHERE chat_id='-100'"
+            ).fetchone()[0], 2)  # bot reply + user 7
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM facts WHERE chat_id='-100'"
+            ).fetchone()[0], 1)
+        items = self.store.recall_all("-100", "filter coffee", limit=5)
+        self.assertTrue(any(i["kind"] == "fact" for i in items))
+        # Pending approval targeting 42 is gone.
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM pending_approvals"
+                " WHERE target_user_id=42"
+            ).fetchone()[0], 0)
+        # Unrelated user's DM untouched.
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM messages WHERE chat_id='77'"
+            ).fetchone()[0], 1)
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT COUNT(*) FROM facts WHERE chat_id='77'"
+            ).fetchone()[0], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

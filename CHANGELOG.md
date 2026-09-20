@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.12.0 — 2026-09-21
+
+Owner power commands (all owner-only, all ephemeral — the command and the
+bot's reply auto-delete after 30 seconds, silently):
+
+- `/stats` — today's traffic: inbound/outbound counts, active chats,
+  per-provider AI call counts, cache hit rate, uptime.
+- `/ban <user_id>` / `/unban <user_id>` — silence a user everywhere
+  (messages, button taps, Business chats); ban list persists on disk.
+- `/broadcast <text>` — two-step: stages the message and shows a
+  preview, then `/broadcast yes` within 60 seconds sends to every known
+  chat (`/broadcast no` cancels). Expired requests are rejected.
+- `/say <chat_id> <text>` — send text as the bot into any chat.
+- `/restart` — clean restart: drops a flag the watchdog honors, so the
+  relaunch doesn't burn the crash counter or enter backoff.
+- `/quiet <minutes>` — maintenance mode with auto-resume (1–1440 min);
+  `/shutdown` stays manual, `/start` wakes early.
+- `/logs [n]` — tail of the daemon log as a monospace code block.
+- `/users` — full user roster with first/last seen.
+- `/forgetuser <user_id>` — wipes the user's turns everywhere plus their
+  whole private-DM chat (facts, summaries, bot replies); other chats'
+  facts are chat-scoped and untouched. MemoryStore.wipe_user() corrected
+  to include the DM chat's facts and metadata.
+- `/model [groq|gemini|openrouter]` — show the provider chain or pin one
+  first (persisted to ron_ai.json).
+- `/active` retrofitted with the same ephemeral behavior.
+- Outbound accounting: /stats now counts successful sends on every path
+  (plain send(), send_markup(), and rich sendRichMessage), and only
+  counts successful sends.
+- ron_ai: AI_CALL_HOOK fires before each provider attempt (drives the
+  per-provider counters); user turns tagged with user_id, stripped
+  before the prompt reaches providers.
+- Tests: new tests/test_powercmds.py (51 tests: gating, bans +
+  enforcement, broadcast confirm/expiry, quiet expiry, forgetuser
+  scoping, ephemeral timers, model pinning, restart flag, outbound
+  accounting); MemoryStore.wipe_user scoping test in test_memory.py.
+
 ## 1.11.0 — 2026-09-21
 
 New owner-only `/active` command: shows who's around right now and in
