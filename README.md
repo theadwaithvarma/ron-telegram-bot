@@ -53,6 +53,7 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 - **Semantic answer cache** (`ron_cache.py`) — repeat or paraphrased questions are answered from a per-chat local cache (token-set similarity, no embeddings, no new deps): 24h TTL, 200-entry LRU per chat, freshness-sensitive questions never cached
 - **Rolling history summaries** — once a chat's raw history passes 40 turns, the oldest half is folded into an encrypted per-chat summary by the cheap model; prompts carry summary + last 15 turns instead of unbounded history
 - **Light mode** (`light_mode` in `ron_ai.json`): cheap-model routing, no draft streaming, one rich send per reply — running lean on demand, built for heavy lifting
+- **Self-healing sends** — every outbound message goes through `send_healed()`: if Telegram rejects the bot's own formatting ("can't parse entities", overlong text), it strips the formatting or truncates and retries automatically (max 3 attempts), logging each recovery. The user just sees the fixed message.
 
 ### 🧠 Privacy-First Memory
 - **Encrypted per-chat memory** (`ron_memory.py`): SQLite + Fernet encryption at rest (key from `RON_MEMORY_KEY`; fails closed without it). Each chat's memory is strictly isolated — DM, group, and Business memories never merge

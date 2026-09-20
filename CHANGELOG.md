@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.14.0 — 2026-09-21
+
+Self-healing send pipeline: the bot now detects its OWN formatting
+errors and fixes them automatically — no user action, no manual /del//edit
+needed for these.
+
+- All outbound text sends (`send()`, `send_markup()`, rich `sendRichMessage`
+  via `send_blocks()`/`send_rich()`) and `editMessageText` go through
+  `send_healed()`, which classifies Telegram API failures and retries:
+  - Parse/entity errors ("can't parse entities",
+    `RICH_MESSAGE_CONTENT_REQUIRED`) → strip ALL formatting, retry as
+    plain text (inline keyboard kept).
+  - Length errors ("message is too long", "caption is too long") →
+    truncate to Telegram limits (4096 text / 1024 caption, marked "…").
+- Retry chain: original → fix matching the error → the other fix (a
+  message can be malformed AND too long) → give up with the existing
+  provider-neutral error. Max 3 attempts, never infinite; unknown errors
+  fail fast without guessing.
+- Bad rich blocks can't be fixed in place, so `sendRichMessage` failures
+  are retried as plain `sendMessage` (text extracted from the blocks).
+- Silent on success — the user just sees the fixed message. Every
+  auto-recovery is logged (`[ron_daemon] send healed: …`) so it shows
+  up in `/logs`.
+- `/del` and `/edit` stay as-is: manual override for content mistakes.
+
 ## 1.13.0 — 2026-09-21
 
 Owner-only message surgery (ephemeral like all power commands):

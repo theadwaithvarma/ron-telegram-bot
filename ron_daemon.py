@@ -975,6 +975,184 @@ def _note_sent(result):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Self-healing send pipeline (v1.14.0).
+#
+# The bot detects its OWN formatting errors and fixes them automatically —
+# no user action needed. Every outbound text send/edit goes through
+# send_healed(), which retries failed calls after auto-fixing the two
+# failure classes Telegram actually returns for our messages:
+#   * parse/entity errors ("can't parse entities",
+#     RICH_MESSAGE_CONTENT_REQUIRED) -> strip ALL formatting, retry as
+#     plain text (the inline keyboard is kept — a bad keyboard is a
+#     different failure class and keeps its own error).
+#   * length errors ("message is too long", "caption is too long") ->
+#     truncate to Telegram limits (4096 text / 1024 caption, marked "…").
+# Retry chain (max 3 API attempts, never infinite):
+#   1. original payload
+#   2. the fix matching the failure (parse -> strip, length -> truncate)
+#   3. the other fix (a message can be malformed AND too long)
+# Then give up: the caller surfaces the existing provider-neutral error.
+# sendRichMessage is special: bad rich blocks can't be "stripped" in
+# place, so they are dropped and retried as plain sendMessage (text
+# extracted from the blocks or markdown).
+# Silent on success — the user just sees the fixed message. Every
+# auto-recovery is logged so it shows up in /logs.
+# ---------------------------------------------------------------------------
+_HEAL_MAX_ATTEMPTS = 3
+_TG_TEXT_LIMIT = 4096
+_TG_CAPTION_LIMIT = 1024
+
+_PARSE_ERR_RE = re.compile(
+    r"can'?t parse entities|parse entities|rich_message_content_required",
+    re.I)
+_LENGTH_ERR_RE = re.compile(r"too long|too big", re.I)
+
+
+def _api_ok(r):
+    return isinstance(r, dict) and bool(r.get("ok"))
+
+
+def _api_err(r):
+    try:
+        return str(r.get("error", "?")) if isinstance(r, dict) else "?"
+    except Exception:
+        return "?"
+
+
+def _heal_kind(err):
+    """Classify a Telegram send/edit failure: 'parse', 'length', 'other'."""
+    e = (err or "").lower()
+    if _PARSE_ERR_RE.search(e):
+        return "parse"
+    if _LENGTH_ERR_RE.search(e):
+        return "length"
+    return "other"
+
+
+def _strip_send_format(params):
+    """Drop all formatting from a send/edit payload: parse_mode, rich
+    content, markdown/HTML markers in text/caption. reply_markup (the
+    inline keyboard) is kept."""
+    p = dict(params)
+    p.pop("parse_mode", None)
+    p.pop("rich_message", None)
+    for key in ("text", "caption"):
+        if isinstance(p.get(key), str):
+            p[key] = strip_markdown(p[key])
+    return p
+
+
+def _truncate_send_text(params):
+    """Cut text/caption to Telegram limits, marking the cut with '…'."""
+    p = dict(params)
+    t = p.get("text")
+    if isinstance(t, str) and len(t) > _TG_TEXT_LIMIT:
+        p["text"] = t[:_TG_TEXT_LIMIT - 1] + "…"
+    c = p.get("caption")
+    if isinstance(c, str) and len(c) > _TG_CAPTION_LIMIT:
+        p["caption"] = c[:_TG_CAPTION_LIMIT - 1] + "…"
+    return p
+
+
+def _blocks_text(blocks):
+    """Best-effort plain text from Bot API 10.3 rich blocks, for the
+    sendRichMessage -> sendMessage fallback."""
+    out = []
+
+    def _rt(node):
+        if isinstance(node, str):
+            return node
+        if isinstance(node, dict):
+            return _rt(node.get("text", ""))
+        if isinstance(node, list):
+            return "".join(_rt(n) for n in node)
+        return ""
+
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t in ("paragraph", "blockquote", "pre"):
+            out.append(_rt(b.get("text", "")))
+        elif t == "list":
+            for item in b.get("items", []) or []:
+                out.append("\u2022 " + _rt(item.get("text", "")))
+        # divider / buttons carry no readable text
+    return "\n".join(s for s in out if s).strip()
+
+
+def _rich_fallback_text(payload):
+    """Plain text for a failed sendRichMessage: markdown shape, blocks
+    shape, or the raw text key as a last resort."""
+    rm = payload.get("rich_message") or {}
+    if isinstance(rm.get("markdown"), str):
+        return rm["markdown"]
+    if isinstance(rm.get("blocks"), list):
+        return _blocks_text(rm["blocks"])
+    return payload.get("text", "") or ""
+
+
+def send_healed(method, params, as_json=False):
+    """Bot API call with self-healing retries for the bot's own
+    formatting mistakes.
+
+    method: 'sendMessage' | 'editMessageText' | 'sendRichMessage' ...
+    params: payload dict. as_json: post via rich_mod.api_json (needed for
+    nested payloads like sendRichMessage) instead of the urlencoded api().
+    """
+    transport = rich_mod.api_json if as_json else api
+    params = dict(params)
+    r = transport(method, params)
+    if _api_ok(r):
+        return r
+    err = _api_err(r)
+    kind = _heal_kind(err)
+    if kind == "other":
+        return r  # unknown failure — don't guess, fail fast
+
+    # Recovery chain: the fix matching the classification first, then the
+    # other fix applied on top (a message can be malformed AND too long).
+    # Each entry is (label, transport, method, params).
+    attempts = []
+    if method == "sendRichMessage":
+        # Bad rich content can't be fixed in place — drop it and go plain.
+        # Recovery stays on the JSON transport: payloads may carry nested
+        # dicts (reply_parameters) that the urlencoded api() can't send.
+        plain = {k: v for k, v in params.items() if k != "rich_message"}
+        plain["text"] = strip_markdown(_rich_fallback_text(params))
+        attempts.append(("rich content dropped, retried as plain text",
+                         rich_mod.api_json, "sendMessage", plain))
+        attempts.append(("truncated to Telegram limits",
+                         rich_mod.api_json, "sendMessage",
+                         _truncate_send_text(plain)))
+    else:
+        t = rich_mod.api_json if as_json else api
+        stripped = _strip_send_format(params)
+        if kind == "parse":
+            attempts.append(("stripped formatting", t, method, stripped))
+            attempts.append(("stripped, then truncated to Telegram limits",
+                             t, method, _truncate_send_text(stripped)))
+        else:
+            truncated = _truncate_send_text(params)
+            attempts.append(("truncated to Telegram limits",
+                             t, method, truncated))
+            attempts.append(("truncated, then stripped formatting",
+                             t, method, _strip_send_format(truncated)))
+
+    last = r
+    for label, t, m, p in attempts[:_HEAL_MAX_ATTEMPTS - 1]:
+        if m == method and p == params:
+            continue  # nothing changed — don't burn an attempt
+        r2 = t(m, p)
+        if _api_ok(r2):
+            print(f"[ron_daemon] send healed: {label} after '{err[:90]}'",
+                  flush=True)
+            return r2
+        last = r2
+    return last
+
+
 def send(chat_id, text, reply_to=None, thread_id=None,
          business_connection_id=None):
     params = {"chat_id": chat_id, "text": text}
@@ -986,7 +1164,7 @@ def send(chat_id, text, reply_to=None, thread_id=None,
     if business_connection_id:
         # Secretary Mode: send on the business account, not as the bot.
         params["business_connection_id"] = business_connection_id
-    r = api("sendMessage", params)
+    r = send_healed("sendMessage", params)
     _note_sent(r)
     return r
 
@@ -1036,7 +1214,7 @@ def send_markup(chat_id, text, reply_markup, reply_to=None,
         params["reply_parameters"] = json.dumps({"message_id": reply_to})
     if business_connection_id:
         params["business_connection_id"] = business_connection_id
-    r = api("sendMessage", params)
+    r = send_healed("sendMessage", params)
     _note_sent(r)
     return r
 
@@ -1719,7 +1897,13 @@ def send_rich(chat_id, text, reply_markup=None, reply_to=None, thread_id=None,
             # fall through to the plain-text fallback below (which also
             # carries the connection id).
             kw["business_connection_id"] = business_connection_id
-        r = rich_mod.rich_send(chat_id, text, fmt="markdown", **kw, **rp)
+        # Self-healing: malformed AI markdown ("can't parse entities") is
+        # stripped and retried as plain text inside send_healed, so the
+        # reply lands without anyone touching it.
+        payload = {"chat_id": chat_id, "rich_message": {"markdown": text}}
+        payload.update(kw)
+        payload.update(rp)
+        r = send_healed("sendRichMessage", payload, as_json=True)
         if r.get("ok"):
             _note_sent(r)  # /stats: rich sends bypass send(), count here
             return r
@@ -2046,7 +2230,7 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
             # An empty inline keyboard clears the buttons; omitting
             # reply_markup preserves whatever was there.
             params["reply_markup"] = json.dumps({"inline_keyboard": []})
-        r = api("editMessageText", params)
+        r = send_healed("editMessageText", params)
         if not (isinstance(r, dict) and r.get("ok")):
             err = str((r or {}).get("error", "unknown"))[:80]
             _owner_reply(chat_id, user_id, cmd_msg_id,
@@ -2450,7 +2634,8 @@ def send_blocks(chat_id, blocks, reply_to=None, thread_id=None,
     if business_connection_id:
         payload["business_connection_id"] = business_connection_id
     try:
-        return rich_mod.api_json("sendRichMessage", payload)
+        # Self-healing: bad blocks are dropped and retried as plain text.
+        return send_healed("sendRichMessage", payload, as_json=True)
     except Exception as e:
         print(f"[ron_daemon] blocks send error: {e}", flush=True)
         return {"ok": False, "error": str(e)[:150]}
