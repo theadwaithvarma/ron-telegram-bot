@@ -2,7 +2,7 @@
 
 ## 1.0.0 — 2026-09-20
 
-Initial public release. Snapshot of the bot running as `@ronrebootedbot`.
+Initial release. Snapshot of the bot running as `@ronrebootedbot`.
 
 - Conversational AI backend on Groq (`openai/gpt-oss-120b`) with per-chat
   rolling history and model fallback on 429 rate limits
