@@ -3,16 +3,14 @@
 
 Replies to everyone: DMs from any user, and group messages that mention
 the bot or reply to it. (Owner-only pause was lifted 2026-09-20.)
-Replies use ron_ai.py (multi-provider AI brain: Groq -> Gemini ->
-OpenRouter), streaming live via rich drafts for
+Replies use ron_ai.py (Groq backend), streaming live via rich drafts for
 long 1:1 answers, sent as native rich messages (Bot API 10.1
 sendRichMessage) with contextual quick-reply buttons.
 Business / Secretary Mode: handles business_connection updates and answers
 business_message updates on the owner's business account.
 
-Run: copy .env.example to .env, fill it in, then
-     nohup python3 ron_daemon.py >ron_daemon.log 2>&1 &
-State: offset persisted next to the script (ron_daemon.offset)
+Run: nohup python3 ron_daemon.py >/tmp/ron_daemon.log 2>&1 &
+State: offset persisted to ~/workspace/telegram-bot/ron_daemon.offset
 """
 import json
 import os
@@ -24,22 +22,21 @@ import time
 import urllib.request
 import urllib.parse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.expanduser("~"), "workspace", "telegram-bot"))
 import ron_ai
 import rich_send as rich_mod
 
-from config import (
-    BASE_DIR,
-    BOT_TOKEN,
-    BOT_USERNAME,
-    OWNER_ID,
-    read_json_response,
-    telegram_api_base,
-)
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+from dynamic_credentials import dynamic_credential_entry, read_json_response
 
-OFFSET_FILE = str(BASE_DIR / "ron_daemon.offset")
-BASE = telegram_api_base()
+HOME = os.path.expanduser("~")
+OFFSET_FILE = os.path.join(HOME, "workspace", "telegram-bot", "ron_daemon.offset")
+OWNER_ID = 6819786239  # Adwaith — bot owner (no longer a reply gate)
 PLAYGROUND = "-1003920795086"
+
+_entry = dynamic_credential_entry("custom.telegram")
+_SURROGATE = str(_entry["surrogate"]).strip()
+BASE = f"https://api.telegram.org/bot{_SURROGATE}"
 
 # Graceful shutdown: restarts must not eat in-flight replies. The poll loop
 # saves the update offset as soon as a reply thread is spawned, so killing
@@ -67,8 +64,10 @@ def _atomic_write_json(path, obj):
 # Degraded mode: if every AI provider keeps failing, the bot stops burning
 # API calls, tells the user honestly, queues their message to disk, and
 # answers it when a provider recovers — no silent drops, no duplicates.
-HEARTBEAT_FILE = str(BASE_DIR / "ron_heartbeat.json")
-DEGRADED_QUEUE = str(BASE_DIR / "degraded_queue.jsonl")
+HEARTBEAT_FILE = os.path.join(HOME, "workspace", "telegram-bot",
+                              "ron_heartbeat.json")
+DEGRADED_QUEUE = os.path.join(HOME, "workspace", "telegram-bot",
+                              "degraded_queue.jsonl")
 BRAIN_FAIL_WINDOW = 600.0    # systemic failures counted over the last 10 min
 BRAIN_FAIL_THRESHOLD = 5     # this many -> degraded mode
 RECOVERY_POLL_SECS = 60      # provider probe interval while degraded
@@ -208,9 +207,15 @@ def _drain_queue():
     for e in live:
         try:
             send_typing(e["chat_id"], e.get("business_connection_id"))
+            _dq_private = e.get("private", True)
+            _dq_extra = group_context()
+            if not _dq_private and _MEM_MODULES:
+                _dq_extra += ron_privacy.GROUP_PRIVACY_RULE
             reply = ron_ai.chat(e["chat_id"], e["text"],
                                 e.get("user_name", "there"),
-                                system_extra=group_context())
+                                system_extra=_dq_extra,
+                                user_id=e.get("user_id", 0),
+                                is_private=_dq_private)
             send_rich_with_kb(e["chat_id"], reply, e.get("reply_to"),
                               e.get("thread_id"),
                               e.get("business_connection_id"))
@@ -286,19 +291,379 @@ def _health_ping():
         print(f"[ron_daemon] health: {name} {'OK' if ok else 'DOWN'} - "
               f"{detail}", flush=True)
         if not ok and detail.startswith("HTTP 40"):
-            if OWNER_ID:
-                try:
-                    send(OWNER_ID,
-                         f"\u26A0\uFE0F Heads up: the {name} API key looks dead "
-                         f"({detail}). The bot's running on the other providers "
-                         f"for now.")
-                except Exception as e:
-                    print(f"[ron_daemon] owner alert failed: {e}", flush=True)
+            try:
+                send(OWNER_ID,
+                     f"\u26A0\uFE0F Heads up: the {name} API key looks dead "
+                     f"({detail}). The bot's running on the other providers "
+                     f"for now.")
+            except Exception as e:
+                print(f"[ron_daemon] owner alert failed: {e}", flush=True)
 
 
 def _track(t):
     with _INFLIGHT_LOCK:
         _INFLIGHT.add(t)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — per-chat isolated memory (2026-09-20).
+# Every row is scoped by chat_id; reads always filter by chat_id. A DM's
+# memory never leaks into a group or another DM. Cross-chat disclosure
+# happens ONLY via private-DM approval (never asked in the group — even the
+# ask leaks metadata), and consent is recorded per (group, user, fact):
+# ask once, never re-ask.
+# ---------------------------------------------------------------------------
+try:
+    import ron_memory
+    import ron_privacy
+    _MEM_MODULES = True
+except Exception as _mem_import_err:
+    _MEM_MODULES = False
+    print(f"[ron_daemon] memory modules unavailable: {_mem_import_err}",
+          flush=True)
+mem = None
+
+
+def _mem_cfg():
+    try:
+        return ron_ai.load_config().get("memory", {}) or {}
+    except Exception:
+        return {}
+
+
+def init_memory():
+    """Start the memory store. Fail soft: the bot runs memory-less rather
+    than dying. The store itself fails closed (no key -> it raises)."""
+    global mem
+    if not _MEM_MODULES:
+        return
+    if not _mem_cfg().get("enabled", True):
+        print("[ron_daemon] memory: disabled in ron_ai.json", flush=True)
+        return
+    try:
+        mem = ron_memory.MemoryStore()
+    except Exception as e:
+        # Never log key material — type name only.
+        print(f"[ron_daemon] memory: disabled ({type(e).__name__})",
+              flush=True)
+        mem = None
+        return
+    ron_ai.MEMORY_HOOK = _memory_dual_write
+    ron_ai.MEMORY_RECALL_HOOK = _memory_context
+    threading.Thread(target=_approval_sweeper, daemon=True).start()
+    print("[ron_daemon] memory: enabled", flush=True)
+
+
+def _memory_dual_write(chat_id, user_id, user_name, user_text, reply):
+    """Every completed turn lands in SQLite alongside the JSON history."""
+    try:
+        if mem is None:
+            return
+        c = str(chat_id)
+        mem.record_message(c, user_id or 0, "user",
+                           f"[{user_name}]: {user_text}")
+        mem.record_message(c, 0, "assistant", reply)
+    except Exception as e:
+        print(f"[ron_daemon] memory write failed: {type(e).__name__}",
+              flush=True)
+
+
+def _memory_context(chat_id, user_text, is_private):
+    """Bounded recall injected into the prompt. Always chat-scoped."""
+    try:
+        if mem is None:
+            return ""
+        cfg = _mem_cfg()
+        lim = int(cfg.get("recall_limit", 3))
+        chars = int(cfg.get("recall_chars", 700))
+        bits = []
+        for f in mem.recall_facts(str(chat_id), user_text, limit=lim):
+            bits.append("- " + f["text"])
+        for m in mem.recall(str(chat_id), user_text, limit=lim):
+            bits.append("- (earlier) " + m["text"][:160])
+        if not is_private:
+            # Facts P approved for this group — via consent rows only,
+            # never by merging another chat's memory. Relevance-gated:
+            # only injected when the current message is actually about
+            # the fact's topic, same rule as the disclosure trigger.
+            for _uid, ftext in mem.consented_facts(str(chat_id)):
+                if ron_privacy.topic_matches(user_text, ftext):
+                    bits.append("- (approved to share here) " + ftext[:200])
+        if not bits:
+            return ""
+        return ("\nRelevant memory from this chat:\n"
+                + "\n".join(bits))[:chars]
+    except Exception:
+        return ""
+
+
+def _dm(user_id, text):
+    """Best-effort DM. False when the bot can't open the chat (never
+    started / blocked) — callers must stay silent, never degrade."""
+    try:
+        r = send(user_id, text)
+        return bool(r.get("ok"))
+    except Exception:
+        return False
+
+
+def _dm_approval(user_id, text, pending_id):
+    """DM a Yes/No approval request. Returns True if Telegram accepted it.
+
+    Preferred path: sendRichMessage with a blocks-form message — the ask
+    as a text block plus the consent buttons as a Bot API 10.3 rich
+    buttons block (Yes = success/green, No = danger/red). Any failure
+    falls back to the classic plain message + inline keyboard; the
+    privacy guarantee holds either way (silent on failure, never degrade).
+    """
+    try:
+        blocks = [rich_text_block(text),
+                  rich_buttons_block(
+                      ron_privacy.approval_button_rows(pending_id))]
+        r = rich_mod.api_json("sendRichMessage", {
+            "chat_id": user_id,
+            "rich_message": {"blocks": blocks},
+        })
+        if r.get("ok"):
+            return True
+        print(f"[ron_daemon] rich approval send not ok: {str(r)[:120]}",
+              flush=True)
+    except Exception as e:
+        print(f"[ron_daemon] rich approval send error: {e}", flush=True)
+    try:
+        r = send_markup(user_id, text,
+                        ron_privacy.approval_keyboard(pending_id))
+        return bool(r.get("ok"))
+    except Exception:
+        return False
+
+
+def _maybe_trigger_disclosures(chat_id, text, message_id, group_title,
+                               allow_disclose=False):
+    """Silent disclosure flow. NOTHING is posted in the group here —
+    approvals are asked via private DM. allow_disclose=True (the bot is
+    already engaged in this reply cycle) additionally lets already-consented
+    facts post as a reply.
+    """
+    if mem is None or not text:
+        return
+    cands = ron_privacy.find_disclosable_facts(mem, chat_id, text)
+    if not cands:
+        return
+    timeout = int(_mem_cfg().get("approval_timeout_secs", 900))
+    for c in cands:
+        uid, fact = c["user_id"], c["fact"]
+        if c.get("consented"):
+            # Already approved for this group: disclose without re-asking,
+            # but only when genuinely relevant and the bot is engaged.
+            if allow_disclose and message_id:
+                send_rich_with_kb(chat_id, fact["text"],
+                                  reply_to=message_id)
+                print(f"[ron_daemon] disclosure: consented fact shared "
+                      f"(group={chat_id})", flush=True)
+            continue
+        if mem.active_pendings_for(uid, group_chat_id=chat_id,
+                                   kind="disclosure", fact_id=fact["id"]):
+            continue  # already asked, waiting on P
+        pid = mem.create_pending(
+            "disclosure", chat_id, uid, group_message_id=message_id,
+            target_name=mem.member_name(chat_id, uid),
+            fact_id=fact["id"], dm_chat_id=fact["chat_id"],
+            timeout_secs=timeout)
+        ok = _dm_approval(
+            uid, ron_privacy.disclosure_dm_text(group_title, fact["text"]),
+            pid)
+        if not ok:
+            # Can't DM P (never started the bot / blocked): stay silent,
+            # log ids only — never the fact content.
+            mem.set_pending_status(pid, "unreachable")
+            print(f"[ron_daemon] disclosure: cannot DM user_id={uid}, "
+                  f"staying silent (group={chat_id})", flush=True)
+        else:
+            print(f"[ron_daemon] disclosure: approval asked via DM "
+                  f"(user_id={uid}, group={chat_id})", flush=True)
+
+
+def _start_overshare_approval(chat_id, user_id, user_name, text, message_id,
+                              group_title):
+    """Adwaith asked something personal in a group: ask him privately via
+    DM instead of answering publicly. Returns True (message consumed)."""
+    if mem is None:
+        return False
+    timeout = int(_mem_cfg().get("approval_timeout_secs", 900))
+    pid = mem.create_pending(
+        "overshare", chat_id, user_id, group_message_id=message_id,
+        target_name=user_name, payload=text, timeout_secs=timeout)
+    ok = _dm_approval(
+        user_id, ron_privacy.overshare_dm_text(group_title, text), pid)
+    if not ok:
+        mem.set_pending_status(pid, "unreachable")
+        print(f"[ron_daemon] overshare: cannot DM user_id={user_id}, "
+              f"staying silent (group={chat_id})", flush=True)
+    else:
+        print(f"[ron_daemon] overshare: approval asked via DM "
+              f"(group={chat_id})", flush=True)
+    return True
+
+
+def _link_overshare_consent(group_chat_id, user_id, question):
+    """Approving a personal answer also records consent for any DM fact it
+    touched — ask once per fact per group, composed."""
+    try:
+        for f in mem.dm_facts(user_id):
+            if ron_privacy.topic_matches(question, f["text"]):
+                mem.record_consent(group_chat_id, user_id, f["id"])
+    except Exception:
+        pass
+
+
+def _apply_approval(pending, approved):
+    """Resolve a pending approval (from DM text or a Yes/No button)."""
+    pid = pending["id"]
+    uid = pending["target_user_id"]
+    gid = pending["group_chat_id"]
+    if approved:
+        if pending["kind"] == "disclosure":
+            fact = (mem.get_fact(pending["dm_chat_id"], pending["fact_id"])
+                    if mem else None)
+            if not fact or fact.get("superseded_by") is not None:
+                mem.set_pending_status(pid, "expired")
+                _dm(uid, "That note's gone from my memory — nothing to share.")
+                return
+            mem.record_consent(gid, uid, pending["fact_id"])
+            mem.set_pending_status(pid, "disclosed")
+            # Exactly one disclosure, as a reply to the triggering message.
+            send_rich_with_kb(gid, fact["text"],
+                              reply_to=pending["group_message_id"])
+            _dm(uid, "Shared ✓ — I won't ask about that one in this group again.")
+            print(f"[ron_daemon] disclosure: approved and shared "
+                  f"(group={gid})", flush=True)
+        else:  # overshare
+            question = pending.get("payload") or ""
+            mem.set_pending_status(pid, "approved")
+            _link_overshare_consent(gid, uid, question)
+            # Answer in the group, once, as a reply to his message.
+            ai_reply(gid, uid, pending.get("target_name") or "there",
+                     question, private=False,
+                     reply_to=pending["group_message_id"])
+            _dm(uid, "Answering in the group ✓")
+            print(f"[ron_daemon] overshare: approved, answering "
+                  f"(group={gid})", flush=True)
+    else:
+        mem.set_pending_status(pid, "denied")
+        _dm(uid, "Got it — kept private ✓")
+        print(f"[ron_daemon] approval denied (kind={pending['kind']}, "
+              f"group={gid})", flush=True)
+
+
+def _resolve_dm_approval(user_id, text):
+    """P answers a pending ask with text in DM. True if consumed."""
+    if mem is None:
+        return False
+    t = (text or "").strip()
+    if len(t) > 60:  # long DM text is conversation, not a Yes/No
+        return False
+    pendings = mem.active_pendings_for(user_id)
+    if not pendings:
+        return False
+    verdict = ron_privacy.classify_response(t)
+    if verdict is None:
+        return False
+    _apply_approval(pendings[0], approved=(verdict == "approve"))
+    return True
+
+
+def _record_turn(chat_id, user_id, user_name, user_text, reply):
+    """Dual-write a non-AI turn (memory/command ack) to JSON + SQLite.
+
+    Normal AI turns already dual-write via ron_ai._save_turn; this covers
+    the handled paths that bypass the AI (remember/forget acks etc.) so
+    the two stores stay in parity. Approval/disclosure DMs are system
+    messages and are deliberately NOT recorded.
+    """
+    try:
+        ron_ai._save_turn(chat_id, user_text, user_name, reply, user_id)
+    except Exception:
+        pass
+
+
+def _handle_memory_nl(chat_id, user_id, user_name, text):
+    """'remember this ...' / 'forget ...' / 'forget everything'.
+    True if handled."""
+    if mem is None:
+        return False
+    fact = ron_privacy.parse_remember(text)
+    if fact is not None:
+        mem.remember(chat_id, fact)
+        ack = "Noted ✓ — I'll remember that for this chat."
+        send(chat_id, ack)
+        _record_turn(chat_id, user_id, user_name, text, ack)
+        return True
+    parsed = ron_privacy.parse_forget(text)
+    if parsed is None:
+        return False
+    kind, q = parsed
+    if kind == "all":
+        mem.wipe_chat(chat_id)
+        _clear_json_history(chat_id)
+        ack = "Wiped this chat's memory ✓ — starting fresh."
+    elif kind == "query":
+        n = mem.forget(chat_id, q)
+        ack = "Forgotten ✓" if n else "Nothing matching to forget."
+    else:
+        fid = mem.forget_latest_fact(chat_id)
+        ack = ("Forgotten ✓" if fid
+               else "There's nothing stored to forget.")
+    send(chat_id, ack)
+    _record_turn(chat_id, user_id, user_name, text, ack)
+    return True
+
+
+def _clear_json_history(chat_id):
+    try:
+        hist = ron_ai.load_history()
+        hist.pop(str(chat_id), None)
+        ron_ai.save_history(hist)
+    except Exception:
+        pass
+
+
+def _resolve_callback_approval(query, action, pid):
+    """Yes/No button tapped in a DM. Only the target user can resolve."""
+    if mem is None:
+        return
+    frm = query.get("from") or {}
+    p = mem.get_pending(pid)
+    if not p or p["status"] != "pending" or p["expires_ts"] < time.time():
+        return  # stale or already resolved
+    if frm.get("id") != p["target_user_id"]:
+        print(f"[ron_daemon] approval button from wrong user (pid={pid})",
+              flush=True)
+        return
+    _apply_approval(p, approved=(action == "go"))
+
+
+def _approval_sweeper():
+    """Expire stale approval asks; prune old raw messages daily."""
+    last_prune = 0.0
+    while not _SHUTDOWN.is_set():
+        time.sleep(60)
+        if _SHUTDOWN.is_set():
+            break
+        try:
+            if mem is not None:
+                mem.expire_due()
+                now = time.time()
+                if now - last_prune > 86400:
+                    days = int(_mem_cfg().get("retention_days", 30))
+                    n = mem.prune_expired(days)
+                    if n:
+                        print(f"[ron_daemon] memory: pruned {n} expired "
+                              f"messages", flush=True)
+                    last_prune = now
+        except Exception as e:
+            print(f"[ron_daemon] approval sweeper: {type(e).__name__}",
+                  flush=True)
 
 
 def _untrack(t):
@@ -381,7 +746,8 @@ LINK_TAIL_RE = re.compile(r"\[links:\s*([^\]]+?)\s*\]\s*$", re.I)
 # resolves the group and posts the message mentioning the requester.
 # Only the requester themself is ever mentioned — no pinging other people.
 # ---------------------------------------------------------------------------
-KNOWN_GROUPS_FILE = str(BASE_DIR / "known_groups.json")
+KNOWN_GROUPS_FILE = os.path.join(HOME, "workspace", "telegram-bot",
+                                 "known_groups.json")
 
 GROUP_RE = re.compile(r"^\[send_group:\s*(.+?)\s*\]\s*$", re.M | re.I)
 GROUP_TAIL_RE = re.compile(r"\[send_group:\s*([^\]]+?)\s*\]\s*$", re.I)
@@ -492,7 +858,8 @@ def group_context():
 # Forum topics: track topic id <-> name per group, reply inside the same
 # topic, and manage topics (create/rename/close/reopen/delete) via trailers.
 # ---------------------------------------------------------------------------
-KNOWN_TOPICS_FILE = str(BASE_DIR / "known_topics.json")
+KNOWN_TOPICS_FILE = os.path.join(HOME, "workspace", "telegram-bot",
+                                 "known_topics.json")
 
 TOPIC_RE = re.compile(r"^\[topic:\s*(.+?)\s*\]\s*$", re.M | re.I)
 TOPIC_TAIL_RE = re.compile(r"\[topic:\s*([^\]]+?)\s*\]\s*$", re.I)
@@ -545,7 +912,8 @@ def topic_name(group_id, thread_id):
 # carries business_connection_id so the reply goes out on the business
 # account. Only connection metadata is stored — never message content.
 # ---------------------------------------------------------------------------
-BUSINESS_CONNECTIONS_FILE = str(BASE_DIR / "business_connections.json")
+BUSINESS_CONNECTIONS_FILE = os.path.join(HOME, "workspace", "telegram-bot",
+                                         "business_connections.json")
 
 
 def load_business_connections():
@@ -892,6 +1260,57 @@ def parse_trailers(reply):
     return clean, {"inline_keyboard": kb} if kb else None
 
 
+# ---------------------------------------------------------------------------
+# Rich message buttons (Bot API 10.3) — used "whenever necessary".
+#
+# Rule: rich buttons where the bot owns the full message (fixed-format DMs
+# like the privacy approval ask). Where the message body is AI-generated
+# markdown, we keep the classic styled inline keyboard via reply_markup —
+# converting markdown to blocks is out of scope and buys nothing.
+# ---------------------------------------------------------------------------
+_RICH_BTN_STYLES = ("primary", "success", "danger", "link")
+
+
+def rich_buttons_block(rows, align="left"):
+    """Build an InputRichBlockButtons block from keyboard rows.
+
+    Each row holds 1-8 button dicts: {"text", exactly one of
+    "callback_data"/"url", optional "style"}. Returns the block dict for
+    rich_message["blocks"].
+    """
+    if align not in ("left", "center", "right"):
+        align = "left"
+    btns = []
+    for row in rows:
+        if not row or len(row) > 8:
+            raise ValueError("rich button row must hold 1-8 buttons")
+        for b in row:
+            actions = [k for k in ("callback_data", "url") if b.get(k)]
+            if len(actions) != 1:
+                raise ValueError(
+                    "RichMessageButton needs exactly one action")
+            rb = {"text": (b.get("text") or "")[:64]}
+            if "callback_data" in b:
+                # 64-byte cap, UTF-8 safe (same rule as inline keyboards).
+                rb["callback_data"] = _cb64(b["callback_data"])
+            else:
+                rb["url"] = b["url"]
+            style = b.get("style")
+            if style in _RICH_BTN_STYLES:
+                rb["style"] = style
+            elif "callback_data" in b:
+                rb["style"] = "primary"
+            btns.append(rb)
+    if not btns:
+        raise ValueError("no buttons to build a block from")
+    return {"type": "buttons", "buttons": btns, "align": align}
+
+
+def rich_text_block(text):
+    """Plain-text block for a blocks-form rich message."""
+    return {"type": "text", "text": {"type": "text", "text": text or ""}}
+
+
 def strip_markdown(t):
     """Degrade rich Markdown to plain text for the no-format fallback."""
     t = re.sub(r"```\w*\n?", "", t)
@@ -958,7 +1377,8 @@ def parse_command(text):
     return token.lower() or None
 
 
-def handle_command(chat_id, user_id, cmd, is_private, text=""):
+def handle_command(chat_id, user_id, cmd, is_private, text="",
+                   user_name="there"):
     if cmd == "ping":
         send(chat_id, "\U0001F3D3 pong \u2014 alive and polling.")
         return True
@@ -976,6 +1396,21 @@ def handle_command(chat_id, user_id, cmd, is_private, text=""):
                 "text": text,
                 "ephemeral_message_parameters": {"receiver_user_id": user_id},
             })
+        return True
+    if cmd == "forget":
+        # Phase 4: per-chat memory wipe. In a DM anyone can wipe their own
+        # DM; in a group only the owner (group memory is shared).
+        if mem is None:
+            send(chat_id, "Memory isn't enabled right now.")
+            return True
+        if not is_private and user_id != OWNER_ID:
+            send(chat_id, "Only Adwaith can wipe this group's memory.")
+            return True
+        mem.wipe_chat(chat_id)
+        _clear_json_history(chat_id)
+        ack = "Wiped this chat's memory ✓ — starting fresh."
+        send(chat_id, ack)
+        _record_turn(chat_id, user_id, user_name, text, ack)
         return True
     return False
 
@@ -1222,7 +1657,8 @@ def stream_ai_reply(chat_id, user_id, user_name, text):
     try:
         reply = ron_ai.chat_stream(chat_id, text, user_name, on_token,
                                    stop_event=stop_event,
-                                   system_extra=group_context())
+                                   system_extra=group_context(),
+                                   user_id=user_id, is_private=True)
     finally:
         # Only clear our own slot — a newer concurrent stream in this chat
         # may have registered its event after us.
@@ -1254,7 +1690,15 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                                        business_connection_id)
                 return
             try:
+                # Light mode (2026-09-20): run lean — cheap models for every
+                # message, no draft streaming, daily notice on interaction.
+                lm = ron_ai.light_mode_enabled()
                 extra = group_context()
+                if not private and _MEM_MODULES:
+                    # Phase 4 backstop: the deterministic tripwire catches
+                    # most personal questions, but if one slips through the
+                    # model must still not answer it publicly.
+                    extra += ron_privacy.GROUP_PRIVACY_RULE
                 if thread_id and not private:
                     tname = topic_name(chat_id, thread_id)
                     if tname:
@@ -1263,7 +1707,8 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 # Business account reply: no draft streaming — drafts are a
                 # preview in the bot's own chats, but this reply must go out
                 # on the business account as one final message.
-                if private and not business_connection_id:
+                # Light mode also skips streaming: single cheap send instead.
+                if private and not business_connection_id and not lm:
                     try:
                         stream_ai_reply(chat_id, user_id, user_name, text)
                         _record_brain_success()
@@ -1299,7 +1744,8 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 # non-streaming path (groups, business): show typing while generating
                 send_typing(chat_id, business_connection_id)
                 reply = ron_ai.chat(chat_id, text, user_name,
-                                    system_extra=extra)
+                                    system_extra=extra, user_id=user_id,
+                                    is_private=private)
                 _record_brain_success()
             except Exception as e:
                 msg = str(e)
@@ -1314,6 +1760,10 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 else:
                     reply = "Brain glitch, try that again in a bit. \U0001F9E0"
                     print(f"[ron_daemon] ai error: {e}", flush=True)
+            if lm:
+                # Mention light mode on interaction (once per user per day):
+                # users should know the bot is capable of heavier lifting.
+                reply += ron_ai.light_mode_notice(user_id)
             send_rich_with_kb(chat_id, reply, reply_to, thread_id,
                               business_connection_id)
             handle_group_sends(chat_id, user_id, user_name, reply)
@@ -1374,6 +1824,14 @@ def handle_update(upd):
                 ephemeral_welcome(chat_id, nm, chat.get("title"))
             except Exception as e:
                 print(f"[ron_daemon] ephemeral welcome failed: {e}", flush=True)
+            # Phase 4: track them now so disclosure consent gating knows
+            # they are present without waiting for them to speak.
+            if mem is not None:
+                try:
+                    mem.note_member(chat_id, nm.get("id", 0),
+                                    nm.get("first_name", ""))
+                except Exception:
+                    pass
 
     # Learn every group the bot sees so DM-to-group requests can name them.
     if chat.get("type") in ("group", "supergroup"):
@@ -1418,14 +1876,32 @@ def handle_update(upd):
     is_private = chat.get("type") == "private"
 
     cmd = parse_command(text)
-    if cmd and handle_command(chat_id, user_id, cmd, is_private, text):
+    if cmd and handle_command(chat_id, user_id, cmd, is_private, text,
+                               user_name):
         return
 
+    # Phase 4 (silent): track group membership and check for disclosure
+    # triggers. Nothing here posts in the group — approval asks and their
+    # answers go via private DM only (a "yes" typed in the group is
+    # ambiguous chat, never consent).
+    if mem is not None and not is_private:
+        mem.note_member(chat_id, user_id, user_name)
+        _maybe_trigger_disclosures(chat_id, text, msg.get("message_id"),
+                                   chat.get("title") or "this group",
+                                   allow_disclose=False)
+
     if is_private:
+        # Phase 4: DM answers to pending approval asks, then natural
+        # memory commands ("remember this ...", "forget ...").
+        if mem is not None and _resolve_dm_approval(user_id, text):
+            return
+        if mem is not None and _handle_memory_nl(chat_id, user_id,
+                                                  user_name, text):
+            return
         canned = canned_reply(text, chat_id)
         if canned is not None:
             # Zero-cost ack: no API call, still saved to history for context.
-            ron_ai._save_turn(chat_id, text, user_name, canned)
+            ron_ai._save_turn(chat_id, text, user_name, canned, user_id)
             send_rich_with_kb(chat_id, canned)
             return
         ai_reply(chat_id, user_id, user_name, text)
@@ -1441,11 +1917,31 @@ def handle_update(upd):
     replied_to_me = ((msg.get("reply_to_message") or {}).get("from") or {}).get("is_bot")
     if mentioned or replied_to_me:
         clean = text.replace("@" + BOT_USERNAME, "").strip()
+        # Phase 4: natural memory commands first.
+        if mem is not None and _handle_memory_nl(chat_id, user_id,
+                                                  user_name, clean or text):
+            return
+        # Phase 4 oversharing guard: Adwaith asking something personal in a
+        # group gets a private DM approval ask — never answered publicly
+        # without his explicit Yes.
+        if (user_id == OWNER_ID
+                and _MEM_MODULES and ron_privacy.looks_personal(clean or text)
+                and _start_overshare_approval(
+                    chat_id, user_id, user_name, clean or text,
+                    msg.get("message_id"), chat.get("title") or "this group")):
+            return
+        # The bot is engaged: consented facts may now disclose.
+        if mem is not None:
+            _maybe_trigger_disclosures(chat_id, clean or text,
+                                       msg.get("message_id"),
+                                       chat.get("title") or "this group",
+                                       allow_disclose=True)
         # Thread the reply so it's clear who Ron is answering.
         canned = canned_reply(clean or text, chat_id)
         if canned is not None:
             # Zero-cost ack: no API call, still saved to history for context.
-            ron_ai._save_turn(chat_id, clean or text, user_name, canned)
+            ron_ai._save_turn(chat_id, clean or text, user_name, canned,
+                              user_id)
             send_rich_with_kb(chat_id, canned,
                               reply_to=msg.get("message_id"),
                               thread_id=msg.get("message_thread_id"))
@@ -1484,6 +1980,11 @@ def handle_callback(query):
                 pass
         return
     if not data.startswith("q:"):
+        # Phase 4: private-DM approval buttons (mem:go:<pid> / mem:no:<pid>).
+        if _MEM_MODULES:
+            parsed = ron_privacy.parse_memory_callback(data)
+            if parsed:
+                _resolve_callback_approval(query, parsed[0], parsed[1])
         return
     msg = query.get("message") or {}
     chat = msg.get("chat") or {}
@@ -1540,6 +2041,11 @@ def save_offset(offset):
 def main():
     offset = load_offset()
     print(f"[ron_daemon] starting, offset={offset}", flush=True)
+    print(f"[ron_daemon] light mode "
+          f"{'ON (cheap routing, no streaming, daily notice)' if ron_ai.light_mode_enabled() else 'off'}",
+          flush=True)
+    # Phase 4: memory store (dual-write + recall hooks + approval sweeper).
+    init_memory()
     # Phase 3: heartbeat for the watchdog, startup provider health ping,
     # and the degraded-mode recovery worker.
     threading.Thread(target=_heartbeat_loop, daemon=True).start()

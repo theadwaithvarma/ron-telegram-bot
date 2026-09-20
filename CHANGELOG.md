@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.2.0 — 2026-09-20
+
+Privacy-first memory release: the bot now remembers per chat, encrypted at
+rest, with consent-gated disclosure — plus a lean light mode and Bot API
+10.3 rich buttons.
+
+- **Encrypted per-chat memory** (`ron_memory.py`, new) — SQLite with
+  Fernet encryption (key from `RON_MEMORY_KEY`; fails closed without it).
+  Strict isolation by `chat_id`: DM, group, and Business memories never
+  merge. Explicit facts only (`remember that…` / `forget that…`), local
+  FTS5 recall, raw messages expire after 30 days, `forget` wipes per chat,
+  nothing sensitive in logs
+- **Disclosure consent** (`ron_privacy.py`, new) — when a private fact
+  becomes relevant in a group, the bot says nothing publicly and DMs the
+  person for approval instead. Group-text "yes" never counts; consent is
+  scoped to one group + user + fact. The approval DM now renders as a
+  rich message with semantic buttons (✅ Yes = green, ❌ Keep private =
+  red), falling back to a classic keyboard if rich send fails
+- **Accidental-oversharing guard** — if the owner asks something personal
+  in a group, the bot asks for approval privately before answering
+  publicly. DMs bypass the guard
+- **Light mode** (`light_mode` in `ron_ai.json`) — cheap-model routing,
+  no draft streaming, single rich send per reply, one daily notice per
+  user. Built for heavy lifting, running lean on demand
+- **Bot API 10.3 rich message buttons** — `InputRichBlockButtons` blocks
+  where the bot owns the full message; styled inline keyboards stay where
+  the body is AI-generated markdown
+- New dependency: `cryptography` (memory encryption); everything else
+  remains stdlib. `RON_MEMORY_KEY` documented in `.env.example`
+
 ## 1.1.0 — 2026-09-20
 
 Self-sufficiency release: the multi-provider brain, token economy, and

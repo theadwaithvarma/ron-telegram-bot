@@ -1,4 +1,12 @@
 {
+  "light_mode": false,
+  "memory": {
+    "approval_timeout_secs": 900,
+    "enabled": true,
+    "recall_chars": 700,
+    "recall_limit": 3,
+    "retention_days": 30
+  },
   "model": "openai/gpt-oss-120b",
   "providers": [
     {

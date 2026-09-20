@@ -35,6 +35,13 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 - Greetings and small talk route to each provider's smallest model with a short prompt
 - Pure acknowledgements (`ok`, `lol`, `thanks`, `👍`) get instant canned replies — zero API calls
 - A failed stream never re-runs the whole provider chain; you get the honest error instead of a double token burn
+- **Light mode** (`light_mode` in `ron_ai.json`): cheap-model routing, no draft streaming, one rich send per reply — running lean on demand, built for heavy lifting
+
+### 🧠 Privacy-First Memory
+- **Encrypted per-chat memory** (`ron_memory.py`): SQLite + Fernet encryption at rest (key from `RON_MEMORY_KEY`; fails closed without it). Each chat's memory is strictly isolated — DM, group, and Business memories never merge
+- **Explicit facts only** — `remember that…` stores, `forget that…` wipes; local FTS5 recall, raw messages expire after 30 days, nothing sensitive in logs
+- **Disclosure consent** (`ron_privacy.py`): when a private fact comes up in a group, Ron says nothing publicly — it DMs the person for approval first. Group-text "yes" never counts; consent is scoped to one group + user + fact. Approval DMs render as rich messages with green/red semantic buttons
+- **Oversharing guard**: ask something personal in a group and Ron checks with you privately before answering publicly
 
 ### 🩺 Self-Healing
 - **Watchdog supervisor** (`ron_watchdog.py`): 60-second checks for dead or hung daemons, duplicate processes, and broken configs — with exponential restart backoff and last-known-good config restore (see `ron-watchdog.service.example` for systemd)
@@ -56,7 +63,7 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 - **DM-to-group pings** — `[send_group: Group Name | message]` posts your message in a group, mentioning you (fuzzy group-name resolution)
 - **Forum topic management** — detects forum status via cached `getChat`, auto-purges stale topics when a group disables them
 - `[topic: ...]` and `[send_topic: ...]` trailers for topic actions, with explicit confirmation before destructive deletes
-- **Quick-reply buttons** — `[buttons: Label | Label]` renders inline keyboards; tapping a button re-sends its label as your message
+- **Quick-reply buttons** — `[buttons: Label | Label]` renders keyboards; tapping a button re-sends its label as your message. Bot API 10.3 rich buttons where the bot owns the full message, styled inline keyboards elsewhere
 - **Contextual links** — `[links: Label -> https://...]` for clean inline references
 
 ### 👋 Ephemeral Welcomes
@@ -111,6 +118,7 @@ Everything comes from **environment variables** (see `.env.example`). A `.env` f
 | `BOT_USERNAME` | — | Bot username without `@` (default `ronrebootedbot`) |
 | `OWNER_ID` | — | Your Telegram user id — gets private alerts (e.g. dead API key) |
 | `SYSTEM_PROMPT` | — | Override the bot persona |
+| `RON_MEMORY_KEY` | — | Fernet key for memory encryption at rest — memory fails closed without it |
 | `RON_BOT_DIR` | — | Watchdog only: bot install dir (default: watchdog's own directory) |
 
 The failover chain itself (providers and their model ladders) lives in `ron_ai.json` — edit it to re-tune without touching code.
@@ -126,6 +134,8 @@ ron-telegram-bot/
 ├── ron_daemon.py      # Long-polling daemon — routing, commands, trailer handlers, degraded mode
 ├── ron_ai.py          # Multi-provider chat backend — failover, cheap routing, history
 ├── ron_ai.json        # Provider/model chain config (no secrets)
+├── ron_memory.py      # Encrypted per-chat memory (SQLite + Fernet, FTS5 recall)
+├── ron_privacy.py     # Disclosure consent + oversharing guard
 ├── ron_watchdog.py    # Supervisor — restarts dead/hung daemons, repairs broken configs
 ├── ron-watchdog.service.example  # systemd unit template for the watchdog
 ├── config.py          # Env-var config + .env loader (stdlib only)
@@ -133,10 +143,10 @@ ron-telegram-bot/
 ├── rich_send.py       # Native rich message sender with plain-text fallback
 ├── ephemeral_send.py  # Private ephemeral messages (welcomes)
 ├── delete_messages.py # Message deletion helper
-├── requirements.txt   # stdlib only — no third-party deps (Python 3.8+)
+├── requirements.txt   # cryptography (memory encryption); rest is stdlib (Python 3.8+)
 ├── .env.example       # Template for required/optional config
 ├── CHANGELOG.md       # Version history
-└── VERSION            # Current version (1.1.0)
+└── VERSION            # Current version (1.2.0)
 ```
 
 ---

@@ -41,6 +41,28 @@ Source: https://core.telegram.org/bots and https://core.telegram.org/bots/featur
 - `can_send_welcome_messages` admin right exists (native welcome messages —
   needs admin; our ephemeral welcome works without admin, keep it).
 
+## Rich message buttons (Bot API 10.3, Aug 2026 — adopted 2026-09-20)
+
+- `RichMessageButton`: a button inside a `RichMessage`, sent as an
+  `InputRichBlockButtons` block: `{"type":"buttons",
+  "buttons":[RichMessageButton,...],"align":"left"}` — 1–8 buttons per
+  row, align left/center/right. Requires the blocks form of
+  `rich_message` (`{"blocks":[...]}`); exactly-one of html/markdown/blocks.
+- Button text may hold plain text, custom emoji, and date-time entities.
+  Styles: `danger` (red), `success` (green), `primary` (blue), `link`
+  (`link` only with `callback_data`). Exactly one action required;
+  callback_data 1–64 bytes. Callbacks arrive as normal callback_query
+  updates — no plumbing change.
+- Inline keyboards ALSO accept `style` (danger/success/primary; no `link`)
+  via `reply_markup` — works on rich messages too.
+- Our "whenever necessary" rule: rich buttons where the bot owns the full
+  message (privacy approval DM: text block + buttons block, Yes=success /
+  No=danger, with classic-keyboard fallback). AI-generated markdown
+  replies keep the styled inline keyboard via reply_markup (converting
+  markdown→blocks is out of scope).
+- Text block shape: `{"type":"text","text":{"type":"text","text":"..."}}`
+  (RichText union: `type:"text"` plain, `type:"button"` for RichTextButton).
+
 ## Privacy mode
 - Group bots see only relevant messages, but **all service messages**
   (incl. `new_chat_members`) arrive regardless — our welcome hook is safe.

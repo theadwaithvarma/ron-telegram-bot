@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Ron AI backend — OpenAI-compatible chat completions for the Telegram bot.
 
-Reads provider API keys from the environment (GROQ_API_KEY, GEMINI_API_KEY,
-OPENROUTER_API_KEY); config.py loads .env automatically when present.
-A provider with no key set is skipped silently — the bot runs on whatever
-providers are keyed.
+Reads the API key from the Secure Vault (custom.groq) as a surrogate;
+Sentinel/authd swaps it into the Authorization header on egress.
 """
 import json
 import os
@@ -13,15 +11,15 @@ import sys
 import threading
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# Importing config loads .env as a side effect, so the env-based provider
-# keys below work whether the process inherited them or read them from .env.
-from config import BASE_DIR
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+from dynamic_credentials import dynamic_credential_entry, DynamicCredentialError
 
-DIR = str(BASE_DIR)
-CONFIG_FILE = str(BASE_DIR / "ron_ai.json")
-HISTORY_FILE = str(BASE_DIR / "ron_ai_history.json")
+HOME = os.path.expanduser("~")
+DIR = os.path.join(HOME, "workspace", "telegram-bot")
+CONFIG_FILE = os.path.join(DIR, "ron_ai.json")
+HISTORY_FILE = os.path.join(DIR, "ron_ai_history.json")
 MAX_HISTORY = 12          # messages (user+assistant turns) kept per chat
 MAX_REPLY = 3500          # chars — Telegram-friendly cap
 # NOTE 2026-09-20: gpt-oss is a reasoning model — its hidden thinking trace
@@ -39,6 +37,9 @@ MAX_TOKENS = 2048
 DEFAULT_CONFIG = {
     "base_url": "https://api.groq.com/openai/v1",
     "model": "openai/gpt-oss-120b",  # legacy: providers list is authoritative
+    # Light mode (2026-09-20): run lean — cheap routing for every message,
+    # no draft streaming, and a daily light-mode notice on interaction.
+    "light_mode": False,
     "system": (
         "You are Ron, a friendly AI assistant chatting on Telegram "
         "as @ronrebootedbot. You talk like a tough-love mentor: direct, "
@@ -125,22 +126,25 @@ COOLDOWN_AFTER_RATELIMIT_SECS = 30.0
 
 # Multi-provider failover (2026-09-20): the bot no longer depends on a
 # single AI backend. Providers are tried in order; each one needs its key
-# in the corresponding env var (see _KEY_ENV_VARS). A provider with
+# in the vault (dynamic_credential_entry("custom.<name>")). A provider with
 # no key is skipped silently, so the bot runs fine on Groq alone until
 # Gemini/OpenRouter keys are added. Every endpoint below is
 # OpenAI-compatible (/chat/completions, Bearer auth, SSE streaming).
 PROVIDER_DEFS = {
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
+        "key_slot": "custom.groq",
         "extra_headers": {},
     },
     "gemini": {
         # Google's OpenAI-compatible endpoint (key from AI Studio, free tier)
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "key_slot": "custom.gemini",
         "extra_headers": {},
     },
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
+        "key_slot": "custom.openrouter",
         "extra_headers": {
             "HTTP-Referer": "https://t.me/ronrebootedbot",
             "X-Title": "Ron Telegram Bot",
@@ -188,6 +192,13 @@ STREAM_STALL_SECS = 90.0
 STREAM_TOTAL_SECS = 600.0
 # Guards history read-modify-write: every reply thread shares one file.
 _HIST_LOCK = threading.RLock()
+# Phase 4 (memory DB): the daemon sets these after init. MEMORY_HOOK gets
+# every completed turn for dual-write (JSON + SQLite stay in lockstep);
+# MEMORY_RECALL_HOOK(chat_id, user_text, is_private) returns a short
+# context string (or "") to append to the system prompt. Both are best
+# effort — memory must never break a reply.
+MEMORY_HOOK = None
+MEMORY_RECALL_HOOK = None
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
@@ -200,21 +211,14 @@ def _model_not_found(body):
                              or "invalid model" in b)
 
 
-# Env var holding each provider's API key. A provider whose var is unset
-# or empty is skipped silently — no error, no log spam.
-_KEY_ENV_VARS = {
-    "groq": "GROQ_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-}
-
-
 def _provider_key(name):
-    """API key for a provider from its env var, or None if not set."""
-    env_var = _KEY_ENV_VARS.get(name)
-    if not env_var:
+    """Vault surrogate for a provider, or None if its key isn't connected."""
+    slot = PROVIDER_DEFS[name]["key_slot"]
+    try:
+        entry = dynamic_credential_entry(slot)
+        return str(entry["surrogate"]).strip()
+    except DynamicCredentialError:
         return None
-    return os.environ.get(env_var, "").strip() or None
 
 
 class _PooledResponse:
@@ -308,7 +312,7 @@ def _request(cfg, messages, stream, timeout, cheap=False):
             continue
         key = _provider_key(name)
         if not key:
-            continue  # key env var not set — skip provider silently
+            continue  # key not in the vault yet — skip provider silently
         any_key = True
         with _rate_limit_lock:
             wait = _provider_cooldown.get(name, 0.0) - now
@@ -394,6 +398,13 @@ def _request(cfg, messages, stream, timeout, cheap=False):
                     attempt += 1
                     continue
                 break
+            except DynamicCredentialError as e:
+                _API_SEMAPHORE.release()
+                # Surrogate went stale mid-run — treat as keyless provider.
+                last_err = e
+                while i < len(plan) and plan[i][0] == name:
+                    i += 1
+                break
             else:
                 return _PooledResponse(raw)
     if saw_rate_limit:
@@ -404,7 +415,7 @@ def _request(cfg, messages, stream, timeout, cheap=False):
 def probe_providers(timeout=15):
     """Cheap per-provider health check (Phase 3 watchdog/degraded mode).
 
-    GETs /models on each keyed provider — validates the provider's API key and
+    GETs /models on each keyed provider — validates the vault key and
     reachability through the same egress path chat completions use, without
     spending any tokens. Returns {name: (ok: bool, detail: str)}.
     """
@@ -412,7 +423,7 @@ def probe_providers(timeout=15):
     for name, spec in PROVIDER_DEFS.items():
         key = _provider_key(name)
         if not key:
-            out[name] = (False, "no key in env")
+            out[name] = (False, "no key in vault")
             continue
         url = spec["base_url"].rstrip("/") + "/models"
         req = urllib.request.Request(url, headers={"User-Agent": _UA})
@@ -442,6 +453,58 @@ def load_config():
     return cfg
 
 
+# Light mode: the user-facing day boundary is IST, and the notice ledger
+# lives next to the config. Best effort — a notice must never break a reply.
+IST = timezone(timedelta(hours=5, minutes=30))
+_LIGHT_NOTICE_FILE = os.path.join(DIR, "light_mode_notices.json")
+_light_notice_lock = threading.Lock()
+
+
+def light_mode_enabled(cfg=None):
+    """True when the bot should run lean (cheap models, no streaming)."""
+    if cfg is None:
+        cfg = load_config()
+    return bool(cfg.get("light_mode"))
+
+
+def _use_cheap(user_text, cfg):
+    """Cheap routing: trivial small-talk, or every message in light mode."""
+    return _looks_trivial(user_text) or bool(cfg.get("light_mode"))
+
+
+def light_mode_notice(user_id, state_file=None):
+    """Footer mentioning light mode, at most once per user per IST day.
+
+    Returns the notice text (with leading blank line) or "" when the user
+    already saw it today. Corrupt/missing ledger -> notice again, never fail.
+    """
+    if not user_id:
+        return ""
+    path = state_file or _LIGHT_NOTICE_FILE
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    key = str(user_id)
+    with _light_notice_lock:
+        try:
+            with open(path) as f:
+                seen = json.load(f)
+            if not isinstance(seen, dict):
+                seen = {}
+        except Exception:
+            seen = {}
+        if seen.get(key) == today:
+            return ""
+        seen[key] = today
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(seen, f)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+    return ("\n\n💡 _Light mode is on — running lean right now, but I'm built "
+            "for heavier lifting. Full power soon._")
+
+
 def load_history():
     try:
         with open(HISTORY_FILE) as f:
@@ -450,12 +513,13 @@ def load_history():
         return {}
 
 
-def _save_turn(chat_id, user_text, user_name, reply):
+def _save_turn(chat_id, user_text, user_name, reply, user_id=0):
     """Append one completed turn to history, thread-safely.
 
     Re-reads under a lock so two concurrent replies in the same chat can't
     clobber each other's turns, and writes atomically (tmp+rename) so a
-    crash mid-write never leaves a torn JSON file.
+    crash mid-write never leaves a torn JSON file. Also dual-writes the
+    turn to the Phase 4 memory DB via MEMORY_HOOK (best effort).
     """
     with _HIST_LOCK:
         hist = load_history()
@@ -465,6 +529,11 @@ def _save_turn(chat_id, user_text, user_name, reply):
         turns.append({"role": "assistant", "content": reply})
         hist[ck] = turns[-MAX_HISTORY:]
         _write_history(hist)
+    if MEMORY_HOOK is not None:
+        try:
+            MEMORY_HOOK(chat_id, user_id, user_name, user_text, reply)
+        except Exception:
+            pass
 
 
 def _write_history(hist):
@@ -481,7 +550,8 @@ def save_history(hist):
     _write_history(hist)
 
 
-def chat(chat_id, user_text, user_name="there", system_extra=""):
+def chat(chat_id, user_text, user_name="there", system_extra="",
+         user_id=0, is_private=True):
     """One conversational turn. Returns the assistant's reply text."""
     cfg = load_config()
     hist = load_history()
@@ -490,21 +560,33 @@ def chat(chat_id, user_text, user_name="there", system_extra=""):
     turns.append({"role": "user", "content": f"[{user_name}]: {user_text}"})
     turns = turns[-MAX_HISTORY:]
     # Token economy: greetings/small-talk get the small model + short prompt.
-    cheap = _looks_trivial(user_text)
+    # Light mode forces cheap routing for every message.
+    cheap = _use_cheap(user_text, cfg)
+    # Phase 4: bounded memory recall injected into the prompt (skipped for
+    # cheap small-talk — nothing worth recalling there).
+    mem_extra = ""
+    if MEMORY_RECALL_HOOK is not None and not cheap:
+        try:
+            mem_extra = MEMORY_RECALL_HOOK(chat_id, user_text, is_private) or ""
+        except Exception:
+            mem_extra = ""
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
-              else cfg["system"]) + (system_extra or "")
+              else cfg["system"]) + (system_extra or "") + mem_extra
     messages = [{"role": "system", "content": system}] + turns
 
-    # 120s: reasoning models can think a while before the first token
-    resp = _request(cfg, messages, stream=False, timeout=120, cheap=cheap)
-    with resp:
-        data = json.loads(resp.read().decode())
+    try:
+        # 120s: reasoning models can think a while before the first token
+        resp = _request(cfg, messages, stream=False, timeout=120, cheap=cheap)
+        with resp:
+            data = json.loads(resp.read().decode())
+    except DynamicCredentialError:
+        raise RuntimeError("AI key not connected yet")
 
     reply = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
     if not reply:
         raise RuntimeError("AI backend returned empty reply")
     reply = reply[:MAX_REPLY]
-    _save_turn(chat_id, user_text, user_name, reply)
+    _save_turn(chat_id, user_text, user_name, reply, user_id)
     return reply
 
 
@@ -513,7 +595,7 @@ if __name__ == "__main__":
 
 
 def chat_stream(chat_id, user_text, user_name="there", on_token=None,
-               stop_event=None, system_extra=""):
+               stop_event=None, system_extra="", user_id=0, is_private=True):
     """Streaming conversational turn. Calls on_token(chunk) per token as the
     model generates. If stop_event is set, generation halts early.
     Returns the assistant's full reply text."""
@@ -524,12 +606,23 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     turns.append({"role": "user", "content": f"[{user_name}]: {user_text}"})
     turns = turns[-MAX_HISTORY:]
     # Token economy: greetings/small-talk get the small model + short prompt.
-    cheap = _looks_trivial(user_text)
+    # Light mode forces cheap routing for every message.
+    cheap = _use_cheap(user_text, cfg)
+    # Phase 4: bounded memory recall (skipped for cheap small-talk).
+    mem_extra = ""
+    if MEMORY_RECALL_HOOK is not None and not cheap:
+        try:
+            mem_extra = MEMORY_RECALL_HOOK(chat_id, user_text, is_private) or ""
+        except Exception:
+            mem_extra = ""
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
-              else cfg["system"]) + (system_extra or "")
+              else cfg["system"]) + (system_extra or "") + mem_extra
     messages = [{"role": "system", "content": system}] + turns
 
-    resp = _request(cfg, messages, stream=True, timeout=120, cheap=cheap)
+    try:
+        resp = _request(cfg, messages, stream=True, timeout=120, cheap=cheap)
+    except DynamicCredentialError:
+        raise RuntimeError("AI key not connected yet")
 
     parts = []
     start = time.time()
@@ -586,5 +679,5 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     if not reply:
         raise RuntimeError("AI backend returned empty reply")
     reply = reply[:MAX_REPLY]
-    _save_turn(chat_id, user_text, user_name, reply)
+    _save_turn(chat_id, user_text, user_name, reply, user_id)
     return reply

@@ -15,3 +15,4 @@ ron_ai.json.good
 business_connections.json
 *.log
 .venv/
+ron_memory.db*
