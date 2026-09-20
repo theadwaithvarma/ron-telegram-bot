@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+ron_daemon.offset
+ron_ai_history.json
+history.jsonl
+known_groups.json
+known_topics.json
+state.json
+*.log
+.venv/

@@ -1,0 +1,2 @@
+# Ron Telegram bot — stdlib only, no third-party deps.
+# Python 3.8+ (uses only urllib, json, threading, signal).
