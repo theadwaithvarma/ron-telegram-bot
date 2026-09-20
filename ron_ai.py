@@ -20,7 +20,17 @@ HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, "workspace", "telegram-bot")
 CONFIG_FILE = os.path.join(DIR, "ron_ai.json")
 HISTORY_FILE = os.path.join(DIR, "ron_ai_history.json")
-MAX_HISTORY = 12          # messages (user+assistant turns) kept per chat
+# Phase 6 — rolling history summaries (2026-09-20). The JSON store keeps
+# up to HISTORY_STORE_MAX raw turns per chat; past SUMMARY_ROLLOVER_AT
+# stored turns the oldest half is folded into an encrypted per-chat
+# summary (MEMORY_SUMMARY_* hooks, wired by the daemon to ron_memory's
+# chat_meta table). Each request then carries only the bounded summary +
+# the PROMPT_RECENT most recent verbatim turns — far cheaper than the
+# old "full raw history every turn" (MAX_HISTORY).
+HISTORY_STORE_MAX = 48   # raw turns kept per chat in the JSON store
+SUMMARY_ROLLOVER_AT = 40  # fold oldest half into the summary past this
+PROMPT_RECENT = 15        # verbatim recent turns sent with each request
+SUMMARY_MAX_CHARS = 1200  # cap on the summary injected into the prompt
 MAX_REPLY = 3500          # chars — Telegram-friendly cap
 # NOTE 2026-09-20: gpt-oss is a reasoning model — its hidden thinking trace
 # streams as reasoning chunks and counts against max_tokens. 800 was so small
@@ -199,6 +209,11 @@ _HIST_LOCK = threading.RLock()
 # effort — memory must never break a reply.
 MEMORY_HOOK = None
 MEMORY_RECALL_HOOK = None
+# Phase 6 (rolling summaries): wired by the daemon to the encrypted
+# per-chat chat_meta table in ron_memory.py — summaries must never live
+# in a new plaintext store.
+MEMORY_SUMMARY_GET = None  # fn(chat_id) -> str | None
+MEMORY_SUMMARY_SET = None  # fn(chat_id, text) -> None
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
@@ -527,7 +542,7 @@ def _save_turn(chat_id, user_text, user_name, reply, user_id=0):
         turns = hist.get(ck, [])
         turns.append({"role": "user", "content": f"[{user_name}]: {user_text}"})
         turns.append({"role": "assistant", "content": reply})
-        hist[ck] = turns[-MAX_HISTORY:]
+        hist[ck] = turns[-HISTORY_STORE_MAX:]
         _write_history(hist)
     if MEMORY_HOOK is not None:
         try:
@@ -550,15 +565,126 @@ def save_history(hist):
     _write_history(hist)
 
 
+# -- Phase 6: rolling history summaries ---------------------------------
+_SUMMARIZER_SYSTEM = (
+    "Summarize this older chat history in the third person for "
+    "conversation continuity. Keep topics, names, decisions and open "
+    "threads; drop verbatim private details beyond what's needed for "
+    "continuity. Plain text, no headers, ~250 words max.")
+
+
+def _load_summary(chat_id):
+    """Best-effort fetch of this chat's rolling summary. "" on any failure.
+
+    The hook is None-safe and exception-safe: a summary must never break
+    a reply.
+    """
+    hook = MEMORY_SUMMARY_GET
+    if hook is None:
+        return ""
+    try:
+        return hook(str(chat_id)) or ""
+    except Exception:
+        return ""
+
+
+def _prompt_turns(chat_id, user_text, user_name):
+    """Assemble the history window for one prompt: rolling summary +
+    the PROMPT_RECENT most recent raw turns.
+
+    The JSON store keeps up to HISTORY_STORE_MAX raw turns per chat; once
+    stored turns pass SUMMARY_ROLLOVER_AT the oldest half is folded into
+    the summary (see _maybe_rollover), so the prompt only ever carries a
+    bounded summary plus PROMPT_RECENT verbatim turns.
+    Returns (turns, summary).
+    """
+    hist = load_history()
+    stored = hist.get(str(chat_id), [])
+    summary = _load_summary(chat_id)
+    if len(stored) > SUMMARY_ROLLOVER_AT:
+        summary = _maybe_rollover(chat_id, stored, summary)
+    turns = list(stored)
+    turns.append({"role": "user", "content": f"[{user_name}]: {user_text}"})
+    return turns[-PROMPT_RECENT:], summary
+
+
+def _maybe_rollover(chat_id, stored, prior_summary):
+    """Fold the oldest half of a chat's stored turns into its summary.
+
+    Reads history fresh under the lock (another reply thread may have
+    written since we last looked) and re-verifies before writing back.
+    The network summarization happens OUTSIDE the lock so the JSON file
+    is never held during I/O. On ANY exception: returns the prior
+    summary and leaves history untouched (silent fallback to the old
+    full-history behavior). Never calls _save_turn.
+    """
+    ck = str(chat_id)
+    try:
+        with _HIST_LOCK:
+            fresh = load_history().get(ck, [])
+            if len(fresh) <= SUMMARY_ROLLOVER_AT:
+                return prior_summary
+            oldest = list(fresh[:len(fresh) // 2])
+        cfg = load_config()
+        chunk = _summarize_via_cheap(cfg, oldest, prior_summary)
+        if not chunk:
+            return prior_summary
+        tail = (((prior_summary or "") + "\n") if prior_summary else "") + chunk
+        # Keep the most recent end: the latest turns matter most.
+        new_summary = tail[-SUMMARY_MAX_CHARS:]
+        with _HIST_LOCK:
+            hist = load_history()
+            cur = hist.get(ck, [])
+            if len(cur) <= SUMMARY_ROLLOVER_AT:
+                return prior_summary  # another thread rolled over already
+            keep = cur[len(cur) // 2:]
+            hook = MEMORY_SUMMARY_SET
+            if hook is not None:
+                hook(ck, new_summary)
+            hist[ck] = keep[-HISTORY_STORE_MAX:]
+            _write_history(hist)
+        return new_summary
+    except Exception:
+        return prior_summary
+
+
+def _summarize_via_cheap(cfg, old_turns, prior_summary):
+    """Summarize one chat's oldest turns into a bounded chunk.
+
+    Privacy: only THIS chat's turns are ever sent — never another chat's
+    content. The request reuses the cheap-model/provider-chain machinery
+    (_request with cheap=True). Returns the summary chunk (str) or None
+    on empty reply / any exception.
+    """
+    lines = []
+    for t in old_turns or []:
+        lines.append(f"{t.get('role', '?')}: {t.get('content', '')}")
+    blob = "\n".join(lines)[:4000]
+    prior = (prior_summary or "").strip()
+    body = ((prior + "\n\n") if prior else "") \
+        + "Older messages to fold in:\n" + blob
+    messages = [{"role": "system", "content": _SUMMARIZER_SYSTEM},
+                {"role": "user", "content": body}]
+    try:
+        resp = _request(cfg, messages, stream=False, timeout=60, cheap=True)
+        with resp:
+            data = json.loads(resp.read().decode())
+        chunk = ((data.get("choices") or [{}])[0]
+                 .get("message", {}).get("content", "")).strip()
+        if not chunk:
+            return None
+        return chunk[:1500]
+    except Exception:
+        return None
+
+
 def chat(chat_id, user_text, user_name="there", system_extra="",
          user_id=0, is_private=True):
     """One conversational turn. Returns the assistant's reply text."""
     cfg = load_config()
-    hist = load_history()
-    ck = str(chat_id)
-    turns = hist.get(ck, [])
-    turns.append({"role": "user", "content": f"[{user_name}]: {user_text}"})
-    turns = turns[-MAX_HISTORY:]
+    # Phase 6: rolling summary + the PROMPT_RECENT most recent raw turns,
+    # not the full raw history every call.
+    turns, summary = _prompt_turns(chat_id, user_text, user_name)
     # Token economy: greetings/small-talk get the small model + short prompt.
     # Light mode forces cheap routing for every message.
     cheap = _use_cheap(user_text, cfg)
@@ -570,8 +696,13 @@ def chat(chat_id, user_text, user_name="there", system_extra="",
             mem_extra = MEMORY_RECALL_HOOK(chat_id, user_text, is_private) or ""
         except Exception:
             mem_extra = ""
+    # Prompt budget: system (~2600 full / ~270 cheap) + summary (<=1200) +
+    # PROMPT_RECENT verbatim turns + bounded recall — far under the old
+    # full-history cost; the store keeps <=48 raw turns per chat.
+    summary_block = ("\n[Earlier in this chat — summarized for continuity:]\n"
+                     + summary + "\n") if summary else ""
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
-              else cfg["system"]) + (system_extra or "") + mem_extra
+              else cfg["system"]) + summary_block + (system_extra or "") + mem_extra
     messages = [{"role": "system", "content": system}] + turns
 
     try:
@@ -600,11 +731,9 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     model generates. If stop_event is set, generation halts early.
     Returns the assistant's full reply text."""
     cfg = load_config()
-    hist = load_history()
-    ck = str(chat_id)
-    turns = hist.get(ck, [])
-    turns.append({"role": "user", "content": f"[{user_name}]: {user_text}"})
-    turns = turns[-MAX_HISTORY:]
+    # Phase 6: rolling summary + the PROMPT_RECENT most recent raw turns,
+    # not the full raw history every call.
+    turns, summary = _prompt_turns(chat_id, user_text, user_name)
     # Token economy: greetings/small-talk get the small model + short prompt.
     # Light mode forces cheap routing for every message.
     cheap = _use_cheap(user_text, cfg)
@@ -615,8 +744,13 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
             mem_extra = MEMORY_RECALL_HOOK(chat_id, user_text, is_private) or ""
         except Exception:
             mem_extra = ""
+    # Prompt budget: system (~2600 full / ~270 cheap) + summary (<=1200) +
+    # PROMPT_RECENT verbatim turns + bounded recall — far under the old
+    # full-history cost; the store keeps <=48 raw turns per chat.
+    summary_block = ("\n[Earlier in this chat — summarized for continuity:]\n"
+                     + summary + "\n") if summary else ""
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
-              else cfg["system"]) + (system_extra or "") + mem_extra
+              else cfg["system"]) + summary_block + (system_extra or "") + mem_extra
     messages = [{"role": "system", "content": system}] + turns
 
     try:

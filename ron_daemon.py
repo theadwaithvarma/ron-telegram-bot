@@ -25,6 +25,12 @@ import urllib.parse
 sys.path.insert(0, os.path.join(os.path.expanduser("~"), "workspace", "telegram-bot"))
 import ron_ai
 import rich_send as rich_mod
+# Phase 6: semantic answer cache. None-safe — the bot replies normally
+# (just without caching) if the module ever fails to import.
+try:
+    import ron_cache
+except Exception:
+    ron_cache = None
 
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 from dynamic_credentials import dynamic_credential_entry, read_json_response
@@ -323,6 +329,18 @@ except Exception as _mem_import_err:
           flush=True)
 mem = None
 
+# Phase 6: thread-local flag set by _memory_context when the prompt for
+# THIS reply injected a consented cross-chat fact ("(approved to share
+# here)"). Replies built on another chat's private facts must never be
+# cached — the disclosure path bypasses the cache entirely. ai_reply runs
+# each reply on its own worker thread, and _memory_context runs on that
+# same thread via MEMORY_RECALL_HOOK, so a thread-local is race-free.
+_CONSENT_DISCLOSED = threading.local()
+
+
+def _consent_disclosed():
+    return bool(getattr(_CONSENT_DISCLOSED, "flag", False))
+
 
 def _mem_cfg():
     try:
@@ -350,6 +368,16 @@ def init_memory():
         return
     ron_ai.MEMORY_HOOK = _memory_dual_write
     ron_ai.MEMORY_RECALL_HOOK = _memory_context
+    # Phase 6: rolling history summaries live in the encrypted per-chat
+    # memory DB (chat_meta table), never in a separate plaintext store.
+    # The lambdas resolve the `mem` global at call time, so they stay
+    # correct even if the store is recreated.
+    ron_ai.MEMORY_SUMMARY_GET = (
+        lambda chat_id: mem.get_meta(str(chat_id), "summary")
+        if mem is not None else None)
+    ron_ai.MEMORY_SUMMARY_SET = (
+        lambda chat_id, text: mem.set_meta(str(chat_id), "summary", text)
+        if mem is not None else None)
     threading.Thread(target=_approval_sweeper, daemon=True).start()
     print("[ron_daemon] memory: enabled", flush=True)
 
@@ -392,6 +420,10 @@ def _memory_context(chat_id, user_text, is_private):
             for _uid, ftext in mem.consented_facts(str(chat_id)):
                 if ron_privacy.topic_matches(user_text, ftext):
                     bits.append("- (approved to share here) " + ftext[:200])
+                    # Phase 6: this reply is built on another chat's
+                    # private fact — mark it so the answer cache refuses
+                    # to store it (disclosure path bypasses cache).
+                    _CONSENT_DISCLOSED.flag = True
         if not bits:
             return ""
         return ("\nRelevant memory from this chat:\n"
@@ -546,9 +578,11 @@ def _apply_approval(pending, approved):
             mem.set_pending_status(pid, "approved")
             _link_overshare_consent(gid, uid, question)
             # Answer in the group, once, as a reply to his message.
+            # Phase 6: cacheable=False — this answer may draw on personal
+            # DM facts, so it must never be served from the answer cache.
             ai_reply(gid, uid, pending.get("target_name") or "there",
                      question, private=False,
-                     reply_to=pending["group_message_id"])
+                     reply_to=pending["group_message_id"], cacheable=False)
             _dm(uid, "Answering in the group ✓")
             print(f"[ron_daemon] overshare: approved, answering "
                   f"(group={gid})", flush=True)
@@ -627,6 +661,14 @@ def _clear_json_history(chat_id):
         hist = ron_ai.load_history()
         hist.pop(str(chat_id), None)
         ron_ai.save_history(hist)
+    except Exception:
+        pass
+    # Phase 6: the rolling summary is part of this chat's memory — a full
+    # wipe clears it too. (wipe_chat already deletes chat_meta rows; this
+    # covers any path that clears the JSON history on its own.)
+    try:
+        if mem is not None:
+            mem.set_meta(str(chat_id), "summary", "")
     except Exception:
         pass
 
@@ -1675,11 +1717,47 @@ def stream_ai_reply(chat_id, user_id, user_name, text):
     handle_group_sends(chat_id, user_id, user_name, reply)
     handle_send_topic(chat_id, user_id, user_name, reply)
     handle_topic_actions(chat_id, user_name, reply)
-    return True
+    # Phase 6: return the reply text (truthy, like the old True) so the
+    # caller can store it in the answer cache.
+    return reply
+
+
+# Phase 6 — semantic answer cache helpers. All None-safe: if the cache
+# module is unavailable the bot just replies via the AI chain as before.
+def _cache_lookup(chat_id, text):
+    """Return a cached reply for a semantically equivalent question, or
+    None. Never raises — a cache failure must never break a reply."""
+    if ron_cache is None:
+        return None
+    try:
+        return ron_cache.lookup(chat_id, text)
+    except Exception as e:
+        print(f"[ron_daemon] cache lookup failed: {type(e).__name__}",
+              flush=True)
+        return None
+
+
+def _cache_store(chat_id, text, reply, cacheable):
+    """Store a successful AI reply for future equivalent questions.
+
+    Skipped when: caching was disabled for this call (overshare-approval
+    answers), the prompt injected another chat's consented private fact
+    (disclosure path bypasses the cache entirely), or the reply is an
+    error/degraded notice (only call this on the success paths).
+    """
+    if ron_cache is None or not cacheable:
+        return
+    if _consent_disclosed():
+        return
+    try:
+        ron_cache.store(chat_id, text, reply)
+    except Exception as e:
+        print(f"[ron_daemon] cache store failed: {type(e).__name__}",
+              flush=True)
 
 
 def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
-           thread_id=None, business_connection_id=None):
+           thread_id=None, business_connection_id=None, cacheable=True):
     """Run the LLM call off the poll loop so updates keep flowing."""
     def _go():
         cur = threading.current_thread()
@@ -1693,9 +1771,35 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                                        business_connection_id)
                 return
             try:
+                # Phase 6: semantic answer cache — serve a recent
+                # semantically-equivalent answer without burning API
+                # tokens. Reset the disclosure flag: _memory_context sets
+                # it on this thread when the prompt for the reply below
+                # injects another chat's consented private fact, and such
+                # replies must never be cached.
+                _CONSENT_DISCLOSED.flag = False
                 # Light mode (2026-09-20): run lean — cheap models for every
                 # message, no draft streaming, daily notice on interaction.
                 lm = ron_ai.light_mode_enabled()
+                if cacheable:
+                    cached = _cache_lookup(chat_id, text)
+                    if cached is not None:
+                        if lm:
+                            cached += ron_ai.light_mode_notice(user_id)
+                        send_rich_with_kb(chat_id, cached, reply_to,
+                                          thread_id, business_connection_id)
+                        handle_group_sends(chat_id, user_id, user_name,
+                                           cached)
+                        handle_send_topic(chat_id, user_id, user_name,
+                                          cached)
+                        handle_topic_actions(
+                            chat_id, user_name, cached,
+                            origin_group_id=None if private else chat_id,
+                            origin_thread_id=(None if private
+                                              else thread_id))
+                        print(f"[ron_daemon] cache hit (chat={chat_id})",
+                              flush=True)
+                        return
                 extra = group_context()
                 if not private and _MEM_MODULES:
                     # Phase 4 backstop: the deterministic tripwire catches
@@ -1713,8 +1817,12 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 # Light mode also skips streaming: single cheap send instead.
                 if private and not business_connection_id and not lm:
                     try:
-                        stream_ai_reply(chat_id, user_id, user_name, text)
+                        reply = stream_ai_reply(chat_id, user_id, user_name,
+                                                text)
                         _record_brain_success()
+                        # Phase 6: cache the successful reply (before any
+                        # light-mode footer) for equivalent future questions.
+                        _cache_store(chat_id, text, reply, cacheable)
                         return
                     except Exception as e:
                         emsg = str(e)
@@ -1750,6 +1858,9 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                                     system_extra=extra, user_id=user_id,
                                     is_private=private)
                 _record_brain_success()
+                # Phase 6: cache the successful reply (before the
+                # light-mode footer, which is per-user/per-day).
+                _cache_store(chat_id, text, reply, cacheable)
             except Exception as e:
                 msg = str(e)
                 if _is_systemic(msg):

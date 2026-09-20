@@ -35,6 +35,8 @@ Ron is a **full-featured conversational Telegram AI bot** that feels less like a
 - Greetings and small talk route to each provider's smallest model with a short prompt
 - Pure acknowledgements (`ok`, `lol`, `thanks`, `👍`) get instant canned replies — zero API calls
 - A failed stream never re-runs the whole provider chain; you get the honest error instead of a double token burn
+- **Semantic answer cache** (`ron_cache.py`) — repeat or paraphrased questions are answered from a per-chat local cache (token-set similarity, no embeddings, no new deps): 24h TTL, 200-entry LRU per chat, freshness-sensitive questions never cached
+- **Rolling history summaries** — once a chat's raw history passes 40 turns, the oldest half is folded into an encrypted per-chat summary by the cheap model; prompts carry summary + last 15 turns instead of unbounded history
 - **Light mode** (`light_mode` in `ron_ai.json`): cheap-model routing, no draft streaming, one rich send per reply — running lean on demand, built for heavy lifting
 
 ### 🧠 Privacy-First Memory
@@ -133,6 +135,7 @@ Runtime state files (`ron_daemon.offset`, `ron_ai_history.json`, `ron_heartbeat.
 ron-telegram-bot/
 ├── ron_daemon.py      # Long-polling daemon — routing, commands, trailer handlers, degraded mode
 ├── ron_ai.py          # Multi-provider chat backend — failover, cheap routing, history
+├── ron_cache.py       # Phase 6 semantic answer cache (stdlib only, per-chat SQLite)
 ├── ron_ai.json        # Provider/model chain config (no secrets)
 ├── ron_memory.py      # Encrypted per-chat memory (SQLite + Fernet, FTS5 recall)
 ├── ron_privacy.py     # Disclosure consent + oversharing guard

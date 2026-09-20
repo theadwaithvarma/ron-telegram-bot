@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.4.0 — 2026-09-20
+
+Token savings round two: the bot now skips API calls for questions it already
+answered and stops sending unbounded raw history on every turn.
+
+- **Semantic answer cache** (`ron_cache.py`, new) — before hitting the AI
+  chain, the daemon checks a per-chat cache for a semantically equivalent
+  recent question. Similarity is local and dependency-free (normalized text,
+  token-set overlap over content words, edit distance for short queries —
+  no hosted vectors, no embeddings). Strict per-chat isolation, 24h TTL,
+  200-entry LRU per chat. Commands, freshness-sensitive questions ("latest",
+  "today", prices, dates), memory-write ops, and any reply built on another
+  chat's consented private fact are never cached; error/degraded replies are
+  never stored. Hits/misses/estimated tokens saved tracked in
+  `ron_cache_stats.json`
+- **Rolling history summaries** (`ron_ai.py`, `ron_memory.py`) — the JSON
+  store keeps up to 48 raw turns per chat; once it passes 40, the oldest half
+  is summarized by the cheapest provider model (third-person, neutral,
+  continuity-focused) and folded into a summary stored in the encrypted
+  per-chat memory DB (`chat_meta` table — no new plaintext store). Prompts
+  now carry summary + last 15 turns instead of full raw history; any
+  summarization failure silently falls back to the old behavior. `forget` /
+  wipe clears the summary with everything else
+- Still zero new pip dependencies; all existing features untouched
+
 ## 1.3.0 — 2026-09-20
 
 Memory lifecycle release: memory now handles change, forgetting, and recall

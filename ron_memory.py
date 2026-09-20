@@ -207,6 +207,15 @@ class MemoryStore:
             expires_ts REAL NOT NULL)""")
         c.execute("""CREATE INDEX IF NOT EXISTS idx_pending_target
             ON pending_approvals(target_user_id, status, expires_ts)""")
+        # Phase 6 (2026-09-20): generic per-chat key/value store —
+        # rolling history summaries live here, encrypted at rest, never
+        # in a new plaintext store. wipe_chat() nukes these rows too.
+        c.execute("""CREATE TABLE IF NOT EXISTS chat_meta(
+            chat_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value_enc BLOB NOT NULL,
+            updated_ts REAL NOT NULL,
+            PRIMARY KEY(chat_id, key))""")
         c.commit()
 
     # -- crypto helpers -------------------------------------------------
@@ -637,7 +646,7 @@ class MemoryStore:
             fids = [r[0] for r in self._db.execute(
                 "SELECT id FROM facts WHERE chat_id=?", (cid,)).fetchall()]
             out = {"messages": 0, "facts": 0, "consents": 0,
-                   "pendings": 0, "members": 0}
+                   "pendings": 0, "members": 0, "meta": 0}
             out["messages"] = self._delete_messages(mids)
             out["facts"] = self._delete_facts(fids)
             out["consents"] = self._db.execute(
@@ -647,6 +656,8 @@ class MemoryStore:
                 (cid,)).rowcount
             out["members"] = self._db.execute(
                 "DELETE FROM chat_members WHERE chat_id=?", (cid,)).rowcount
+            out["meta"] = self._db.execute(
+                "DELETE FROM chat_meta WHERE chat_id=?", (cid,)).rowcount
             self._db.commit()
             return out
 
@@ -657,6 +668,26 @@ class MemoryStore:
             mids = [r[0] for r in self._db.execute(
                 "SELECT id FROM messages WHERE ts < ?", (cutoff,)).fetchall()]
         return self._delete_messages(mids)
+
+    # -- chat_meta (Phase 6 rolling history summaries) ------------------
+    def get_meta(self, chat_id, key):
+        """One encrypted value for this chat. None when absent."""
+        with self._lock:
+            r = self._db.execute(
+                "SELECT value_enc FROM chat_meta WHERE chat_id=? AND key=?",
+                (str(chat_id), str(key))).fetchone()
+        if not r:
+            return None
+        return self._dec(r[0])
+
+    def set_meta(self, chat_id, key, value):
+        """Store/overwrite one encrypted value for this chat."""
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO chat_meta(chat_id, key, value_enc,"
+                " updated_ts) VALUES(?,?,?,?)",
+                (str(chat_id), str(key), self._enc(value), time.time()))
+            self._db.commit()
 
     # -- consents -------------------------------------------------------
     def has_consent(self, group_chat_id, user_id, fact_id):
