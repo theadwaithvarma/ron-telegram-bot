@@ -44,17 +44,19 @@ python3 ron_daemon.py
 
 ## Configuration
 
-All config comes from environment variables (see `.env.example`):
+All config comes from environment variables (see `.env.example`). A `.env`
+file next to the scripts is loaded automatically; shell-exported variables
+take precedence.
 
-| Variable            | Required | What it is                                      |
-|---------------------|----------|-------------------------------------------------|
-| `BOT_TOKEN`         | yes      | Bot token from [@BotFather](https://t.me/BotFather) |
-| `GROQ_API_KEY`      | yes      | Groq Cloud API key (console.groq.com)           |
-| `GROQ_MODEL`        | no       | Chat model (default `openai/gpt-oss-120b`)      |
-| `GROQ_BASE_URL`     | no       | API base URL (default Groq OpenAI-compatible)   |
-| `OWNER_ID`          | no       | Your Telegram user id (owner-only commands)     |
-| `PLAYGROUND_GROUP_ID` | no     | Default group id for group features             |
-| `SYSTEM_PROMPT`     | no       | Override the bot persona                        |
+| Variable        | Required | What it is                                          |
+|-----------------|----------|-----------------------------------------------------|
+| `BOT_TOKEN`     | yes      | Bot token from [@BotFather](https://t.me/BotFather) |
+| `GROQ_API_KEY`  | yes      | Groq Cloud API key (console.groq.com)               |
+| `GROQ_MODEL`    | no       | Chat model (default `openai/gpt-oss-120b`)          |
+| `GROQ_BASE_URL` | no       | API base URL (default Groq OpenAI-compatible)       |
+| `BOT_USERNAME`  | no       | Bot username without @ (default `ronrebootedbot`)   |
+| `OWNER_ID`      | no       | Your Telegram user id (reserved, currently unused)  |
+| `SYSTEM_PROMPT` | no       | Override the bot persona                            |
 
 Runtime state (`ron_daemon.offset`, `ron_ai_history.json`, `known_groups.json`,
 `known_topics.json`) lives next to the scripts and is git-ignored.
@@ -63,6 +65,7 @@ Runtime state (`ron_daemon.offset`, `ron_ai_history.json`, `known_groups.json`,
 
 - `ron_daemon.py` — long-polling daemon, update routing, all command/trailer handlers
 - `ron_ai.py` — Groq chat backend, history, model fallback on 429s
+- `config.py` — environment-variable config + `.env` loader (stdlib only)
 - `stream_send.py` — progressive draft streaming for 1:1 chats
 - `rich_send.py` — native rich message sender with plain-text fallback
 - `ephemeral_send.py` — private ephemeral messages (welcomes)
