@@ -68,6 +68,13 @@ try:
 except Exception:
     ron_cmdquota = None
 
+# Web search backend for /factcheck (Tavily when keyed, else keyless DDG).
+# None-safe — without it the command refuses politely instead of crashing.
+try:
+    import ron_search
+except Exception:
+    ron_search = None
+
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 from dynamic_credentials import dynamic_credential_entry
 
@@ -2500,18 +2507,24 @@ def _ai_imagine_reply(chat_id, user_id, user_name, prompt, private=True,
     t.start()
 
 
-# --- /factcheck (Perplexity, web-grounded) and /think (Gemini, deep) ---
+# --- /factcheck (web-grounded verdict) and /think (Gemini, deep) ---
 # Explicit brain-switch commands. Both pin a single provider via
 # ron_ai.single_shot() — no history, no memory hooks, no cheap routing.
-# Quotas are checked BEFORE any provider call (paid/limited APIs); the
-# quota is spent only after a successful answer. Worker threads keep slow
-# answers off the update poll loop, mirroring /imagine.
+# /factcheck search backends, best first: Perplexity sonar-pro (key in
+# vault) -> Tavily (free key in vault) -> keyless DuckDuckGo scrape.
+# The verdict is rendered by Groq 120b (Gemini flash fallback) from the
+# search evidence; sources are appended by the daemon, never the model,
+# so links can't be hallucinated. Quotas are checked BEFORE any provider
+# call; the quota is spent only after a successful answer. Worker threads
+# keep slow answers off the update poll loop, mirroring /imagine.
 _FACTCHECK_MODEL = "sonar-pro"
 _FACTCHECK_N = 10            # 10 fact-checks per rolling 6h per user
 _FACTCHECK_WINDOW = 6 * 3600
 _THINK_MODEL = "gemini-3.8-flash"
 _THINK_N = 15                # 15 deep thinks per rolling 6h per user
 _THINK_WINDOW = 6 * 3600
+_VERDICT_MODEL = "openai/gpt-oss-120b"   # renders fact-check verdicts
+_VERDICT_FALLBACK_MODEL = _THINK_MODEL
 
 _FACTCHECK_SYSTEM = (
     "You are a precise fact-checker with live web search. Given a claim, "
@@ -2520,6 +2533,19 @@ _FACTCHECK_SYSTEM = (
     "Then 2-4 short sentences explaining, with inline citations. "
     "Keep it tight — chat length, not an essay. "
     "Telegram Markdown (**bold**), no HTML."
+)
+# System prompt for the verdict-rendering path (search results are supplied
+# as evidence; the daemon appends the real source links afterwards).
+_FACTCHECK_SYNTH_SYSTEM = (
+    "You are a precise fact-checker. Web search results for the claim are "
+    "given below as numbered evidence. Judge the claim and reply in this "
+    "exact shape:\n"
+    "**Verdict:** True / False / Misleading / Unverifiable (pick one, one line)\n"
+    "Then 2-4 short sentences explaining, grounded ONLY in the evidence. "
+    "If the evidence is thin, contradictory, or off-topic, the verdict MUST "
+    "be Unverifiable — never guess, never use training knowledge to fill "
+    "gaps. Do not list sources yourself; they are appended separately. "
+    "Telegram Markdown (**bold**), no HTML. Keep it tight — chat length."
 )
 _THINK_SYSTEM = (
     "You are Ron in deep-thinking mode. Think carefully step by step "
@@ -2557,7 +2583,11 @@ def _delete_ack(chat_id, ack_id):
 
 def _handle_factcheck(chat_id, user_id, user_name, text, is_private,
                       reply_to=None, thread_id=None):
-    """/factcheck <claim> -> web-grounded verdict via Perplexity."""
+    """/factcheck <claim> -> web-grounded verdict.
+
+    Search backends (best first): Perplexity (keyed) -> Tavily (free key)
+    -> keyless DuckDuckGo. Always available — no key required.
+    """
     query = _cmd_arg(text)
     if not query:
         send(chat_id,
@@ -2565,14 +2595,8 @@ def _handle_factcheck(chat_id, user_id, user_name, text, is_private,
              "/factcheck the Eiffel Tower is 330m tall \U0001F50D",
              reply_to=reply_to, thread_id=thread_id)
         return True
-    if ron_cmdquota is None:
+    if ron_cmdquota is None or ron_search is None:
         send(chat_id, "Fact-checking isn't available right now.",
-             reply_to=reply_to, thread_id=thread_id)
-        return True
-    if ron_ai._provider_key("perplexity") is None:
-        send(chat_id,
-             "Fact-checking isn't connected yet — Adwaith needs to add "
-             "the Perplexity API key first. \U0001F50D",
              reply_to=reply_to, thread_id=thread_id)
         return True
     allowed, retry_after = ron_cmdquota.check_limit(
@@ -2624,11 +2648,42 @@ def _handle_think(chat_id, user_id, user_name, text, is_private,
     return True
 
 
+def _factcheck_verdict(query):
+    """Web-grounded verdict for a claim.
+
+    Perplexity sonar-pro when its key is connected; otherwise search the
+    web (Tavily when its free key is connected, else keyless DuckDuckGo)
+    and have Groq 120b (Gemini flash fallback) render the verdict from the
+    evidence. Source links are appended by the daemon from the real search
+    results — the model never invents URLs.
+    """
+    if ron_ai._provider_key("perplexity") is not None:
+        return ron_ai.single_shot(
+            "perplexity", _FACTCHECK_MODEL,
+            [{"role": "system", "content": _FACTCHECK_SYSTEM},
+             {"role": "user", "content": query}],
+            timeout=150)
+    results = ron_search.web_search(query)
+    messages = [{"role": "system", "content": _FACTCHECK_SYNTH_SYSTEM},
+                {"role": "user",
+                 "content": ("Claim: %s\n\nWeb results:\n%s"
+                             % (query, ron_search.format_evidence(results)))}]
+    try:
+        verdict = ron_ai.single_shot("groq", _VERDICT_MODEL, messages,
+                                     timeout=150)
+    except Exception:
+        verdict = ron_ai.single_shot("gemini", _VERDICT_FALLBACK_MODEL,
+                                     messages, timeout=150)
+    return (verdict.rstrip() + "\n\n\U0001F517 Sources:\n"
+            + ron_search.format_sources(results))
+
+
 def _ai_spot_reply(scope, chat_id, user_id, user_name, query, ack_text,
                    fail_text, reply_to=None, thread_id=None):
     """Run a pinned-provider command off the poll loop.
 
-    scope "factcheck" -> Perplexity sonar-pro; "think" -> Gemini flash.
+    scope "factcheck" -> web-grounded verdict (Perplexity if keyed, else
+    search + Groq/Gemini verdict); "think" -> Gemini flash.
     Ack message is deleted before the answer lands, like /imagine.
     """
     def _go():
@@ -2641,11 +2696,7 @@ def _ai_spot_reply(scope, chat_id, user_id, user_name, query, ack_text,
             ack_id = None
         try:
             if scope == "factcheck":
-                reply = ron_ai.single_shot(
-                    "perplexity", _FACTCHECK_MODEL,
-                    [{"role": "system", "content": _FACTCHECK_SYSTEM},
-                     {"role": "user", "content": query}],
-                    timeout=150)
+                reply = _factcheck_verdict(query)
                 n, window = _FACTCHECK_N, _FACTCHECK_WINDOW
             else:
                 reply = ron_ai.single_shot(

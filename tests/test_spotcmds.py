@@ -9,10 +9,13 @@ Covers:
 - ron_daemon._cmd_arg: /cmd prefix stripping incl. @botname.
 - ron_ai.single_shot: pinned provider/model plan, message pass-through,
   no-key and unknown-provider errors, empty-reply error.
-- ron_daemon handlers: empty-query hint, no-key notice without provider
-  burn, quota notice without provider burn, success path (ack sent then
-  deleted, pinned provider called, quota recorded only on success,
-  history saved).
+- ron_search: DDG lite parsing (uddg unwrap, snippet clean), source
+  formatting, web_search backend preference and failure.
+- ron_daemon._factcheck_verdict: Perplexity when keyed; otherwise
+  search + Groq verdict with daemon-appended sources; Gemini fallback.
+- ron_daemon handlers: empty-query hint, quota notice without provider
+  burn, success path (ack sent then deleted, pinned provider called,
+  quota recorded only on success, history saved).
 """
 import json
 import os
@@ -241,14 +244,25 @@ class TestFactcheckHandler(_HandlerBase):
             1, USER_A, "u", "/factcheck", True))
         self.assertTrue(any("claim to check" in s for s in self.sent))
 
-    def test_no_key_no_burn(self):
+    def test_no_perplexity_key_uses_search_path(self):
+        # No Perplexity key -> free path: web search + Groq verdict, NOT
+        # a "not connected" refusal. Nothing may burn without quota.
         self._key(None)
+        fake_results = [{"title": "T1", "url": "https://example.com/a",
+                         "snippet": "s1"}]
         with mock.patch.object(
-                ron_daemon.ron_ai, "single_shot") as ss:
+                ron_daemon.ron_search, "web_search",
+                return_value=fake_results) as ws, \
+             mock.patch.object(
+                ron_daemon.ron_ai, "single_shot",
+                return_value="**Verdict:** True") as ss:
             self.assertTrue(ron_daemon._handle_factcheck(
                 1, USER_A, "u", "/factcheck x", True))
-            ss.assert_not_called()
-        self.assertTrue(any("isn't connected" in s for s in self.sent))
+            ws.assert_called_once_with("x")
+            (prov, model, messages), _ = ss.call_args
+            self.assertEqual(prov, "groq")
+        self.assertTrue(any("**Verdict:** True" in s for s in self.sent))
+        self.assertTrue(any("example.com" in s for s in self.sent))
 
     def test_quota_blocks_without_burn(self):
         self._key("hsurr:fake")
@@ -345,6 +359,147 @@ class TestThinkHandler(_HandlerBase):
         self.assertEqual(model, "gemini-3.8-flash")
         self.assertIn("deep-thinking", messages[0]["content"])
         self.assertIn("deep answer", self.sent)
+
+
+_DDG_FIXTURE = """
+<tr>
+  <td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage%3Fx%3D1&amp;rut=abc" class='result-link'>Example <b>Title</b> [x]</a></td>
+</tr>
+<tr><td class='result-snippet'>A snippet &amp; more <b>bold</b> text.</td></tr>
+<tr>
+  <td><a rel="nofollow" href="https://plain.example.org/other" class='result-link'>Plain Link</a></td>
+</tr>
+"""
+
+
+class TestRonSearch(unittest.TestCase):
+    def test_unwrap_ddg_redirect(self):
+        import ron_search
+        u = ron_search._unwrap_ddg(
+            "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=1")
+        self.assertEqual(u, "https://example.com/a")
+
+    def test_unwrap_protocol_relative(self):
+        import ron_search
+        self.assertEqual(ron_search._unwrap_ddg("//example.com/a"),
+                         "https://example.com/a")
+
+    def test_parse_ddg_lite(self):
+        import ron_search
+        rows = ron_search._parse_ddg_lite(_DDG_FIXTURE)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["url"], "https://example.com/page?x=1")
+        self.assertEqual(rows[0]["title"], "Example Title [x]")
+        self.assertEqual(rows[0]["snippet"], "A snippet & more bold text.")
+        self.assertEqual(rows[1]["url"], "https://plain.example.org/other")
+
+    def test_format_sources_sanitizes(self):
+        import ron_search
+        out = ron_search.format_sources([
+            {"title": "A [b] (c) title", "url": "https://example.com/p",
+             "snippet": ""}])
+        self.assertIn("1. [A b c title](https://example.com/p)", out)
+        self.assertIn("example.com", out)
+
+    def test_format_evidence_numbered(self):
+        import ron_search
+        out = ron_search.format_evidence([
+            {"title": "T", "url": "https://e.com", "snippet": "S"}])
+        self.assertIn("[1] T", out)
+        self.assertIn("https://e.com", out)
+
+    def test_web_search_empty_query(self):
+        import ron_search
+        with self.assertRaises(RuntimeError):
+            ron_search.web_search("   ")
+
+    def test_web_search_all_fail(self):
+        import ron_search
+        with mock.patch.object(ron_search, "_tavily_search",
+                               return_value=None), \
+             mock.patch.object(ron_search, "_ddg_search",
+                               return_value=None):
+            with self.assertRaises(RuntimeError):
+                ron_search.web_search("x")
+
+    def test_web_search_prefers_tavily(self):
+        import ron_search
+        tav = [{"title": "T", "url": "https://t.co", "snippet": "S"}]
+        with mock.patch.object(ron_search, "_tavily_search",
+                               return_value=tav), \
+             mock.patch.object(ron_search, "_ddg_search") as ddg:
+            self.assertEqual(ron_search.web_search("x"), tav)
+            ddg.assert_not_called()
+
+
+class TestFactcheckVerdict(unittest.TestCase):
+    def _key(self, val):
+        p = mock.patch.object(ron_daemon.ron_ai, "_provider_key",
+                              return_value=val)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _results(self):
+        return [{"title": "T1", "url": "https://example.com/a",
+                 "snippet": "s1"},
+                {"title": "T2", "url": "https://other.org/b",
+                 "snippet": "s2"}]
+
+    def test_perplexity_when_keyed(self):
+        self._key("hsurr:fake")
+        with mock.patch.object(
+                ron_daemon.ron_ai, "single_shot",
+                return_value="**Verdict:** True") as ss, \
+             mock.patch.object(ron_daemon.ron_search, "web_search") as ws:
+            out = ron_daemon._factcheck_verdict("some claim")
+        (prov, model, messages), _ = ss.call_args
+        self.assertEqual((prov, model), ("perplexity", "sonar-pro"))
+        ws.assert_not_called()  # no search needed
+        self.assertIn("**Verdict:** True", out)
+        self.assertNotIn("Sources:", out)  # perplexity cites inline
+
+    def test_search_plus_groq_verdict(self):
+        self._key(None)
+        with mock.patch.object(
+                ron_daemon.ron_search, "web_search",
+                return_value=self._results()) as ws, \
+             mock.patch.object(
+                ron_daemon.ron_ai, "single_shot",
+                return_value="**Verdict:** False") as ss:
+            out = ron_daemon._factcheck_verdict("some claim")
+        ws.assert_called_once_with("some claim")
+        (prov, model, messages), _ = ss.call_args
+        self.assertEqual(prov, "groq")
+        self.assertEqual(model, "openai/gpt-oss-120b")
+        # evidence reaches the model
+        self.assertIn("example.com/a", messages[1]["content"])
+        self.assertIn("other.org/b", messages[1]["content"])
+        # daemon appends real source links
+        self.assertIn("**Verdict:** False", out)
+        self.assertIn("[T1](https://example.com/a)", out)
+        self.assertIn("[T2](https://other.org/b)", out)
+
+    def test_groq_failure_falls_back_to_gemini(self):
+        self._key(None)
+        with mock.patch.object(ron_daemon.ron_search, "web_search",
+                               return_value=self._results()), \
+             mock.patch.object(
+                ron_daemon.ron_ai, "single_shot",
+                side_effect=[RuntimeError("429"),
+                             "**Verdict:** Misleading"]) as ss:
+            out = ron_daemon._factcheck_verdict("some claim")
+        self.assertEqual(ss.call_count, 2)
+        self.assertEqual(ss.call_args[0][0], "gemini")
+        self.assertIn("**Verdict:** Misleading", out)
+
+    def test_search_failure_raises(self):
+        self._key(None)
+        with mock.patch.object(ron_daemon.ron_search, "web_search",
+                               side_effect=RuntimeError("down")), \
+             mock.patch.object(ron_daemon.ron_ai, "single_shot") as ss:
+            with self.assertRaises(RuntimeError):
+                ron_daemon._factcheck_verdict("some claim")
+            ss.assert_not_called()  # no verdict without evidence
 
 
 if __name__ == "__main__":

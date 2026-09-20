@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.9.1 — 2026-09-21
+
+`/factcheck` now works with zero API keys.
+
+- New `ron_search` module: web search backend with a free-first
+  preference order — Tavily (1,000 free searches/month, no card) when
+  its key is connected in the vault, otherwise a keyless DuckDuckGo
+  lite scrape. Stdlib only, no new dependencies.
+- `/factcheck` backend chain, best first: Perplexity `sonar-pro` (when
+  its key is connected) -> Tavily -> keyless DuckDuckGo. The verdict is
+  rendered by Groq gpt-oss-120b (Gemini flash fallback) from the search
+  evidence, with a strict True/False/Misleading/Unverifiable format.
+- Source links are appended by the daemon from the real search results
+  — the model never invents URLs.
+- The old "not connected" refusal is gone: the command always works
+  now, degrading gracefully only if the web itself is unreachable.
+- DDG parsing is throttle-aware (one short backoff retry).
+- 12 new tests (DDG parsing, uddg unwrap, source formatting, backend
+  preference, verdict paths incl. Gemini fallback). 324/324 green.
+
 ## 1.9.0 — 2026-09-21
 
 Two new brain-switch commands: `/factcheck` and `/think`.
