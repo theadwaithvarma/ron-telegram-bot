@@ -1,3 +1,14 @@
+## 1.25.1 — Test isolation fix (2026-09-21)
+
+- `tests/test_business_secretary.py` now patches `DEGRADED_QUEUE` to a temp
+  dir (like `test_apology.py`). Previously an `ai_reply` call in that test
+  could append a fixture entry to the LIVE
+  `~/workspace/telegram-bot/degraded_queue.jsonl` during full-suite runs —
+  found a real `'111'/'Customer'` fixture sitting in the production drain
+  queue alongside genuine business messages. Also cleaned a `'555'/'Cust'`
+  fixture out of the live `business_stale.json` (from an ad-hoc debug
+  snippet, not the test files — those patch correctly).
+
 ## 1.25.0 — Canary self-test, stale-chat radar, canary deploys, outage apology (2026-09-21)
 
 Four reliability/secretary features:
