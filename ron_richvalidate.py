@@ -284,6 +284,41 @@ def _check_button(btn, path, out, allow_style):
                 if not 1 <= n <= MAX_CALLBACK_BYTES:
                     out.append(f"{path}.callback_data: must be 1-64 bytes "
                                f"UTF-8, got {n} bytes")
+        elif a == "copy_text":
+            # CopyTextButton: exactly {"text"}, 1-256 chars (Bot API 7.10+).
+            v = btn[a]
+            if not isinstance(v, dict):
+                out.append(f"{path}.copy_text: CopyTextButton must be a "
+                           f"dict, got {type(v).__name__}")
+            else:
+                t = v.get("text")
+                if not isinstance(t, str) or not 1 <= len(t) <= 256:
+                    out.append(f"{path}.copy_text.text: required 1-256 chars, "
+                               f"got {t!r}"[:200])
+                extra = set(v) - {"text"}
+                if extra:
+                    out.append(f"{path}.copy_text: unexpected fields "
+                               f"{sorted(extra)}")
+        elif a == "login_url":
+            # LoginUrl: url required; forward_text/bot_username optional
+            # strings; request_write_access optional bool.
+            v = btn[a]
+            if not isinstance(v, dict):
+                out.append(f"{path}.login_url: LoginUrl must be a dict, "
+                           f"got {type(v).__name__}")
+            else:
+                u = v.get("url")
+                if not isinstance(u, str) or not u:
+                    out.append(f"{path}.login_url.url: required non-empty "
+                               f"string, got {u!r}"[:160])
+                for k in ("forward_text", "bot_username"):
+                    if v.get(k) is not None and not isinstance(v[k], str):
+                        out.append(f"{path}.login_url.{k}: must be a string, "
+                                   f"got {type(v[k]).__name__}")
+                rwa = v.get("request_write_access")
+                if rwa is not None and not isinstance(rwa, bool):
+                    out.append(f"{path}.login_url.request_write_access: "
+                               f"must be a bool, got {type(rwa).__name__}")
     if "style" in btn and btn["style"] is not None:
         if not allow_style:
             out.append(f"{path}.style: 'style' is not a field of classic "
@@ -575,6 +610,29 @@ def _check_inline_keyboard(kb, path, out):
             _check_button(btn, f"{path}[{r}][{b}]", out, allow_style=False)
 
 
+def _check_reply_keyboard(kb, path, out):
+    """ReplyKeyboardMarkup: list of KeyboardButton rows."""
+    if not isinstance(kb, list) or not kb:
+        out.append(f"{path}: keyboard rows must be a non-empty list, "
+                   f"got {kb!r}")
+        return
+    for r, row in enumerate(kb):
+        if not isinstance(row, list) or not row:
+            out.append(f"{path}[{r}]: row must be a non-empty list of "
+                       f"buttons, got {row!r}")
+            continue
+        for b, btn in enumerate(row):
+            bp = f"{path}[{r}][{b}]"
+            if not isinstance(btn, dict):
+                out.append(f"{bp}: KeyboardButton must be a dict, "
+                           f"got {type(btn).__name__}")
+                continue
+            t = btn.get("text")
+            if not isinstance(t, str) or not t:
+                out.append(f"{bp}.text: required non-empty string, "
+                           f"got {t!r}"[:160])
+
+
 def _check_reply_markup(params, method, out):
     if "reply_markup" not in params or params["reply_markup"] is None:
         return
@@ -590,10 +648,29 @@ def _check_reply_markup(params, method, out):
         out.append(f"{method}.reply_markup: must be a dict (or JSON string), "
                    f"got {type(rm).__name__}")
         return
-    kb = rm.get("inline_keyboard")
-    if kb is None:
-        return  # other markup kinds are out of scope
-    _check_inline_keyboard(kb, f"{method}.reply_markup.inline_keyboard", out)
+    if "inline_keyboard" in rm:
+        _check_inline_keyboard(rm["inline_keyboard"],
+                               f"{method}.reply_markup.inline_keyboard", out)
+    elif "keyboard" in rm:
+        _check_reply_keyboard(rm["keyboard"],
+                              f"{method}.reply_markup.keyboard", out)
+        for k in ("resize_keyboard", "one_time_keyboard", "selective"):
+            if rm.get(k) is not None and not isinstance(rm[k], bool):
+                out.append(f"{method}.reply_markup.{k}: must be a bool, "
+                           f"got {type(rm[k]).__name__}")
+        ph = rm.get("input_field_placeholder")
+        if ph is not None and not (isinstance(ph, str) and 1 <= len(ph) <= 64):
+            out.append(f"{method}.reply_markup.input_field_placeholder: "
+                       "must be a 1-64 char string")
+    elif "remove_keyboard" in rm:
+        if rm["remove_keyboard"] is not True:
+            out.append(f"{method}.reply_markup.remove_keyboard: must be true")
+        if rm.get("selective") is not None and not isinstance(rm["selective"], bool):
+            out.append(f"{method}.reply_markup.selective: must be a bool")
+    else:
+        out.append(f"{method}.reply_markup: unknown markup kind, expected one "
+                   f"of inline_keyboard/keyboard/remove_keyboard, got "
+                   f"{sorted(rm)}")
 
 
 def _check_caption(params, method, out):

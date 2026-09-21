@@ -1,3 +1,38 @@
+## 1.21.0 — all remaining Telegram button types (2026-09-21)
+
+Every button type from the platform list now works on the bot:
+
+- **Copy buttons.** `[copy: Copy invite code | ABC123]` makes a one-tap
+  `copy_text` button (official 1-256 char limit enforced). Labels pass the
+  same contextual filter as quick replies. Also renders in-bubble on the
+  rich path — RichMessageButton takes the same actions as an inline
+  keyboard button (Bot API 10.3).
+- **Reply keyboards.** `[reply_keyboard: /ping, /imagine, /health]` sends a
+  `ReplyKeyboardMarkup` shortcut menu (resize + one_time, 3 per row);
+  `[hide_keyboard]` dismisses it via `ReplyKeyboardRemove`. A message can
+  only carry one reply_markup kind — an inline keyboard wins and a
+  dropped menu is logged. Prompt rule: never offer one unprompted; only
+  on explicit request (or for Adwaith), never in a group uninvited.
+- **Switch-inline buttons.** `[switch_inline: Try Ron here | hello]`
+  opens Ron in inline mode from any chat. New `inline_query` update
+  handler answers with `answerInlineQuery` (2 articles with a query, 1
+  without). **Adwaith must enable Inline Mode in BotFather first** —
+  until then Telegram never delivers these updates and the button is
+  inert.
+- **Login buttons.** `[login: Log in]` emits a `login_url` button whose
+  URL comes from the new `ron_ai.json` config key `login_url` (default
+  empty -> the trailer is dropped with a logged warning, never sent with
+  a placeholder URL). **A real Telegram Login needs Adwaith's own
+  website domain bound in BotFather** — the code only makes the button
+  type available.
+
+Prompt updated in repo `DEFAULT_CONFIG` and live `ron_ai.json`
+(word-for-word identical): teaches each type and when to use it, keeps
+the existing discipline (default no buttons, contextual drill-downs
+only, never generic continuations). Validator now checks `copy_text`
+/ `login_url` field shapes and `ReplyKeyboardMarkup` /
+`ReplyKeyboardRemove` payloads. 31 new tests in tests/test_buttons.py.
+
 ## 1.20.0 — four missing rich-formatting features + group-ping tail fix (2026-09-21)
 
 API surface gap analysis (Bot API 9.3 reference) turned up four RichText

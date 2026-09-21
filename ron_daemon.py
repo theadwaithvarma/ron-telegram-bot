@@ -1382,6 +1382,22 @@ LINK_RE = re.compile(r"^\[links:\s*(.+?)\s*\]\s*$", re.M | re.I)
 # trailers the model tacks onto the end of a sentence instead of their own line
 BTN_TAIL_RE = re.compile(r"\[buttons:\s*([^\]]+?)\s*\]\s*$", re.I)
 LINK_TAIL_RE = re.compile(r"\[links:\s*([^\]]+?)\s*\]\s*$", re.I)
+# v1.21.0: more button types. [copy: Label | text] -> copy_text button
+# (1-256 chars copied to clipboard); [switch_inline: Label | query] ->
+# switch_inline_query button; [login: Log in] -> login_url button (URL from
+# ron_ai.json "login_url"; trailer dropped if unconfigured);
+# [reply_keyboard: a, b, c] -> ReplyKeyboardMarkup shortcut menu;
+# [hide_keyboard] -> ReplyKeyboardRemove.
+COPY_RE = re.compile(r"^\[copy:\s*(.+?)\s*\]\s*$", re.M | re.I)
+COPY_TAIL_RE = re.compile(r"\[copy:\s*([^\]]+?)\s*\]\s*$", re.I)
+SWITCH_RE = re.compile(r"^\[switch_inline:\s*(.+?)\s*\]\s*$", re.M | re.I)
+SWITCH_TAIL_RE = re.compile(r"\[switch_inline:\s*([^\]]+?)\s*\]\s*$", re.I)
+LOGIN_RE = re.compile(r"^\[login:\s*(.+?)\s*\]\s*$", re.M | re.I)
+LOGIN_TAIL_RE = re.compile(r"\[login:\s*([^\]]+?)\s*\]\s*$", re.I)
+RK_RE = re.compile(r"^\[reply_keyboard:\s*(.+?)\s*\]\s*$", re.M | re.I)
+RK_TAIL_RE = re.compile(r"\[reply_keyboard:\s*([^\]]+?)\s*\]\s*$", re.I)
+HIDEKB_RE = re.compile(r"^\[hide_keyboard\]\s*$", re.M | re.I)
+HIDEKB_TAIL_RE = re.compile(r"\[hide_keyboard\]\s*$", re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -1914,7 +1930,8 @@ def handle_group_sends(origin_chat_id, user_id, user_name, reply):
 
 def strip_trailer_syntax(reply):
     """Remove every trailer form: [buttons:...]/[links:...]/[send_group:...]
-    /[send_topic:...]/[topic:...], line or inline."""
+    /[send_topic:...]/[topic:...]/[copy:...]/[switch_inline:...]/[login:...]
+    /[reply_keyboard:...]/[hide_keyboard], line or inline."""
     reply = BTN_RE.sub("", LINK_RE.sub("", reply))
     reply = GROUP_RE.sub("", reply)
     reply = SEND_TOPIC_RE.sub("", reply)
@@ -1922,6 +1939,11 @@ def strip_trailer_syntax(reply):
     reply = BTN_TAIL_RE.sub("", LINK_TAIL_RE.sub("", reply))
     reply = GROUP_TAIL_RE.sub("", reply)
     reply = SEND_TOPIC_TAIL_RE.sub("", reply)
+    reply = COPY_RE.sub("", COPY_TAIL_RE.sub("", reply))
+    reply = SWITCH_RE.sub("", SWITCH_TAIL_RE.sub("", reply))
+    reply = LOGIN_RE.sub("", LOGIN_TAIL_RE.sub("", reply))
+    reply = RK_RE.sub("", RK_TAIL_RE.sub("", reply))
+    reply = HIDEKB_RE.sub("", HIDEKB_TAIL_RE.sub("", reply))
     return TOPIC_TAIL_RE.sub("", reply).strip()
 
 
@@ -2000,12 +2022,26 @@ def _button_fits_context(label, visible):
 
 
 def parse_trailers(reply):
-    """Pull [buttons: ...] / [links: ...] trailer lines into an inline keyboard."""
+    """Pull button trailer lines into reply_markup.
+
+    [buttons: ...] / [links: ...] -> inline keyboard (existing behavior);
+    v1.21.0 adds [copy: L | text] (copy_text), [switch_inline: L | query]
+    (switch_inline_query), [login: L] (login_url, inert unless ron_ai.json
+    "login_url" is configured), [reply_keyboard: a, b, c] (shortcut menu),
+    [hide_keyboard] (dismiss the menu). A message can only carry ONE
+    reply_markup kind — an inline keyboard wins; a dropped menu is logged.
+    Returns (clean_text, reply_markup_dict_or_None)."""
     btns = (BTN_RE.search(reply) or BTN_TAIL_RE.search(reply) or [None, None])[1]
     links = (LINK_RE.search(reply) or LINK_TAIL_RE.search(reply) or [None, None])[1]
+    copies = (COPY_RE.search(reply) or COPY_TAIL_RE.search(reply) or [None, None])[1]
+    switches = (SWITCH_RE.search(reply) or SWITCH_TAIL_RE.search(reply) or [None, None])[1]
+    login = (LOGIN_RE.search(reply) or LOGIN_TAIL_RE.search(reply) or [None, None])[1]
+    rkb = (RK_RE.search(reply) or RK_TAIL_RE.search(reply) or [None, None])[1]
+    hidekb = HIDEKB_RE.search(reply) or HIDEKB_TAIL_RE.search(reply)
     clean = strip_trailer_syntax(reply)
     kb = []
     link_row = []
+    login_row = []
     dropped_labels = []  # non-http link targets: kept as visible text
     # Spoiler markers contain the "|" separator — erase them before the
     # split, or "||x||" shatters into phantom buttons.
@@ -2046,6 +2082,67 @@ def parse_trailers(reply):
                 break
         if row:
             kb.append(row)
+    if copies:
+        # CopyTextButton.text: official 1-256 chars. One copy button per
+        # trailer — "Label | text"; multiple pairs are ambiguous, so extra
+        # pipes are treated as literal text of the copied value.
+        if "|" not in copies:
+            print(f"[ron_daemon] trailer: [copy:] dropped, needs "
+                  f"'Label | text', got {copies!r}", flush=True)
+        else:
+            label, ctext = (x.strip() for x in copies.split("|", 1))
+            label = _clean_btn_label(label)
+            # The label is a quick-reply-grade button, so it passes the
+            # same contextual filter — a stray "Copy" button is dropped
+            # like any off-topic one.
+            if not label or not ctext:
+                print(f"[ron_daemon] trailer: [copy:] dropped, empty "
+                      f"label or text: {copies!r}", flush=True)
+            elif not _button_fits_context(label, clean):
+                print(f"[ron_daemon] trailer: off-topic copy button dropped: "
+                      f"{label!r}", flush=True)
+            else:
+                kb.append([{"text": label[:40],
+                            "copy_text": {"text": ctext[:256]}}])
+    if switches:
+        # Same "Label | query" pair rule as [copy:]. The query is prefilled
+        # into inline mode; it may be empty (just inserts the bot name).
+        if "|" not in switches:
+            print(f"[ron_daemon] trailer: [switch_inline:] dropped, "
+                  f"needs 'Label | query', got {switches!r}", flush=True)
+        else:
+            label, query = (x.strip() for x in switches.split("|", 1))
+            label = _clean_btn_label(label)
+            if label:
+                kb.append([{"text": label[:40],
+                            "switch_inline_query": query[:256]}])
+            else:
+                print(f"[ron_daemon] trailer: [switch_inline:] dropped, "
+                      f"empty label: {switches!r}", flush=True)
+    if login:
+        # LoginUrl needs the owner's website bound in BotFather; the URL
+        # lives in ron_ai.json "login_url". Unconfigured -> the button is
+        # dropped loudly, never sent with an empty/placeholder URL.
+        login_url = ""
+        try:
+            login_url = (ron_ai.load_config().get("login_url") or "").strip()
+        except Exception as e:
+            print(f"[ron_daemon] trailer: login_url config read failed: {e}",
+                  flush=True)
+        if not login_url:
+            print("[ron_daemon] trailer: [login:] dropped — no login_url "
+                  "configured in ron_ai.json", flush=True)
+        else:
+            for part in (x.strip() for x in login.split("|") if x.strip()):
+                label = _clean_btn_label(part)
+                if not label:
+                    continue
+                login_row.append({"text": label[:40],
+                                  "login_url": {"url": login_url}})
+                if len(login_row) >= 8:
+                    break
+            if login_row:
+                kb.append(login_row)
     if links:
         for part in (x.strip() for x in links.split("|") if x.strip()):
             if "->" not in part:
@@ -2066,7 +2163,38 @@ def parse_trailers(reply):
         kb.append(link_row[:8])
     if dropped_labels:
         clean = (clean + "\n" + "\n".join(dropped_labels)).strip()
-    return clean, {"inline_keyboard": kb} if kb else None
+    markup = None
+    if kb:
+        markup = {"inline_keyboard": kb}
+    if rkb:
+        # Reply keyboards replace the user's typing bar, and a message can
+        # carry only ONE reply_markup kind. If an inline keyboard already
+        # won, the menu is dropped loudly instead of silently merged.
+        if markup is None:
+            rows = []
+            rrow = []
+            for part in (x.strip() for x in rkb.split(",") if x.strip()):
+                label = _clean_btn_label(part)[:40]
+                if label:
+                    rrow.append({"text": label})
+                if len(rrow) >= 3:
+                    rows.append(rrow)
+                    rrow = []
+            if rrow:
+                rows.append(rrow)
+            if rows:
+                markup = {"keyboard": rows[:12],
+                          "resize_keyboard": True,
+                          "one_time_keyboard": True}
+            else:
+                print(f"[ron_daemon] trailer: [reply_keyboard:] dropped, "
+                      f"no usable buttons: {rkb!r}", flush=True)
+        else:
+            print(f"[ron_daemon] trailer: [reply_keyboard:] dropped — "
+                  f"message already has an inline keyboard", flush=True)
+    if hidekb and markup is None:
+        markup = {"remove_keyboard": True}
+    return clean, markup
 
 
 # ---------------------------------------------------------------------------
@@ -2992,10 +3120,12 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
     inside the bubble. Any failure degrades to the classic markdown +
     under-bubble keyboard, then plain text — the reply always lands.
     """
-    clean, kb = parse_trailers(reply)
+    clean, markup = parse_trailers(reply)
     if not clean:
         clean = "On it ✓"  # trailer-only/empty reply: say something
-    rows = kb["inline_keyboard"] if kb else []
+    # In-bubble rich buttons only come from an inline keyboard; reply
+    # keyboards and keyboard-removal ride the classic reply_markup path.
+    rows = markup.get("inline_keyboard", []) if markup else []
     if rows and ron_richblocks is not None:
         try:
             blocks = ron_richblocks.markdown_to_blocks(clean)
@@ -3009,12 +3139,13 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
         except Exception as e:
             print(f"[ron_daemon] blocks build/send error: {e}", flush=True)
     # No buttons, no blocks builder, or blocks failed: the classic path —
-    # markdown shape + under-bubble keyboard. NOTE: no "style" is added to
-    # classic InlineKeyboardButton dicts: "style" is a RichMessageButton
+    # markdown shape + reply_markup (inline keyboard, reply keyboard, or
+    # keyboard removal). NOTE: no "style" is added to classic
+    # InlineKeyboardButton dicts: "style" is a RichMessageButton
     # (in-bubble) field only; the official InlineKeyboardButton has no
     # such field (the local validator flags it).
     try:
-        send_rich(chat_id, clean, kb, reply_to, thread_id,
+        send_rich(chat_id, clean, markup, reply_to, thread_id,
                   business_connection_id)
     except Exception as e:
         print(f"[ron_daemon] send failed: {e}", flush=True)
@@ -3873,6 +4004,39 @@ def handle_update(upd):
                  username=username)
 
 
+# ---------------------------------------------------------------------------
+# Inline mode (Bot API inline_query) — the other end of [switch_inline:]
+# buttons. A tap lands the user in "@RonRebootedBot <query>" in any chat;
+# Telegram only delivers these updates to bots with Inline Mode enabled in
+# BotFather, so until Adwaith flips that switch this handler never fires.
+# ---------------------------------------------------------------------------
+def handle_inline_query(iq):
+    iq_id = iq.get("id")
+    if not iq_id:
+        return
+    query = (iq.get("query") or "").strip()
+    results = []
+    if query:
+        results.append({
+            "type": "article", "id": "askron",
+            "title": f"Ask Ron: {query[:60]}",
+            "description": "Inserts your question as a message",
+            "input_message_content": {"message_text": query},
+        })
+    results.append({
+        "type": "article", "id": "openron",
+        "title": "Open Ron chat",
+        "description": "t.me/RonRebootedBot — chat with Ron directly",
+        "input_message_content": {"message_text": "t.me/RonRebootedBot"},
+    })
+    r = api("answerInlineQuery", {"inline_query_id": iq_id,
+                                  "results": json.dumps(results),
+                                  "cache_time": 0})
+    if not r.get("ok"):
+        print(f"[ron_daemon] answerInlineQuery failed: {str(r)[:150]}",
+              flush=True)
+
+
 def handle_callback(query):
     """Quick-reply buttons: tapping one re-sends its label as the user's message.
     Every query is answered exactly once — BotFather alerts on unanswered ones.
@@ -4013,6 +4177,8 @@ def main():
         try:
             r = api("getUpdates", {"offset": offset, "timeout": 50,
                                    "allowed_updates": ["message", "callback_query",
+                                                       "inline_query",
+                                                       "chosen_inline_result",
                                                        "stopped_message_generation",
                                                        "business_connection",
                                                        "business_message",
@@ -4028,6 +4194,12 @@ def main():
                 try:
                     if "callback_query" in upd:
                         handle_callback(upd["callback_query"])
+                    elif "inline_query" in upd:
+                        # switch_inline_query buttons route users here.
+                        # Inert until Adwaith enables Inline Mode in
+                        # BotFather — Telegram only delivers these to
+                        # opted-in bots.
+                        handle_inline_query(upd["inline_query"])
                     elif "business_connection" in upd:
                         handle_business_connection(upd["business_connection"])
                     elif "business_message" in upd:
