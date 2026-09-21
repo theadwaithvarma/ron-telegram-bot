@@ -4309,12 +4309,13 @@ def handle_guest_message(gm):
             "Mention @ronrebootedbot with your question, or chat at "
             "t.me/RonRebootedBot",
             "How to use Ron here"))
+    # answerGuestQuery takes ONE InlineQueryResult as `result` (singular) —
+    # unlike answerInlineQuery's `results` array. results[] always holds
+    # exactly one card by this point (answer, slowdown, or how-to).
     r = api("answerGuestQuery", {"guest_query_id": qid,
-                                 "results": json.dumps(results),
-                                 "cache_time": 0})
+                                 "result": json.dumps(results[0])})
     if r.get("ok"):
-        print(f"[ron_daemon] guest query answered "
-              f"({len(results)} result(s))", flush=True)
+        print(f"[ron_daemon] guest query answered", flush=True)
     else:
         print(f"[ron_daemon] answerGuestQuery failed: {str(r)[:150]}",
               flush=True)

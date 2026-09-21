@@ -163,10 +163,9 @@ class HandlerTests(unittest.TestCase):
         ron_daemon.handle_guest_message(_guest())
         params = self._last("answerGuestQuery")
         self.assertEqual(params["guest_query_id"], "gq1")
-        results = json.loads(params["results"])
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["title"], "Ron's answer")
-        body = results[0]["input_message_content"]["message_text"]
+        result = json.loads(params["result"])
+        self.assertEqual(result["title"], "Ron's answer")
+        body = result["input_message_content"]["message_text"]
         self.assertIn("SMART ANSWER", body)
         self.assertNotIn("[links:", body)  # trailer stripped
         # quick_answer got the clean query + caller name
@@ -184,21 +183,21 @@ class HandlerTests(unittest.TestCase):
         ron_daemon.handle_guest_message(_guest(qid="g5"))
         self.assertEqual(len(self.fake_ai.calls), 5)  # no 6th AI call
         params = self._last("answerGuestQuery")
-        results = json.loads(params["results"])
-        self.assertEqual(results[0]["id"], "slowdown")
+        result = json.loads(params["result"])
+        self.assertEqual(result["id"], "slowdown")
 
     def test_guest_ai_failure_falls_back_to_info_card(self):
         self.fake_ai.fail = True
         ron_daemon.handle_guest_message(_guest())
         params = self._last("answerGuestQuery")
-        results = json.loads(params["results"])
-        self.assertEqual(results[0]["id"], "openron")
+        result = json.loads(params["result"])
+        self.assertEqual(result["id"], "openron")
 
     def test_guest_bare_mention_gets_howto_card(self):
         ron_daemon.handle_guest_message(_guest(text="@ronrebootedbot"))
         params = self._last("answerGuestQuery")
-        results = json.loads(params["results"])
-        self.assertEqual(results[0]["id"], "openron")
+        result = json.loads(params["result"])
+        self.assertEqual(result["id"], "openron")
         self.assertEqual(self.fake_ai.calls, [])
 
     # -- inline ----------------------------------------------------------
