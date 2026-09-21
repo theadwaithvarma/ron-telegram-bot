@@ -40,13 +40,18 @@ Verified shapes:
               (official docs shape; for long quotes)
 - buttons:    {"type": "buttons", "buttons": [RichMessageButton, ...],
                "align": "left"|"center"|"right"}   (ONE row per block, 1-8)
+- pullquote:  {"type": "pullquote", "text": RichText}
+              (verified shape via live harness 2026-09-21; markdown ">>>")
+- math:       {"type": "mathematical_expression", "expression": str}
+              (verified shape via live harness 2026-09-21;
+               markdown "$$expr$$" or a fenced $$ block)
 - RichText:   plain str, or a list mixing str and inline nodes
 - inline:     {"type": "bold"|"italic"|"code"|"underline"|"strikethrough"|
                "spoiler"|"marked", "text": RichText}
               {"type": "url", "text": RichText, "url": str}   ("url" REQUIRED)
 
 NOT emitted (shapes unverified — fail loud locally rather than guess):
-pull_quote, media blocks. Mention/hashtag/subscript parsing is
+media blocks. Mention/hashtag/subscript parsing is
 not implemented — #/@ stay plain text on the blocks path (the markdown
 path entity-parses them), by design.
 
@@ -214,17 +219,19 @@ def needs_blocks_form(blocks):
     """True when the block list contains something the server's Markdown
     parser cannot render, so the daemon must use the blocks form.
 
-    Tables, checklists, headings, details and expandable quotes have no
-    Markdown representation in sendRichMessage — they would arrive as
-    literal text. Paragraphs, dividers, pre fences, plain lists and plain
-    quotes render fine through the markdown path (which also entity-parses
-    #/@, so we prefer it whenever nothing richer is present).
+    Tables, checklists, headings, details, expandable quotes, pull quotes
+    and math have no Markdown representation in sendRichMessage — they
+    would arrive as literal text. Paragraphs, dividers, pre fences, plain
+    lists and plain quotes render fine through the markdown path (which
+    also entity-parses #/@, so we prefer it whenever nothing richer is
+    present).
     """
     for b in blocks or []:
         if not isinstance(b, dict):
             continue
         t = b.get("type")
-        if t in ("table", "details", "heading", "expandable_blockquote"):
+        if t in ("table", "details", "heading", "expandable_blockquote",
+                 "pullquote", "mathematical_expression"):
             return True
         if t == "list" and any(
                 isinstance(it, dict) and it.get("has_checkbox")
@@ -263,7 +270,9 @@ def markdown_to_blocks(md):
 
     Covers what the bot's replies actually use: paragraphs, ## headings
     (real heading blocks, size 1-6), > quotes (long ones become
-    expandable_blockquote), <details><summary> expandable sections,
+    expandable_blockquote), >>> pull quotes (real pullquote blocks),
+    $$math$$ or fenced $$ blocks (real math expressions),
+    <details><summary> expandable sections,
     - / 1. lists, - [ ] / - [x] checklists (real checkbox items),
     ``` code fences (with language), --- dividers, tables (real compact
     table blocks, first row flagged as header cells), and all inline
@@ -373,6 +382,31 @@ def markdown_to_blocks(md):
             blocks.append({"type": "divider"})
             i += 1
             continue
+        # $$math$$ fence or single-line $$expr$$ — real math block
+        # (InputRichBlockMathExpression, verified shape 2026-09-21).
+        if s.startswith("$$"):
+            flush_para()
+            rest = s[2:]
+            if rest.endswith("$$") and len(rest) > 2:
+                expr = rest[:-2].strip()
+                i += 1
+            else:
+                ml = []
+                if rest.strip():
+                    ml.append(rest.strip())
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("$$"):
+                    ml.append(lines[i].rstrip())
+                    i += 1
+                if i < len(lines):
+                    closing = lines[i].strip()[2:]
+                    if closing:
+                        ml.append(closing)
+                    i += 1
+                expr = "\n".join(ml).strip()
+            blocks.append({"type": "mathematical_expression",
+                           "expression": expr})
+            continue
         # ## heading -> real heading block (InputRichBlockSectionHeading,
         # official docs: type "heading", text RichText, size 1-6).
         m = _HEADING_RE.match(s)
@@ -382,6 +416,18 @@ def markdown_to_blocks(md):
                            "text": parse_inline(m.group(2)),
                            "size": len(m.group(1))})
             i += 1
+            continue
+        # >>> pull quote — verified shape: {"type": "pullquote",
+        # "text": RichText} (live harness 2026-09-21). Checked BEFORE the
+        # plain ">" branch so the longer prefix wins.
+        if s.startswith(">>>"):
+            flush_para()
+            pq = []
+            while i < len(lines) and lines[i].strip().startswith(">>>"):
+                pq.append(re.sub(r"^>>>\s?", "", lines[i].strip()))
+                i += 1
+            blocks.append({"type": "pullquote",
+                           "text": parse_inline("\n".join(pq))})
             continue
         # > quote block — verified shape: {"type": "blockquote",
         # "blocks": [nested blocks]}. The {"text": ...} shape 400s with

@@ -1,3 +1,14 @@
+## 1.18.1 — pull quotes + math blocks (2026-09-21)
+
+- **Two more native block types.** `>>>` lines now render as real pull
+  quotes (`pullquote`, verified shape via live harness) and `$$expr$$`
+  single-line or fenced `$$` blocks render as real math expressions
+  (`mathematical_expression`). Both route through the `sendRichMessage`
+  blocks form via `needs_blocks_form`. Block shapes were proven against the
+  live Bot API with a 21-type send-and-delete sweep — all 21 passed.
+- Prompt teaching updated (repo `DEFAULT_CONFIG` + live `ron_ai.json`):
+  the model now knows `>>>` and `$$` syntax.
+
 ## 1.18.0 — native rich formatting v2 (2026-09-21)
 
 - **Native Bot API 10.1-10.3 rich blocks, end to end.** The bot now renders

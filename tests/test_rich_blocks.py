@@ -266,6 +266,41 @@ class TestInBodyButtons(unittest.TestCase):
             ron_richvalidate.validate_outgoing(payload, "sendRichMessage"),
             [])
 
+    def test_pullquote_triple_angle(self):
+        blk = markdown_to_blocks(">>> standout line")
+        self.assertEqual(len(blk), 1)
+        self.assertEqual(blk[0]["type"], "pullquote")
+        self.assertIn("standout line", str(blk[0]["text"]))
+        self.assertTrue(needs_blocks_form(blk))
+
+    def test_pullquote_multiline_and_not_blockquote(self):
+        blk = markdown_to_blocks(">>> one\n>>> two")
+        self.assertEqual(blk[0]["type"], "pullquote")
+        self.assertIn("one", str(blk[0]["text"]))
+        self.assertIn("two", str(blk[0]["text"]))
+
+    def test_single_angle_still_blockquote(self):
+        blk = markdown_to_blocks("> plain quote")
+        self.assertEqual(blk[0]["type"], "blockquote")
+
+    def test_math_single_line(self):
+        blk = markdown_to_blocks("$$E = mc^2$$")
+        self.assertEqual(len(blk), 1)
+        self.assertEqual(blk[0]["type"], "mathematical_expression")
+        self.assertEqual(blk[0]["expression"], "E = mc^2")
+        self.assertTrue(needs_blocks_form(blk))
+
+    def test_math_fenced_block(self):
+        blk = markdown_to_blocks("$$\nx = 1\ny = 2\n$$")
+        self.assertEqual(blk[0]["type"], "mathematical_expression")
+        self.assertIn("x = 1", blk[0]["expression"])
+        self.assertIn("y = 2", blk[0]["expression"])
+
+    def test_math_dollar_line_not_code(self):
+        # $$...$$ must not be swallowed by the inline code path
+        blk = markdown_to_blocks("price is $5 and $6")
+        self.assertEqual(blk[0]["type"], "paragraph")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
