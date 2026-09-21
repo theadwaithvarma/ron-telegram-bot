@@ -213,12 +213,23 @@ _TAP_WINDOW = 30             # button-mash throttle window (seconds)
 
 def _heartbeat_loop():
     """Write pid+timestamp every 30s so the watchdog can spot a hang."""
+    beats = 0
     while not _SHUTDOWN.is_set():
         try:
             _atomic_write_json(HEARTBEAT_FILE,
                                {"pid": os.getpid(), "ts": time.time()})
         except Exception:
             pass
+        beats += 1
+        # Pool warmer (v1.17.3): one cheap getMe every 90s keeps a warm
+        # TLS connection to the Telegram API through the egress proxy, so
+        # /ping (and the next real send) never pays a cold handshake. It
+        # also keeps the latency EMA fresh, so /ping answers instantly.
+        if beats % 3 == 0:
+            try:
+                api("getMe", timeout=15)
+            except Exception:
+                pass
         for _ in range(60):  # 0.5s granularity so shutdown is prompt
             if _SHUTDOWN.is_set():
                 break
@@ -956,6 +967,7 @@ def api(method, params=None, timeout=65):
     Same contract as before (parsed JSON dict, or
     {"ok": False, "error": ...}), but reuses warm TLS connections instead
     of paying ~0.7s of proxy CONNECT + handshake per call."""
+    t0 = time.perf_counter()
     body = urllib.parse.urlencode(params or {}).encode() if params else None
     try:
         status, data = http_pool.pool_for("api.telegram.org").post(
@@ -967,9 +979,34 @@ def api(method, params=None, timeout=65):
         return {"ok": False, "error":
                 f"HTTP {status}: {data[:120].decode('utf-8', 'replace')}"[:150]}
     try:
-        return json.loads(data.decode("utf-8"))
+        result = json.loads(data.decode("utf-8"))
     except Exception as e:
         return {"ok": False, "error": f"bad JSON: {e}"[:150]}
+    # getUpdates long-polls server-side (up to 50s), so its round trip is
+    # wait time, not latency — only successful instant calls feed the EMA.
+    if method != "getUpdates" and result.get("ok"):
+        _note_api_latency((time.perf_counter() - t0) * 1000)
+    return result
+
+
+# Rolling API-latency tracker (v1.17.3): every successful non-poll api()
+# call feeds an exponential moving average, so /ping reports the live
+# warm-pool latency instantly instead of burning a fresh getMe — which
+# often caught a cold pool and showed an inflated number.
+_API_LAT_LOCK = threading.Lock()
+_API_LAT_EMA = None    # ms, exponential moving average
+_API_LAT_TS = 0.0      # time of the last sample
+_API_LAT_ALPHA = 0.3
+_API_LAT_MAX_AGE = 120  # seconds; older than this, /ping measures live
+
+
+def _note_api_latency(ms):
+    global _API_LAT_EMA, _API_LAT_TS
+    with _API_LAT_LOCK:
+        _API_LAT_EMA = (ms if _API_LAT_EMA is None
+                        else _API_LAT_ALPHA * ms
+                        + (1 - _API_LAT_ALPHA) * _API_LAT_EMA)
+        _API_LAT_TS = time.time()
 
 
 def _note_sent(result):
@@ -2252,11 +2289,18 @@ def _broadcast_fanout(chats, btext, notify_chat, owner_id, cmd_msg_id):
 
 
 def _measure_ping():
-    """Time one real Telegram Bot API round-trip (getMe) in milliseconds.
+    """Report the live Telegram API round-trip latency in milliseconds.
 
-    Returns (ms:int, error:str|None). Uses the keep-alive pool, so this is
-    the steady-state bot->Telegram latency through the egress proxy.
+    Prefers the rolling average of recent real API calls (same pool, same
+    proxy) — instant and never inflated by a cold handshake. Falls back to
+    one live getMe when there is no recent data (e.g. fresh boot).
+
+    Returns (ms:int, error:str|None).
     """
+    with _API_LAT_LOCK:
+        ema, ts = _API_LAT_EMA, _API_LAT_TS
+    if ema is not None and time.time() - ts < _API_LAT_MAX_AGE:
+        return int(ema), None
     t0 = time.perf_counter()
     try:
         r = api("getMe", timeout=15)

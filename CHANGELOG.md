@@ -1,3 +1,20 @@
+## 1.17.3 — honest instant /ping (2026-09-21)
+
+- **Fixed**: /ping measured one live getMe per call, which often caught a
+  cold connection pool and reported an inflated number (e.g. ~860ms vs
+  the true ~200ms warm-pool latency).
+- Every successful non-poll api() call now feeds a rolling exponential
+  moving average of real Telegram API round-trip latency (long-poll
+  getUpdates excluded — its wait time is not latency). /ping reports the
+  average instantly with zero extra API calls; falls back to one live
+  getMe only when there is no recent data (fresh boot).
+- The heartbeat loop warms the pool with one cheap getMe every 90s, so
+  the pool never goes cold and /ping (and the next real send) always
+  sees warm-pool latency.
+- Tests: 4 new cases in tests/test_ping.py (EMA hit needs no API call,
+  stale EMA falls back live, api() feeds EMA on success, getUpdates
+  excluded).
+
 ## 1.17.1 — username NameError hotfix (2026-09-21)
 
 - **Fixed**: v1.17.0 referenced a bare `username` inside `ai_reply()`,
