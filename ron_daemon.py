@@ -332,6 +332,51 @@ def _maybe_degraded_notice(chat_id, reply_to=None, thread_id=None,
         print(f"[ron_daemon] degraded notice failed: {e}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# v1.24.4 — rescue mode ("ghost mode"). When every AI provider is down the
+# bot is dying but not dead: the owner still gets an answer. Any owner
+# message (a "you alive?" ping or a real question) triggers a low-energy
+# vitals pulse — zero AI calls, plain text, no buttons, no history, no
+# cache — so he can tell "dying" from "dead". Throttled to one pulse per
+# chat per minute so a dying loop can't spam him.
+# ---------------------------------------------------------------------------
+_RESCUE_PULSE_COOLDOWN = 60
+_rescue_pulse_ts = {}
+
+
+def _send_rescue_pulse(chat_id, reply_to=None, thread_id=None,
+                       business_connection_id=None):
+    """Owner-only vitals pulse for rescue mode. Never raises."""
+    now = time.time()
+    key = str(chat_id)
+    if now - _rescue_pulse_ts.get(key, 0) < _RESCUE_PULSE_COOLDOWN:
+        return
+    _rescue_pulse_ts[key] = now
+    try:
+        chain = _provider_chain_info()
+        prov = " · ".join(f"{p['name']}: {p['status']}" for p in chain)
+    except Exception:
+        prov = "providers: unknown"
+    try:
+        with open(DEGRADED_QUEUE) as f:
+            qd = sum(1 for line in f if line.strip())
+    except Exception:
+        qd = 0
+    try:
+        with open(os.path.join(os.path.dirname(HEARTBEAT_FILE),
+                               "ron_watchdog.json")) as f:
+            restarts = json.load(f).get("total_restarts", "?")
+    except Exception:
+        restarts = "?"
+    text = ("\U0001FAA6 rescue mode \u2014 brain's down, still breathing.\n"
+            f"uptime {_uptime_str()} · restarts {restarts} · "
+            f"queued {qd}\n{prov}")
+    try:
+        send(chat_id, text, reply_to, thread_id, business_connection_id)
+    except Exception as e:
+        print(f"[ron_daemon] rescue pulse failed: {e}", flush=True)
+
+
 def _drain_queue():
     """Answer queued messages after recovery. True when the queue is empty.
 
@@ -3572,10 +3617,22 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
             # Phase 3 degraded mode: every provider is down — don't burn
             # API calls, queue the message and be honest about it.
             if _brain_down():
-                _queue_message(chat_id, user_id, user_name, text, reply_to,
-                               thread_id, business_connection_id, private)
-                _maybe_degraded_notice(chat_id, reply_to, thread_id,
+                if _owner_gate(user_id):
+                    # v1.24.4 rescue mode: the owner's message is queued
+                    # for the recovery drain like everyone else's, but he
+                    # also gets an instant low-energy vitals pulse — a
+                    # "you alive?" ping is never met with silence.
+                    _queue_message(chat_id, user_id, user_name, text,
+                                   reply_to, thread_id,
+                                   business_connection_id, private)
+                    _send_rescue_pulse(chat_id, reply_to, thread_id,
                                        business_connection_id)
+                else:
+                    _queue_message(chat_id, user_id, user_name, text,
+                                   reply_to, thread_id,
+                                   business_connection_id, private)
+                    _maybe_degraded_notice(chat_id, reply_to, thread_id,
+                                           business_connection_id)
                 return
             try:
                 # Phase 6: semantic answer cache — serve a recent

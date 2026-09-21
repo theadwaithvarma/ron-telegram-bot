@@ -1,3 +1,16 @@
+## 1.24.4 — Rescue mode ("ghost mode") (2026-09-21)
+
+- When every AI provider is down the bot is dying but not dead: any
+  message from the owner now triggers an instant low-energy vitals pulse
+  on top of the normal degraded queueing — uptime, restart count, queued
+  message depth, per-provider status. Zero AI calls, plain text, no
+  buttons/history/cache, so a "you alive?" ping is never met with silence.
+  Throttled to one pulse per chat per minute. Everyone else keeps the
+  existing queue + degraded notice.
+- 6 new offline tests in `tests/test_rescue_mode.py` (pulse content,
+  per-chat throttle, never-raises, owner-vs-stranger routing through
+  `ai_reply` with `_brain_down` forced on).
+
 ## 1.24.3 — Business secretary instruction (2026-09-21)
 
 - Business (Chat Automation) replies go out from Adwaith's personal
