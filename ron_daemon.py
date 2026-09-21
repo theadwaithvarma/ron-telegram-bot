@@ -2250,8 +2250,25 @@ def _broadcast_fanout(chats, btext, notify_chat, owner_id, cmd_msg_id):
                  f"\U0001F4E3 Broadcast done: {ok}/{len(chats)} chats.")
 
 
+def _measure_ping():
+    """Time one real Telegram Bot API round-trip (getMe) in milliseconds.
+
+    Returns (ms:int, error:str|None). Uses the keep-alive pool, so this is
+    the steady-state bot->Telegram latency through the egress proxy.
+    """
+    t0 = time.perf_counter()
+    try:
+        r = api("getMe", timeout=15)
+    except Exception as e:
+        return -1, str(e)[:120]
+    ms = int((time.perf_counter() - t0) * 1000)
+    if isinstance(r, dict) and r.get("ok"):
+        return ms, None
+    err = r.get("error", "?") if isinstance(r, dict) else "?"
+    return -1, str(err)[:120]
+
+
 def handle_command(chat_id, user_id, cmd, is_private, text="",
-                   user_name="there", reply_to=None, thread_id=None,
                    cmd_msg_id=None, reply_msg=None):
     if cmd == "shutdown":
         # Owner-only maintenance mode: the bot goes quiet for everyone
@@ -2490,7 +2507,11 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
         # Normally /start stays conversational (not a scripted greeting).
         return False
     if cmd == "ping":
-        send(chat_id, "\U0001F3D3 pong \u2014 alive and polling.")
+        ms, err = _measure_ping()
+        if err is None:
+            send(chat_id, f"\U0001F3D3 Pong \u2014 {ms}ms")
+        else:
+            send(chat_id, f"\U0001F3D3 Pong \u2014 API unreachable ({err})")
         return True
     if cmd == "health":
         # Phase 7: compact status card. Cheap local reads only — no AI

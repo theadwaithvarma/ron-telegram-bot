@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.16.1 — 2026-09-21
+
+- **`/ping` now reports real latency**: times one live `getMe` round-trip
+  over the keep-alive pool and replies `🏓 Pong — {ms}ms` (bot→Telegram
+  latency through the egress proxy). API failure is reported honestly
+  instead of a fake number.
+
 ## 1.16.0 — 2026-09-21
 
 Overnight stability + speed pass: no features removed, nothing user-facing
