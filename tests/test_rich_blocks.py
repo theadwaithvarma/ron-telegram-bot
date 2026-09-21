@@ -149,9 +149,28 @@ class TestDetails(unittest.TestCase):
         blks = markdown_to_blocks("click here and tap to expand the menu")
         self.assertEqual(blks[0]["type"], "paragraph")
 
-    def test_unclosed_details_falls_back(self):
-        blks = markdown_to_blocks("<details><summary>oops\nno closing tag")
-        self.assertTrue(all(b["type"] == "paragraph" for b in blks))
+    def test_unclosed_details_auto_closes(self):
+        # Unclosed <details> auto-closes at end of input — a real details
+        # block, never raw tags leaking as a paragraph.
+        blks = markdown_to_blocks(
+            "<details><summary>oops</summary>\nno closing tag")
+        self.assertEqual(len(blks), 1)
+        self.assertEqual(blks[0]["type"], "details")
+        self.assertEqual(str(blks[0]["summary"]), "oops")
+        self.assertNotIn("<details", str(blks[0]["blocks"]))
+
+    def test_nested_details_no_tag_leak(self):
+        blks = markdown_to_blocks(
+            "<details><summary>A</summary>\n"
+            "<details><summary>B</summary>\ninner\n</details>\n</details>")
+        self.assertEqual(blks[0]["type"], "details")
+        self.assertNotIn("<summary", str(blks))
+
+    def test_pullquote_after_quote(self):
+        # >>> lines are not swallowed as quote continuations.
+        blks = markdown_to_blocks("> quoted\n>>> pulled")
+        self.assertEqual([b["type"] for b in blks],
+                         ["blockquote", "pullquote"])
 
     def test_needs_blocks_form(self):
         self.assertTrue(needs_blocks_form(

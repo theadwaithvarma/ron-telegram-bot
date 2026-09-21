@@ -355,9 +355,72 @@ class TestBlocks(unittest.TestCase):
         assert_invalid(self, rich([d]), "sendRichMessage",
                        "required non-empty list of nested blocks")
 
+    # v1.18.1 block types (live-verified against the Bot API)
+
+    def test_pullquote_valid(self):
+        assert_valid(self, rich([{"type": "pullquote", "text": "x"}]),
+                     "sendRichMessage")
+
+    def test_pullquote_extra_field_rejected(self):
+        assert_invalid(self, rich([{"type": "pullquote", "text": "x",
+                                          "credit": "y"}]),
+                       "sendRichMessage", "unexpected fields")
+
+    def test_math_expression_block_valid(self):
+        assert_valid(self, rich([{"type": "mathematical_expression",
+                                        "expression": "x^2"}]),
+                     "sendRichMessage")
+
+    def test_math_expression_block_empty_rejected(self):
+        assert_invalid(self, rich([{"type": "mathematical_expression",
+                                          "expression": ""}]),
+                       "sendRichMessage", "expression")
+
+    # v1.18.1 block types (live-verified against the Bot API)
+
+    def test_pullquote_valid(self):
+        assert_valid(self, rich([{"type": "pullquote", "text": "x"}]),
+                     "sendRichMessage")
+
+    def test_pullquote_extra_field_rejected(self):
+        assert_invalid(self, rich([{"type": "pullquote", "text": "x",
+                                          "credit": "y"}]),
+                       "sendRichMessage", "unexpected fields")
+
+    def test_math_expression_block_valid(self):
+        assert_valid(self, rich([{"type": "mathematical_expression",
+                                        "expression": "x^2"}]),
+                     "sendRichMessage")
+
+    def test_math_expression_block_empty_rejected(self):
+        assert_invalid(self, rich([{"type": "mathematical_expression",
+                                          "expression": ""}]),
+                       "sendRichMessage", "expression")
+
     def test_expandable_blockquote_valid(self):
         assert_valid(self, rich([{"type": "expandable_blockquote",
                                         "text": "x"}]), "sendRichMessage")
+
+    # v1.18.1 block types (live-verified against the Bot API)
+
+    def test_pullquote_valid(self):
+        assert_valid(self, rich([{"type": "pullquote", "text": "x"}]),
+                     "sendRichMessage")
+
+    def test_pullquote_extra_field_rejected(self):
+        assert_invalid(self, rich([{"type": "pullquote", "text": "x",
+                                          "credit": "y"}]),
+                       "sendRichMessage", "unexpected fields")
+
+    def test_math_expression_block_valid(self):
+        assert_valid(self, rich([{"type": "mathematical_expression",
+                                        "expression": "x^2"}]),
+                     "sendRichMessage")
+
+    def test_math_expression_block_empty_rejected(self):
+        assert_invalid(self, rich([{"type": "mathematical_expression",
+                                          "expression": ""}]),
+                       "sendRichMessage", "expression")
 
     # unverified / unknown block types still fail loud
 

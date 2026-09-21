@@ -328,25 +328,28 @@ def markdown_to_blocks(md):
             # all — dropped rather than sent as an empty pre.
             continue
         # <details><summary>…</summary>…</details> expandable section.
-        # Collected across lines; an UNCLOSED <details> is not a real
-        # block — its lines fall back to plain paragraphs, never dropped.
+        # Collected across lines with depth counting so nested <details>
+        # pair correctly; an UNCLOSED <details> auto-closes at end of
+        # input (better than leaking raw tags as a paragraph).
         if _DETAILS_OPEN_RE.search(s):
             flush_para()
             chunk = [line]
             # The closing tag may sit on the same line as the opening one.
-            closed = bool(_DETAILS_CLOSE_RE.search(line))
+            depth = (len(_DETAILS_OPEN_RE.findall(line))
+                     - len(_DETAILS_CLOSE_RE.findall(line)))
             i += 1
-            while i < len(lines) and not closed:
+            while i < len(lines) and depth > 0:
                 chunk.append(lines[i])
-                if _DETAILS_CLOSE_RE.search(lines[i]):
-                    closed = True
+                depth += (len(_DETAILS_OPEN_RE.findall(lines[i]))
+                          - len(_DETAILS_CLOSE_RE.findall(lines[i])))
                 i += 1
-            if not closed:
-                para.extend(chunk)
-                continue
             raw = "\n".join(chunk)
             msum = _SUMMARY_RE.search(raw)
             summary = msum.group(1).strip() if msum else ""
+            # All <summary> tags are consumed here (outer summary extracted
+            # above); the recursive parse below then sees clean inner
+            # <details> blocks, which fall back to "Details" if summary-less.
+            # This guarantees no literal tags ever leak into paragraphs.
             body = _SUMMARY_RE.sub("", raw)
             body = _DETAILS_OPEN_RE.sub("", body)
             body = _DETAILS_CLOSE_RE.sub("", body).strip("\n")
@@ -437,7 +440,10 @@ def markdown_to_blocks(md):
         if s.startswith(">"):
             flush_para()
             q = []
-            while i < len(lines) and lines[i].strip().startswith(">"):
+            # >>> pull-quote lines are NOT quote continuations — the
+            # pullquote branch above owns them; stop before swallowing one.
+            while (i < len(lines) and lines[i].strip().startswith(">")
+                   and not lines[i].strip().startswith(">>>")):
                 q.append(re.sub(r"^>\s?", "", lines[i].strip()))
                 i += 1
             joined = "\n".join(q)

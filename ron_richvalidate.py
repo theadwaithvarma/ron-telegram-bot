@@ -416,9 +416,29 @@ def _check_block(block, path, out):
         if "credit" in block and block["credit"] is not None:
             _check_richtext(block["credit"], f"{path}.credit", out)
 
+    elif t == "pullquote":
+        # Verified shape (v1.18.1, live harness): {"type": "pullquote",
+        # "text": RichText}.
+        extra = set(block) - {"type", "text"}
+        if extra:
+            out.append(f"{path}: unexpected fields {sorted(extra)} on "
+                       f"'pullquote' block")
+        _check_richtext_required(block.get("text"), f"{path}.text", out)
+
+    elif t == "mathematical_expression":
+        # Verified shape (v1.18.1, live harness):
+        # {"type": "mathematical_expression", "expression": str}.
+        extra = set(block) - {"type", "expression"}
+        if extra:
+            out.append(f"{path}: unexpected fields {sorted(extra)} on "
+                       f"'mathematical_expression' block")
+        _check_nonempty_str(block.get("expression"),
+                            f"{path}.expression", out)
+
     else:
         out.append(f"{path}: unsupported/unverified block type {t!r} — fail loud "
-                   "(only paragraph/blockquote/footer/heading/pre/divider/list/"
+                   "(only paragraph/blockquote/pullquote/mathematical_expression/"
+                   "footer/heading/pre/divider/list/"
                    "buttons/details/expandable_blockquote and the strict "
                    "table shape are allowed)")
 

@@ -1,3 +1,29 @@
+## 1.19.1 — formatting mistake audit + fixes (2026-09-21)
+
+Found by probing the live model with 10 formatting-heavy prompts and by
+mining the daemon log:
+
+- **Validator was silently killing pull quotes and math.** v1.18.1 taught
+  the converter to emit `pullquote` / `mathematical_expression` blocks,
+  but the pre-send validator's allowlist still rejected them — 8+ live
+  replies fell back to Markdown with literal `>>>` / `$$` text showing.
+  Both block types are now allowlisted with field checks (4 new tests).
+- **Model weakness: spoilers inside table cells.** Asked to put a spoiler
+  in a cell, the model wrote a malformed `||Blazing fast|` that shattered
+  the row (the `||` pipes collide with column separators). Prompt now
+  forbids pipes inside table cells (repo default + live override).
+- **`>>>` pull quotes were swallowed by preceding `>` quote blocks** —
+  the quote collector ate them as continuations. Fixed; 1 new test.
+- **Unclosed `<details>` leaked raw tags as paragraph text; nested
+  `<details>` leaked inner tags.** The collector now depth-counts and
+  auto-closes at end of input — always a real details block, never raw
+  tags. 2 new tests (one updated).
+- Stale log noise investigated: a `username` NameError hit 6 streams at a
+  single boot and never recurred — transient deploy mix, not a code bug.
+
+38 + 139 validator/block tests green; full suite 560 (3 pre-existing
+`cryptography` import errors unchanged).
+
 ## 1.19.0 — owner rulebook: teach the bot from Telegram (2026-09-21)
 
 - **Teach Ron directly from your DM.** As the owner, say "remember: ...",
