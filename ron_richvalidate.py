@@ -37,6 +37,12 @@ headline traps this validator exists to catch:
   ``heading`` (InputRichBlockSectionHeading), ``details``, and
   ``expandable_blockquote`` blocks; ``is_header`` on table cells;
   ``has_checkbox``/``is_checked`` on list items.
+* v1.20.0 corrections from the official Bot API 10.1 field tables (the
+  v1.19.x shapes for these were guessed): ``anchor_link`` carries
+  ``anchor_name`` (not ``name``); ``reference``/``reference_link``
+  (footnotes) carry ``name``/``reference_name`` alongside ``text``;
+  ``date_time`` carries ``unix_time`` (int, required — this is what the
+  client localizes) plus optional ``date_time_format``.
 
 Deliberate strict choices (so a later wiring stage knows what it is opting
 into):
@@ -97,7 +103,14 @@ _NODE_ALLOWED_FIELDS.update({
     "custom_emoji": {"custom_emoji_id", "alternative_text"},
     "mathematical_expression": {"expression"},
     "anchor": {"name"},
-    "anchor_link": {"text", "name"},
+    # v1.20.0 field-name corrections from the official Bot API 10.1 field
+    # tables (previously guessed): anchor_link carries "anchor_name" (not
+    # "name"); reference/reference_link carry "name"/"reference_name";
+    # date_time carries "unix_time" (+ optional "date_time_format").
+    "anchor_link": {"text", "anchor_name"},
+    "reference": {"text", "name"},
+    "reference_link": {"text", "reference_name"},
+    "date_time": {"text", "unix_time", "date_time_format"},
     "button": {"button"},
 })
 
@@ -210,8 +223,29 @@ def _check_typed_node(node, t, path, out, depth):
                             f"{path}.custom_emoji_id", out)
     elif t == "mathematical_expression":
         _check_nonempty_str(node.get("expression"), f"{path}.expression", out)
-    elif t in ("anchor", "anchor_link"):
+    elif t == "anchor":
         _check_nonempty_str(node.get("name"), f"{path}.name", out)
+    elif t == "anchor_link":
+        # Official field is "anchor_name" (empty = top of message).
+        _check_nonempty_str(node.get("anchor_name"),
+                            f"{path}.anchor_name", out)
+    elif t == "reference":
+        _check_nonempty_str(node.get("name"), f"{path}.name", out)
+    elif t == "reference_link":
+        _check_nonempty_str(node.get("reference_name"),
+                            f"{path}.reference_name", out)
+    elif t == "date_time":
+        # unix_time is what the client localizes per reader; text is the
+        # fallback for clients without date_time rendering. date_time_format
+        # is optional per the MessageEntity docs (format-token syntax
+        # unverified — we emit without it).
+        if not _is_int(node.get("unix_time")):
+            out.append(f"{path}.unix_time: required int unix timestamp, "
+                       f"got {node.get('unix_time')!r}")
+        df = node.get("date_time_format")
+        if df is not None and not isinstance(df, str):
+            out.append(f"{path}.date_time_format: must be a string, "
+                       f"got {df!r}")
     elif t == "button":
         b = node.get("button")
         if not isinstance(b, dict):

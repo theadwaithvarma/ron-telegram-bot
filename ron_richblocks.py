@@ -47,20 +47,89 @@ Verified shapes:
                markdown "$$expr$$" or a fenced $$ block)
 - RichText:   plain str, or a list mixing str and inline nodes
 - inline:     {"type": "bold"|"italic"|"code"|"underline"|"strikethrough"|
-               "spoiler"|"marked", "text": RichText}
+               "spoiler"|"marked"|"subscript"|"superscript", "text": RichText}
+              (subscript from ~x~, superscript from ^x^ — the two-char
+               strikethrough ~~x~~ still wins over single ~, and unbalanced
+               ~/^ stay literal)
               {"type": "url", "text": RichText, "url": str}   ("url" REQUIRED)
+              {"type": "reference_link", "text": "[id]", "reference_name": id}
+              (footnote ref, markdown [^id])
+              {"type": "reference", "text": RichText, "name": id}
+              (footnote definition, from a trailing "[^id]: note" line)
+              {"type": "anchor", "name": id}   (zero-width jump target;
+               auto-attached to every ## heading)
+              {"type": "anchor_link", "text": RichText, "anchor_name": id}
+              (in-message jump link, markdown [text](#id))
+              {"type": "date_time", "text": str, "unix_time": int}
+              (markdown {{YYYY-MM-DD HH:MM}}, parsed as IST wall time;
+               renders in each reader's timezone)
 
 NOT emitted (shapes unverified — fail loud locally rather than guess):
-media blocks. Mention/hashtag/subscript parsing is
+media blocks. Mention/hashtag parsing is
 not implemented — #/@ stay plain text on the blocks path (the markdown
 path entity-parses them), by design.
 
 Pure functions, no network. Safe to import anywhere.
 """
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 __all__ = ["parse_inline", "text_blocks", "markdown_to_blocks",
            "needs_blocks_form"]
+
+
+# ---------------------------------------------------------------------------
+# Date-time markers: {{2026-09-22 18:00}} -> RichTextDateTime (v1.20.0)
+# ---------------------------------------------------------------------------
+
+# Naive datetimes inside {{...}} are the model's wall-clock time, which the
+# prompt pins to IST (the user's timezone). The unix_time is what the
+# client localizes per reader; text is the honest fallback for clients
+# that don't render date_time nodes.
+_IST = ZoneInfo("Asia/Kolkata")
+_DT_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%d",
+               "%d %b %Y %H:%M", "%d %b %Y",
+               "%d %B %Y %H:%M", "%d %B %Y")
+_DT_MARKER_RE = re.compile(r"\{\{([^}\n]{1,80})\}\}")
+_FOOTNOTE_REF_RE = re.compile(r"\[\^([\w-]+)\]")
+_FOOTNOTE_DEF_RE = re.compile(r"^\[\^([\w-]+)\]:\s*(.*)$")
+_ANCHOR_LINK_RE = re.compile(r"\[([^\]\n]+?)\]\(#([\w-]+)\)")
+_HEADING_ANCHOR_RE = re.compile(r"\s*\{#([\w-]+)\}\s*$")
+
+
+def _parse_datetime(s):
+    """Parse a {{...}} marker body as IST wall time.
+
+    Returns (display_text, unix_time) or None when the body is not a
+    recognized datetime — the marker is then left literal.
+    """
+    s = (s or "").strip()
+    for fmt in _DT_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        return None
+    ts = int(dt.replace(tzinfo=_IST).timestamp())
+    disp = f"{dt.day} {dt.strftime('%b')} {dt.year}"
+    if "%H" in fmt:
+        h12 = dt.hour % 12 or 12
+        ampm = "AM" if dt.hour < 12 else "PM"
+        disp += f", {h12}:{dt.minute:02d} {ampm} IST"
+    return disp, ts
+
+
+def _slugify(s):
+    """Heading text -> anchor name: lowercase, spaces/underscores to
+    hyphens, other punctuation dropped. Documented in the system prompt
+    so the model can predict TOC link targets."""
+    s = re.sub(r"[\s_]+", "-", (s or "").lower())
+    s = re.sub(r"[^a-z0-9-]", "", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s or "section"
 
 
 # ---------------------------------------------------------------------------
@@ -79,8 +148,14 @@ _ONE_CHAR = (
     ("`", "code"),
     ("*", "italic"),
     ("_", "italic"),
+    # v1.20.0: single ~ is subscript, single ^ is superscript. The two-char
+    # ~~ strikethrough above is matched FIRST, so ~~x~~ still parses as
+    # strikethrough and only lone ~x~ becomes subscript. Neither char had
+    # any inline meaning before, so no existing syntax is disturbed.
+    ("~", "subscript"),
+    ("^", "superscript"),
 )
-_ESCAPABLE = set("*_`~|=[!#>-")
+_ESCAPABLE = set("*_`~|=[!#>-^")
 
 
 def _merge(parts):
@@ -122,6 +197,17 @@ def parse_inline(s):
             continue
         # [text](url)
         if ch == "[":
+            # v1.20.0: [^id] footnote reference -> reference_link node.
+            # Checked before the url branch: "[^1](https://x)" reads as a
+            # footnote ref followed by literal "(https://x)".
+            fm = _FOOTNOTE_REF_RE.match(s, i)
+            if fm:
+                flush()
+                fid = fm.group(1)
+                parts.append({"type": "reference_link", "text": f"[{fid}]",
+                              "reference_name": fid})
+                i = fm.end()
+                continue
             m = re.match(r"\[([^\]\n]+?)\]\((https?://[^)\s]+)\)", s[i:])
             if m:
                 flush()
@@ -129,6 +215,29 @@ def parse_inline(s):
                               "url": m.group(2)})
                 i += m.end()
                 continue
+            # v1.20.0: [text](#anchor) in-message jump link -> anchor_link.
+            am = _ANCHOR_LINK_RE.match(s, i)
+            if am:
+                flush()
+                parts.append({"type": "anchor_link",
+                              "text": parse_inline(am.group(1)),
+                              "anchor_name": am.group(2)})
+                i = am.end()
+                continue
+        # v1.20.0: {{2026-09-22 18:00}} date-time marker -> date_time node
+        # (renders in each reader's timezone). Unparseable bodies stay
+        # literal — e.g. Jinja {{ x }} in prose is untouched.
+        if ch == "{":
+            dm = _DT_MARKER_RE.match(s, i)
+            if dm:
+                parsed = _parse_datetime(dm.group(1))
+                if parsed is not None:
+                    flush()
+                    disp, ts = parsed
+                    parts.append({"type": "date_time", "text": disp,
+                                  "unix_time": ts})
+                    i = dm.end()
+                    continue
         matched = False
         for marker, typ in _TWO_CHAR + _ONE_CHAR:
             if not s.startswith(marker, i):
@@ -215,6 +324,29 @@ _EXPAND_MARKER_RE = re.compile(
 _LONG_QUOTE_CHARS = 400
 
 
+# Inline node types with no Markdown rendering: if a reply carries any of
+# these, the server-side markdown path would show raw markers, so the
+# message must go out in blocks form. (v1.20.0: subscript/superscript,
+# date_time, footnote reference nodes, anchors and anchor links.)
+_INLINE_BLOCKS_ONLY = frozenset({
+    "subscript", "superscript", "date_time",
+    "reference", "reference_link", "anchor", "anchor_link",
+})
+
+
+def _richtext_has(node, types):
+    """True when any nested RichText node has a type in `types`."""
+    if isinstance(node, str):
+        return False
+    if isinstance(node, dict):
+        if node.get("type") in types:
+            return True
+        return any(_richtext_has(v, types) for v in node.values())
+    if isinstance(node, list):
+        return any(_richtext_has(v, types) for v in node)
+    return False
+
+
 def needs_blocks_form(blocks):
     """True when the block list contains something the server's Markdown
     parser cannot render, so the daemon must use the blocks form.
@@ -224,7 +356,9 @@ def needs_blocks_form(blocks):
     would arrive as literal text. Paragraphs, dividers, pre fences, plain
     lists and plain quotes render fine through the markdown path (which
     also entity-parses #/@, so we prefer it whenever nothing richer is
-    present).
+    present). Inline nodes in _INLINE_BLOCKS_ONLY (v1.20.0) likewise have
+    no markdown rendering — e.g. ~sub~ would arrive literally — so any
+    block carrying one forces the blocks form too.
     """
     for b in blocks or []:
         if not isinstance(b, dict):
@@ -236,6 +370,8 @@ def needs_blocks_form(blocks):
         if t == "list" and any(
                 isinstance(it, dict) and it.get("has_checkbox")
                 for it in b.get("items", []) or []):
+            return True
+        if _richtext_has(b, _INLINE_BLOCKS_ONLY):
             return True
     return False
 
@@ -269,18 +405,46 @@ def markdown_to_blocks(md):
     """Convert a Telegram-Markdown reply into rich-message blocks.
 
     Covers what the bot's replies actually use: paragraphs, ## headings
-    (real heading blocks, size 1-6), > quotes (long ones become
-    expandable_blockquote), >>> pull quotes (real pullquote blocks),
-    $$math$$ or fenced $$ blocks (real math expressions),
-    <details><summary> expandable sections,
+    (real heading blocks, size 1-6; every heading carries a zero-width
+    anchor node — explicit via ## Title {#my-id} or auto-derived from the
+    heading text — so [text](#my-id) table-of-contents links work),
+    > quotes (long ones become expandable_blockquote), >>> pull quotes
+    (real pullquote blocks), $$math$$ or fenced $$ blocks (real math
+    expressions), <details><summary> expandable sections,
     - / 1. lists, - [ ] / - [x] checklists (real checkbox items),
     ``` code fences (with language), --- dividers, tables (real compact
-    table blocks, first row flagged as header cells), and all inline
-    formatting via parse_inline. Never raises on weird input — worst case
-    it degrades to plain paragraph blocks. Never emits an empty pre block.
+    table blocks, first row flagged as header cells), [^id] footnote refs
+    with trailing [^id]: note definitions (native reference nodes),
+    ~sub~ / ^sup^ (native subscript/superscript), {{YYYY-MM-DD HH:MM}}
+    (native date_time, parsed as IST), and all inline formatting via
+    parse_inline. Never raises on weird input — worst case it degrades to
+    plain paragraph blocks. Never emits an empty pre block.
     """
-    lines = (md or "").split("\n")
+    raw_lines = (md or "").split("\n")
+    # v1.20.0: footnote definitions ("[^id]: note") are collected up front
+    # and removed from the flow; they render as a footnote section at the
+    # end of the message, in order of first reference.
+    lines, footnote_defs, footnote_order = [], {}, []
+    for ln in raw_lines:
+        fm = _FOOTNOTE_DEF_RE.match(ln.strip())
+        if fm:
+            fid = fm.group(1)
+            if fid not in footnote_defs:
+                footnote_order.append(fid)
+            footnote_defs[fid] = fm.group(2).strip()
+        else:
+            lines.append(ln)
     blocks, para = [], []
+    used_anchors = set()
+
+    def take_anchor(name):
+        """Dedupe anchor names: setup, setup-2, ..."""
+        base, n = name, 2
+        while name in used_anchors:
+            name = f"{base}-{n}"
+            n += 1
+        used_anchors.add(name)
+        return name
 
     def flush_para():
         if para:
@@ -412,11 +576,28 @@ def markdown_to_blocks(md):
             continue
         # ## heading -> real heading block (InputRichBlockSectionHeading,
         # official docs: type "heading", text RichText, size 1-6).
+        # v1.20.0: every heading carries a zero-width anchor node so
+        # [text](#id) TOC links can jump to it. Explicit id via
+        # "## Title {#my-id}"; otherwise auto-derived from the heading
+        # text (lowercase, spaces -> hyphens — the prompt documents this
+        # rule so the model can predict link targets).
         m = _HEADING_RE.match(s)
         if m:
             flush_para()
-            blocks.append({"type": "heading",
-                           "text": parse_inline(m.group(2)),
+            title = m.group(2)
+            am = _HEADING_ANCHOR_RE.search(title)
+            if am:
+                aid = take_anchor(am.group(1))
+                title = title[:am.start()].rstrip()
+            else:
+                aid = take_anchor(_slugify(title))
+            text = parse_inline(title)
+            anchor_node = {"type": "anchor", "name": aid}
+            if isinstance(text, str):
+                text = [anchor_node, text] if text else [anchor_node]
+            else:
+                text = [anchor_node] + text
+            blocks.append({"type": "heading", "text": text,
                            "size": len(m.group(1))})
             i += 1
             continue
@@ -540,4 +721,24 @@ def markdown_to_blocks(md):
         para.append(line)
         i += 1
     flush_para()
+    # v1.20.0: footnote definitions render as a footnote section at the
+    # end of the message — one paragraph per note, each a native
+    # "reference" node the [^id] reference_links jump to. Ordered by
+    # first reference in the body; unreferenced definitions are kept
+    # (dropping content is worse than an extra note).
+    if footnote_defs:
+        body_scan = "\n".join(lines)
+        ref_order = []
+        for fid in _FOOTNOTE_REF_RE.findall(body_scan):
+            if fid not in ref_order:
+                ref_order.append(fid)
+        for fid in ref_order + [f for f in footnote_order
+                                if f not in ref_order]:
+            note = footnote_defs[fid]
+            blocks.append({
+                "type": "paragraph",
+                "text": [{"type": "reference",
+                          "text": parse_inline(note) if note else "",
+                          "name": fid}],
+            })
     return blocks or [{"type": "paragraph", "text": ""}]

@@ -788,5 +788,71 @@ class TestRegressions(unittest.TestCase):
                        "4096")
 
 
+# ---------------------------------------------------------------------------
+# v1.20.0: corrected node shapes (official Bot API 10.1 field tables)
+# ---------------------------------------------------------------------------
+
+class TestV120Nodes(unittest.TestCase):
+    def para(self, text):
+        return rich([{"type": "paragraph", "text": text}])
+
+    # date_time: text + unix_time (required), date_time_format optional.
+    def test_date_time_valid(self):
+        n = {"type": "date_time", "text": "22 Sep 2026, 6:00 PM IST",
+             "unix_time": 1790080200}
+        assert_valid(self, self.para(n), "sendRichMessage")
+
+    def test_date_time_with_format_valid(self):
+        n = {"type": "date_time", "text": "x", "unix_time": 1,
+             "date_time_format": "d MMM yyyy"}
+        assert_valid(self, self.para(n), "sendRichMessage")
+
+    def test_date_time_missing_unix_time_rejected(self):
+        n = {"type": "date_time", "text": "x"}
+        assert_invalid(self, self.para(n), "sendRichMessage", ".unix_time")
+
+    def test_date_time_bad_unix_time_rejected(self):
+        n = {"type": "date_time", "text": "x", "unix_time": "now"}
+        assert_invalid(self, self.para(n), "sendRichMessage", ".unix_time")
+
+    # reference / reference_link (footnotes): name / reference_name required.
+    def test_reference_valid(self):
+        n = {"type": "reference", "text": "the note", "name": "1"}
+        assert_valid(self, self.para(n), "sendRichMessage")
+
+    def test_reference_missing_name_rejected(self):
+        n = {"type": "reference", "text": "the note"}
+        assert_invalid(self, self.para(n), "sendRichMessage", ".name")
+
+    def test_reference_link_valid(self):
+        n = {"type": "reference_link", "text": "[1]", "reference_name": "1"}
+        assert_valid(self, self.para(n), "sendRichMessage")
+
+    def test_reference_link_missing_name_rejected(self):
+        n = {"type": "reference_link", "text": "[1]"}
+        assert_invalid(self, self.para(n), "sendRichMessage",
+                       ".reference_name")
+
+    # anchor_link: official field is anchor_name (the old guessed "name"
+    # shape is now rejected).
+    def test_anchor_link_valid(self):
+        n = {"type": "anchor_link", "text": "jump", "anchor_name": "sec1"}
+        assert_valid(self, self.para(n), "sendRichMessage")
+
+    def test_anchor_link_old_name_shape_rejected(self):
+        n = {"type": "anchor_link", "text": "jump", "name": "sec1"}
+        assert_invalid(self, self.para(n), "sendRichMessage", "anchor_name")
+
+    # converter round-trip: emitted nodes must validate clean.
+    def test_converter_output_validates(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from ron_richblocks import markdown_to_blocks
+        md = ("## Guide\n\nSee [details](#details) and H~2~O at "
+              "{{2026-09-22 18:00}}.[^1]\n\n[^1]: a note")
+        blocks = markdown_to_blocks(md)
+        assert_valid(self, rich(blocks), "sendRichMessage")
+
+
+
 if __name__ == "__main__":
     unittest.main()

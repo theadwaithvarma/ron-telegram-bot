@@ -1,28 +1,36 @@
-## 1.19.1 — formatting mistake audit + fixes (2026-09-21)
+## 1.20.0 — four missing rich-formatting features + group-ping tail fix (2026-09-21)
 
-Found by probing the live model with 10 formatting-heavy prompts and by
-mining the daemon log:
+API surface gap analysis (Bot API 9.3 reference) turned up four RichText
+features Ron's converter never emitted. All four are now live:
 
-- **Validator was silently killing pull quotes and math.** v1.18.1 taught
-  the converter to emit `pullquote` / `mathematical_expression` blocks,
-  but the pre-send validator's allowlist still rejected them — 8+ live
-  replies fell back to Markdown with literal `>>>` / `$$` text showing.
-  Both block types are now allowlisted with field checks (4 new tests).
-- **Model weakness: spoilers inside table cells.** Asked to put a spoiler
-  in a cell, the model wrote a malformed `||Blazing fast|` that shattered
-  the row (the `||` pipes collide with column separators). Prompt now
-  forbids pipes inside table cells (repo default + live override).
-- **`>>>` pull quotes were swallowed by preceding `>` quote blocks** —
-  the quote collector ate them as continuations. Fixed; 1 new test.
-- **Unclosed `<details>` leaked raw tags as paragraph text; nested
-  `<details>` leaked inner tags.** The collector now depth-counts and
-  auto-closes at end of input — always a real details block, never raw
-  tags. 2 new tests (one updated).
-- Stale log noise investigated: a `username` NameError hit 6 streams at a
-  single boot and never recurred — transient deploy mix, not a code bug.
+- **Footnotes.** `Claim here[^1].` with `[^1]:` definitions emits
+  `reference_link` / `reference` blocks; definitions are lifted out of
+  paragraph flow and ordered by first reference.
+- **Anchor jump-links.** Every heading gets an automatic anchor
+  (`## Setup` -> `#setup`); explicit `## Setup {#id}` supported;
+  duplicates become `setup-2`. Links emit `anchor_link` (`anchor_name`).
+- **Subscript / superscript.** `H~2~O`, `x^2^` emit `subscript` /
+  `superscript`; `~~strikethrough~~` still matches first, unbalanced
+  markers stay literal, `^` is now escapable.
+- **Localized date-time.** `{{2026-09-22 18:00}}` emits `date_time`
+  with display text + integer `unix_time` (IST interpretation; several
+  date formats accepted; invalid markers stay literal).
 
-38 + 139 validator/block tests green; full suite 560 (3 pre-existing
-`cryptography` import errors unchanged).
+Converter, validator field shapes (corrected per the API reference),
+`needs_blocks_form()`, plain-text fallback, and the AI prompt (repo
+default + live `ron_ai.json`) all updated. 21 + 11 new converter /
+validator tests.
+
+- **Group-ping tail fix.** `[send_group: G | msg]` tacked onto the end
+  of a sentence was stripped by `strip_trailer_syntax()` but never
+  fired — silent failure, the user saw "done!" with nothing posted.
+  `handle_group_sends()` now executes tail-form matches too, with
+  overlap-dedupe against own-line matches so a ping never posts twice
+  (7 new tests, verified failing on the old code).
+
+53 + 150 converter/validator tests green; full suite 603 (3 pre-existing
+`cryptography` import errors and 1 pre-existing discovery-order failure
+in test_who_line unchanged).
 
 ## 1.19.1 — formatting mistake audit + fixes (2026-09-21)
 

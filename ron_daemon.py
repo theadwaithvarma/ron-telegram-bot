@@ -1878,17 +1878,19 @@ def send_group_ping(group_chat_id, user_id, first_name, message):
 
 def handle_group_sends(origin_chat_id, user_id, user_name, reply):
     """Execute [send_group: ...] trailers the model emitted."""
-    for m in GROUP_RE.finditer(reply):
+    seen = []
+
+    def _fire(m):
         inner = m.group(1)
         if "|" not in inner:
-            continue
+            return
         gname, message = (x.strip() for x in inner.split("|", 1))
         if not gname or not message:
-            continue
+            return
         gid, err = resolve_group(gname)
         if err:
             send(origin_chat_id, err)
-            continue
+            return
         title = load_known_groups().get(str(gid), {}).get("title", "the group")
         if send_group_ping(gid, user_id, user_name, message):
             print(f"[ron_daemon] group ping -> {title} for {user_id}",
@@ -1896,6 +1898,19 @@ def handle_group_sends(origin_chat_id, user_id, user_name, reply):
         else:
             send(origin_chat_id, f"Couldn't post in {title} — try again?")
 
+    for m in GROUP_RE.finditer(reply):
+        _fire(m)
+        seen.append(m.span())
+    # v1.20.0: the model sometimes tacks the trailer onto the end of a
+    # sentence instead of its own line ("Done! [send_group: G | hi]").
+    # GROUP_TAIL_RE catches that form — but a trailer alone on the final
+    # line matches BOTH regexes, so tail matches overlapping an already
+    # fired GROUP_RE span are skipped: a ping must never post twice.
+    for m in GROUP_TAIL_RE.finditer(reply):
+        s, e = m.span()
+        if any(s < es and ss < e for ss, es in seen):
+            continue
+        _fire(m)
 
 def strip_trailer_syntax(reply):
     """Remove every trailer form: [buttons:...]/[links:...]/[send_group:...]
@@ -2120,6 +2135,11 @@ def strip_markdown(t):
     t = re.sub(r"```[^`\s]*\n?", "", t)
     t = re.sub(r"[*_`~]", "", t)
     t = re.sub(r"\|\||==", "", t)  # spoiler ||..|| / highlight ==..== markers
+    # v1.20.0: new markers degrade to their inner text, never raw syntax.
+    t = re.sub(r"\^([^^\n]+)\^", r"\1", t)        # ^superscript^ -> text
+    t = re.sub(r"\[\^([\w-]+)\]", r"[\1]", t)     # [^1] -> [1] (refs + defs)
+    t = re.sub(r"\{\{([^}\n]+)\}\}", r"\1", t)     # {{2026-09-22 18:00}}
+    t = re.sub(r"\s*\{#[\w-]+\}", "", t)          # ## Title {#anchor}
     t = re.sub(r"^#{1,6}\s+", "", t, flags=re.M)
     t = re.sub(r"^>\s?", "", t, flags=re.M)
     t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)

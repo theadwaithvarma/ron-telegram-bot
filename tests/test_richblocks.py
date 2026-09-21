@@ -10,7 +10,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from ron_richblocks import parse_inline, text_blocks, markdown_to_blocks
+from ron_richblocks import (parse_inline, text_blocks, markdown_to_blocks,
+                            needs_blocks_form)
 
 
 class TestParseInline(unittest.TestCase):
@@ -84,10 +85,13 @@ class TestMarkdownToBlocks(unittest.TestCase):
 
     def test_heading_is_real_heading_block(self):
         # v1.18.0: headings are real heading blocks (InputRichBlockSectionHeading).
+        # v1.20.0: every heading carries a zero-width anchor node so
+        # [text](#id) TOC links can jump to it.
         blks = markdown_to_blocks("## Title")
         self.assertEqual(blks[0]["type"], "heading")
         self.assertEqual(blks[0]["size"], 2)
-        self.assertEqual(blks[0]["text"], "Title")
+        self.assertEqual(blks[0]["text"],
+                         [{"type": "anchor", "name": "title"}, "Title"])
         blks = markdown_to_blocks("# Big")
         self.assertEqual(blks[0]["size"], 1)
 
@@ -193,6 +197,143 @@ class TestFenceAndNestingFixes(unittest.TestCase):
         pres = [b for b in blocks if b.get("type") == "pre"]
         self.assertEqual(len(pres), 1)
         self.assertEqual(pres[0]["text"], "x = 1")
+
+
+# ---------------------------------------------------------------------------
+# v1.20.0: subscript/superscript, footnotes, anchors, date-time
+# ---------------------------------------------------------------------------
+
+class TestSubSuperScript(unittest.TestCase):
+    def test_subscript(self):
+        self.assertEqual(parse_inline("H~2~O"),
+                         ["H", {"type": "subscript", "text": "2"}, "O"])
+
+    def test_superscript(self):
+        self.assertEqual(parse_inline("x^2^"),
+                         ["x", {"type": "superscript", "text": "2"}])
+
+    def test_strikethrough_double_tilde_still_wins(self):
+        # ~~ is matched before single ~, so strikethrough is undisturbed.
+        self.assertEqual(parse_inline("~~gone~~")["type"], "strikethrough")
+        out = parse_inline("~a~ and ~~b~~")
+        self.assertEqual(out[0]["type"], "subscript")
+        self.assertEqual(out[2]["type"], "strikethrough")
+
+    def test_unbalanced_markers_stay_literal(self):
+        self.assertEqual(parse_inline("a^b"), "a^b")
+        self.assertEqual(parse_inline("~/.ssh/config"), "~/.ssh/config")
+        self.assertEqual(parse_inline("it costs ~5 dollars"), "it costs ~5 dollars")
+
+    def test_caret_escapable(self):
+        self.assertEqual(parse_inline("a\\^b"), "a^b")
+
+    def test_nested_inside_bold(self):
+        out = parse_inline("**H~2~O**")
+        self.assertEqual(out["type"], "bold")
+        kinds = [n if isinstance(n, str) else n.get("type")
+                 for n in out["text"]]
+        self.assertIn("subscript", kinds)
+
+
+class TestFootnotes(unittest.TestCase):
+    def test_ref_inline(self):
+        out = parse_inline("see this[^1] ok")
+        self.assertIn({"type": "reference_link", "text": "[1]",
+                       "reference_name": "1"}, out)
+
+    def test_definitions_become_footnote_section(self):
+        blks = markdown_to_blocks("Claim here[^a].\n\n[^a]: the supporting note")
+        self.assertEqual([b["type"] for b in blks],
+                         ["paragraph", "paragraph"])
+        text = blks[1]["text"]
+        nodes = text if isinstance(text, list) else [text]
+        refs = [n for n in nodes
+                if isinstance(n, dict) and n.get("type") == "reference"]
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["name"], "a")
+        self.assertIn("supporting note", str(refs[0]["text"]))
+
+    def test_definition_lines_are_not_paragraphs(self):
+        blks = markdown_to_blocks("[^1]: just a note")
+        self.assertEqual(len(blks), 1)
+        self.assertEqual(blks[0]["type"], "paragraph")
+
+    def test_order_follows_first_reference(self):
+        blks = markdown_to_blocks("b[^2] a[^1]\n\n[^1]: one\n[^2]: two")
+        names = [b["text"][0]["name"] for b in blks[1:]]
+        self.assertEqual(names, ["2", "1"])
+
+    def test_unreferenced_definition_kept(self):
+        blks = markdown_to_blocks("Hi.\n\n[^x]: orphan note")
+        self.assertEqual(len(blks), 2)
+
+
+class TestAnchors(unittest.TestCase):
+    def test_heading_gets_auto_anchor(self):
+        blks = markdown_to_blocks("## Installation Guide")
+        h = blks[0]
+        self.assertEqual(h["type"], "heading")
+        self.assertIsInstance(h["text"], list)
+        self.assertEqual(h["text"][0],
+                         {"type": "anchor", "name": "installation-guide"})
+
+    def test_explicit_anchor_id(self):
+        blks = markdown_to_blocks("## Setup {#quick-setup}")
+        self.assertEqual(blks[0]["text"][0],
+                         {"type": "anchor", "name": "quick-setup"})
+        self.assertNotIn("{#", str(blks[0]["text"]))
+
+    def test_anchor_link(self):
+        out = parse_inline("[jump](#installation-guide)")
+        self.assertEqual(out, {"type": "anchor_link", "text": "jump",
+                               "anchor_name": "installation-guide"})
+
+    def test_duplicate_headings_deduped(self):
+        blks = markdown_to_blocks("## Setup\n\n## Setup")
+        names = [b["text"][0]["name"] for b in blks]
+        self.assertEqual(names, ["setup", "setup-2"])
+
+
+class TestDateTime(unittest.TestCase):
+    def test_datetime_marker(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        out = parse_inline("meet {{2026-09-22 18:00}} ok")
+        nodes = [p for p in out if isinstance(p, dict)]
+        self.assertEqual(len(nodes), 1)
+        node = nodes[0]
+        self.assertEqual(node["type"], "date_time")
+        exp = int(datetime(2026, 9, 22, 18, 0,
+                           tzinfo=ZoneInfo("Asia/Kolkata")).timestamp())
+        self.assertEqual(node["unix_time"], exp)
+        self.assertIn("22 Sep 2026", node["text"])
+
+    def test_date_only(self):
+        out = parse_inline("{{2026-09-22}}")
+        self.assertEqual(out["type"], "date_time")
+        self.assertIn("22 Sep 2026", out["text"])
+
+    def test_invalid_stays_literal(self):
+        self.assertEqual(parse_inline("{{not a date}}"), "{{not a date}}")
+        self.assertEqual(parse_inline("{{2026-13-45}}"), "{{2026-13-45}}")
+        # Jinja-style template syntax in prose is untouched.
+        self.assertEqual(parse_inline("{{ x }}"), "{{ x }}")
+
+    def test_inside_code_stays_literal(self):
+        out = parse_inline("`{{2026-09-22}}`")
+        self.assertEqual(out, {"type": "code", "text": "{{2026-09-22}}"})
+
+
+class TestNeedsBlocksFormV120(unittest.TestCase):
+    def test_new_syntax_forces_blocks_form(self):
+        for md in ("H~2~O", "x^2^", "see[^1]\n\n[^1]: n",
+                   "[t](#a)\n\n## A", "{{2026-09-22 18:00}}"):
+            blks = markdown_to_blocks(md)
+            self.assertTrue(needs_blocks_form(blks), md)
+
+    def test_plain_markdown_unaffected(self):
+        blks = markdown_to_blocks("plain **bold** and ~~strike~~")
+        self.assertFalse(needs_blocks_form(blks))
 
 
 if __name__ == "__main__":
