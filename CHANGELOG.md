@@ -1,3 +1,31 @@
+## 1.24.0 — Guest Mode + smart one-shot answers (2026-09-21)
+
+Adwaith asked for Telegram's Guest Bots feature (Bot API 10.0): anyone can
+@mention @ronrebootedbot in a group or 1-on-1 chat the bot isn't a member
+of, and the bot answers right there. Guest mode was already enabled on the
+bot (`supports_guest_queries: true`); the daemon just never spoke the
+protocol.
+
+- **`guest_message` update.** Subscribed in `allowed_updates` and routed to
+  a new `handle_guest_message()`. The @mention is stripped to get the real
+  question; the ONLY write is `answerGuestQuery` — the bot only ever sees
+  the tagged message, so `sendMessage` to those chats is never attempted.
+  Banned callers get silence.
+- **Smart answers, not echoes.** Both guest mentions and inline queries now
+  run through a new `ron_ai.quick_answer()`: one-shot, cheap-model-first
+  with the full provider chain behind it (429 cooldowns, 5xx breaker,
+  failover), 30s cap, no history/memory writes (there's no real chat to
+  remember). Inline's old echo-the-query card survives only as the degraded
+  fallback when the brain hiccups; guests fall back to a how-to card.
+- **Abuse throttle.** 5 one-shot answers per caller per 60s; over that,
+  a provider-neutral "too many requests — slow down" card.
+- **Observability.** Successful `answerInlineQuery`/`answerGuestQuery`
+  calls now log one line — tonight's inline outage was undebuggable
+  precisely because successes were silent.
+- **Tests.** `tests/test_guest_mode.py`: 15 offline tests (mention
+  stripping, ban silence, throttle, echo fallback, trailer stripping,
+  quick_answer shape/timeout/cheap routing).
+
 ## 1.23.0 — Stop-button UX: no fallback after an intentional stop (2026-09-21)
 
 Adwaith hit it live during the 5xx outage: he pressed Stop twice, and

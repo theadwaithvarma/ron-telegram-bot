@@ -4179,35 +4179,134 @@ def handle_update(upd):
 
 
 # ---------------------------------------------------------------------------
-# Inline mode (Bot API inline_query) — the other end of [switch_inline:]
-# buttons. A tap lands the user in "@RonRebootedBot <query>" in any chat;
-# Telegram only delivers these updates to bots with Inline Mode enabled in
-# BotFather, so until Adwaith flips that switch this handler never fires.
-# ---------------------------------------------------------------------------
+# One-shot Q&A: smart answers for inline + guest queries (v1.24.0) ---------
+# Both entry points share one core: a cheap-model-first AI answer with the
+# full provider chain behind it, no history/memory writes (there is no real
+# chat to remember), and a per-caller throttle so one user can't burn the
+# API budget. Inline answers also back the [switch_inline:] buttons.
+_ONE_SHOT_THROTTLE = {}       # caller_key -> [monotonic timestamps]
+_ONE_SHOT_LIMIT = 5           # answers ...
+_ONE_SHOT_WINDOW = 60.0       # ... per this many seconds
+_ONE_SHOT_TRAILERS = ("buttons", "links", "copy", "switch_inline", "login",
+                      "reply_keyboard")
+
+
+def _one_shot_allowed(caller_key):
+    now = time.monotonic()
+    hits = [t for t in _ONE_SHOT_THROTTLE.get(caller_key, [])
+            if now - t < _ONE_SHOT_WINDOW]
+    if len(hits) >= _ONE_SHOT_LIMIT:
+        _ONE_SHOT_THROTTLE[caller_key] = hits
+        return False
+    hits.append(now)
+    _ONE_SHOT_THROTTLE[caller_key] = hits
+    return True
+
+
+def _smart_one_shot(query, user_name="there"):
+    """AI answer for a one-shot query. Trailers are stripped: cards can't
+    carry the bot's button markup, and one-shot callers are strangers."""
+    reply = ron_ai.quick_answer(query, user_name)
+    for _name in _ONE_SHOT_TRAILERS:
+        reply = _strip_trailer(reply, _name)
+    return _strip_hide_keyboard(reply).strip()
+
+
+def _answer_card(cid, title, text, description=None):
+    return {"type": "article", "id": cid, "title": title,
+            "description": (description or text[:120]),
+            "input_message_content": {"message_text": text}}
+
+
+def _slowdown_card():
+    return _answer_card(
+        "slowdown", "Too many requests — slow down",
+        "You're asking too fast — give it a minute, then try again.")
+
+
 def handle_inline_query(iq):
     iq_id = iq.get("id")
     if not iq_id:
         return
     query = (iq.get("query") or "").strip()
+    frm = iq.get("from") or {}
+    caller_key = f"iq:{frm.get('id') or 'anon'}"
+    user_name = frm.get("first_name") or "there"
     results = []
     if query:
-        results.append({
-            "type": "article", "id": "askron",
-            "title": f"Ask Ron: {query[:60]}",
-            "description": "Inserts your question as a message",
-            "input_message_content": {"message_text": query},
-        })
-    results.append({
-        "type": "article", "id": "openron",
-        "title": "Open Ron chat",
-        "description": "t.me/RonRebootedBot — chat with Ron directly",
-        "input_message_content": {"message_text": "t.me/RonRebootedBot"},
-    })
+        if _one_shot_allowed(caller_key):
+            try:
+                answer = _smart_one_shot(query, user_name)
+                results.append(_answer_card("askron", "Ron's answer",
+                                            answer, query[:100]))
+            except Exception as e:
+                # Degraded but functional: fall back to echoing the query
+                # so inline never looks broken when the brain hiccups.
+                print(f"[ron_daemon] inline smart answer failed: {e}",
+                      flush=True)
+                results.append(_answer_card(
+                    "askron", f"Ask Ron: {query[:60]}", query,
+                    "Inserts your question as a message"))
+        else:
+            results.append(_slowdown_card())
+    results.append(_answer_card(
+        "openron", "Open Ron chat", "t.me/RonRebootedBot",
+        "Chat with Ron directly"))
     r = api("answerInlineQuery", {"inline_query_id": iq_id,
                                   "results": json.dumps(results),
                                   "cache_time": 0})
-    if not r.get("ok"):
+    if r.get("ok"):
+        print(f"[ron_daemon] inline query answered "
+              f"({len(results)} result(s))", flush=True)
+    else:
         print(f"[ron_daemon] answerInlineQuery failed: {str(r)[:150]}",
+              flush=True)
+
+
+def handle_guest_message(gm):
+    """Bot API 10.0 Guest Mode: the bot was @mentioned in a chat it isn't a
+    member of. The bot only ever sees the tagged message (and replies to
+    it); caller context is limited to guest_bot_caller_user/chat when
+    Telegram provides it. The ONLY write allowed here is answerGuestQuery —
+    never try sendMessage to these chats."""
+    qid = gm.get("guest_query_id")
+    if not qid:
+        return
+    text = (gm.get("text") or gm.get("caption") or "").strip()
+    query = re.sub(r"@" + re.escape(BOT_USERNAME), "", text,
+                   flags=re.I).strip()
+    caller = gm.get("guest_bot_caller_user") or {}
+    caller_id = caller.get("id")
+    if caller_id and ron_owner.is_banned(caller_id):
+        return  # banned callers get silence
+    caller_key = f"gq:{caller_id or 'anon'}"
+    user_name = caller.get("first_name") or "there"
+    results = []
+    if query:
+        if _one_shot_allowed(caller_key):
+            try:
+                answer = _smart_one_shot(query, user_name)
+                results.append(_answer_card("guestanswer", "Ron's answer",
+                                            answer, query[:100]))
+            except Exception as e:
+                print(f"[ron_daemon] guest smart answer failed: {e}",
+                      flush=True)
+        else:
+            results.append(_slowdown_card())
+    if not results:
+        results.append(_answer_card(
+            "openron", "Ask Ron",
+            "Mention @ronrebootedbot with your question, or chat at "
+            "t.me/RonRebootedBot",
+            "How to use Ron here"))
+    r = api("answerGuestQuery", {"guest_query_id": qid,
+                                 "results": json.dumps(results),
+                                 "cache_time": 0})
+    if r.get("ok"):
+        print(f"[ron_daemon] guest query answered "
+              f"({len(results)} result(s))", flush=True)
+    else:
+        print(f"[ron_daemon] answerGuestQuery failed: {str(r)[:150]}",
               flush=True)
 
 
@@ -4353,6 +4452,7 @@ def main():
                                    "allowed_updates": ["message", "callback_query",
                                                        "inline_query",
                                                        "chosen_inline_result",
+                                                       "guest_message",
                                                        "stopped_message_generation",
                                                        "business_connection",
                                                        "business_message",
@@ -4370,10 +4470,11 @@ def main():
                         handle_callback(upd["callback_query"])
                     elif "inline_query" in upd:
                         # switch_inline_query buttons route users here.
-                        # Inert until Adwaith enables Inline Mode in
-                        # BotFather — Telegram only delivers these to
-                        # opted-in bots.
                         handle_inline_query(upd["inline_query"])
+                    elif "guest_message" in upd:
+                        # Bot API 10.0 Guest Mode: @mention in a chat the
+                        # bot isn't a member of — answer via answerGuestQuery.
+                        handle_guest_message(upd["guest_message"])
                     elif "business_connection" in upd:
                         handle_business_connection(upd["business_connection"])
                     elif "business_message" in upd:

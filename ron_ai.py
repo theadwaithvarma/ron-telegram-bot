@@ -955,6 +955,45 @@ def chat(chat_id, user_text, user_name="there", system_extra="",
     return reply
 
 
+def quick_answer(query_text, user_name="there"):
+    """One-shot AI answer for inline/guest queries (v1.24.0).
+
+    No chat history, no memory hooks, no turn saving, no cache — just the
+    answer. Cheap-model-first with the full provider chain behind it, so
+    the 429 cooldowns, 5xx circuit breaker, and failover all apply.
+    Raises like chat() on backend failure: RuntimeError("AI key not
+    connected yet") when no provider has a key, RateLimitedError when
+    every provider 429s, RuntimeError on an empty reply.
+    """
+    query_text = (query_text or "").strip()
+    if not query_text:
+        raise RuntimeError("empty query")
+    cfg = load_config()
+    system = (cfg.get("system") or "") + (
+        "\n[One-shot card answer: a stranger invoked the bot with a single "
+        "question and your reply is shown as a card in their chat. Answer "
+        "directly and concisely — a few short sentences max. No follow-up "
+        "questions, no button/trailer markup like [links: ...], no markdown "
+        "tables, plain text only.]")
+    messages = [{"role": "system", "content": system},
+                {"role": "user",
+                 "content": f"{user_name} asks: {query_text}"}]
+    try:
+        # 30s: inline/guest clients won't wait around; cheap=True puts the
+        # small model first for speed, the big models stay behind it for
+        # 429/5xx failover.
+        resp = _request(cfg, messages, stream=False, timeout=30, cheap=True)
+        with resp:
+            data = json.loads(resp.read().decode())
+    except DynamicCredentialError:
+        raise RuntimeError("AI key not connected yet")
+    reply = (data.get("choices") or [{}])[0].get("message", {}).get(
+        "content", "").strip()
+    if not reply:
+        raise RuntimeError("AI backend returned empty reply")
+    return reply[:MAX_REPLY]
+
+
 if __name__ == "__main__":
     print(chat("selftest", "Reply with exactly: brain online"))
 
