@@ -1,3 +1,30 @@
+## 1.21.1 — phantom buttons fix (2026-09-21)
+
+Adwaith hit it live: he said "show all buttons", the model replied "Pick
+an option:" with a `[buttons:]` trailer, and the contextual filter dropped
+every label — button-promising text with zero buttons underneath.
+
+- **Explicit-request bypass.** When the user's message explicitly asks for
+  buttons (`show/display/list/give/need/want … button(s)`, or `/menu`),
+  the contextual `_button_fits_context` filter is skipped for that turn.
+  The boilerplate deny-list still drops junk labels either way. The flag
+  threads from the incoming message text through `send_rich_with_kb`
+  (new `user_text` param) into `parse_trailers(reply,
+  skip_context_filter=...)`, covering the streaming, cached, vision, and
+  degraded-replay send paths.
+- **Comma fallback.** The model sometimes emits comma-separated labels as
+  one giant button (`[buttons: Ask a question, Get coding help, …]`). `|`
+  stays the primary separator; when a `[buttons:]` body has no pipe but
+  has commas, labels now split on commas (logged, since the prompt says
+  pipes).
+- **Prompt hardening.** New "Button trailer rules." paragraph in both the
+  repo prompt and the live `ron_ai.json` (word-for-word identical): `|`
+  only, one label per button, never commas; never announce buttons in
+  visible text ("Pick an option:") — they render automatically and
+  announcing reads broken if any get filtered; if the reply describes
+  options, the matching trailer MUST be emitted on the same reply; an
+  explicit button request must always be honored with a real trailer.
+
 ## 1.21.0 — all remaining Telegram button types (2026-09-21)
 
 Every button type from the platform list now works on the bot:

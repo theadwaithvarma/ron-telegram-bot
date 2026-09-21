@@ -375,7 +375,8 @@ def _drain_queue():
                                 is_private=_dq_private)
             send_rich_with_kb(e["chat_id"], reply, e.get("reply_to"),
                               e.get("thread_id"),
-                              e.get("business_connection_id"))
+                              e.get("business_connection_id"),
+                              user_text=e["text"])
             handle_group_sends(e["chat_id"], e.get("user_id"),
                                e.get("user_name", "there"), reply)
             handle_send_topic(e["chat_id"], e.get("user_id"),
@@ -1991,6 +1992,36 @@ _BUTTON_STOPWORDS = frozenset({
 })
 
 
+# A user message that explicitly asks for buttons bypasses the contextual
+# filter for that turn — if the user asked for buttons, dropping them all
+# is the bug ("phantom buttons", v1.21.1). Tight on purpose: a request
+# verb near "button(s)". Negative cases that must NOT match: "press the
+# button below", "the button says ok", "buttons are cool", prose that
+# merely mentions buttons.
+_EXPLICIT_BUTTON_RE = re.compile(
+    r"\b(show|display|list|give|need|want)\b.{0,30}\bbuttons?\b", re.I)
+_EXPLICIT_MENU_RE = re.compile(r"^/menu\s*$")
+
+
+def _explicit_button_request(text):
+    """True when the user's incoming message explicitly asks for buttons."""
+    t = (text or "").strip()
+    if _EXPLICIT_MENU_RE.match(t):
+        return True
+    return bool(_EXPLICIT_BUTTON_RE.search(t))
+
+
+def _button_denied(label):
+    """Boilerplate labels are never contextual, whatever the reply says.
+
+    Split out of _button_fits_context so the deny-list survives even when
+    an explicit button request bypasses the contextual filter (v1.21.1).
+    """
+    norm = re.sub(r"[^a-z0-9 ]", "", (label or "").lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return norm in _BUTTON_DENY
+
+
 def _button_fits_context(label, visible):
     """True if a quick-reply label is grounded in the reply's topic.
 
@@ -2005,7 +2036,7 @@ def _button_fits_context(label, visible):
     """
     norm = re.sub(r"[^a-z0-9 ]", "", (label or "").lower())
     norm = re.sub(r"\s+", " ", norm).strip()
-    if not norm or norm in _BUTTON_DENY:
+    if not norm or _button_denied(label):
         return False
     low_visible = (visible or "").lower()
     if _CODE_LABEL_RE.search(norm):
@@ -2021,7 +2052,7 @@ def _button_fits_context(label, visible):
     return any(w in low_visible for w in words)
 
 
-def parse_trailers(reply):
+def parse_trailers(reply, skip_context_filter=False):
     """Pull button trailer lines into reply_markup.
 
     [buttons: ...] / [links: ...] -> inline keyboard (existing behavior);
@@ -2030,7 +2061,9 @@ def parse_trailers(reply):
     "login_url" is configured), [reply_keyboard: a, b, c] (shortcut menu),
     [hide_keyboard] (dismiss the menu). A message can only carry ONE
     reply_markup kind — an inline keyboard wins; a dropped menu is logged.
-    Returns (clean_text, reply_markup_dict_or_None)."""
+    skip_context_filter=True (v1.21.1): the user's message explicitly
+    asked for buttons, so off-topic quick replies are kept — the deny-list
+    still drops boilerplate. Returns (clean_text, reply_markup_dict_or_None)."""
     btns = (BTN_RE.search(reply) or BTN_TAIL_RE.search(reply) or [None, None])[1]
     links = (LINK_RE.search(reply) or LINK_TAIL_RE.search(reply) or [None, None])[1]
     copies = (COPY_RE.search(reply) or COPY_TAIL_RE.search(reply) or [None, None])[1]
@@ -2048,10 +2081,22 @@ def parse_trailers(reply):
     if btns:
         btns = btns.replace("||", "")
     if btns:
+        # v1.21.1: the model sometimes emits comma-separated labels as one
+        # giant button ("a, b, c"). "|" stays the primary separator —
+        # commas are only a fallback when no pipe is present.
+        if "|" in btns:
+            parts = btns.split("|")
+        elif "," in btns:
+            print(f"[ron_daemon] trailer: [buttons:] has no pipes, "
+                  f"splitting on commas (prompt says pipes): {btns!r}",
+                  flush=True)
+            parts = btns.split(",")
+        else:
+            parts = [btns]
         # callback_data is capped at 64 bytes by Telegram — truncate by bytes,
         # not chars, so multibyte labels can't produce BUTTON_DATA_INVALID.
         row = []
-        for b in (x.strip() for x in btns.split("|")):
+        for b in (x.strip() for x in parts):
             if not b:
                 continue
             # The AI sometimes puts link syntax inside [buttons: ...] —
@@ -2071,8 +2116,17 @@ def parse_trailers(reply):
             if label:
                 # 2026-09-21: drop quick replies that aren't about this
                 # reply's topic ("Summary" on a one-liner, "Fix code" on a
-                # non-code topic). Off-topic buttons are worse than none.
-                if not _button_fits_context(label, clean):
+                # non-code topic). Off-topic buttons are worse than none —
+                # UNLESS the user explicitly asked for buttons this turn
+                # (skip_context_filter), in which case dropping them all
+                # was the "phantom buttons" bug. The deny-list still drops
+                # boilerplate either way.
+                if _button_denied(label):
+                    print(f"[ron_daemon] trailer: denied boilerplate "
+                          f"button dropped: {label!r}", flush=True)
+                    continue
+                if not skip_context_filter and not _button_fits_context(
+                        label, clean):
                     print(f"[ron_daemon] trailer: off-topic button dropped: "
                           f"{label!r}", flush=True)
                     continue
@@ -2098,7 +2152,11 @@ def parse_trailers(reply):
             if not label or not ctext:
                 print(f"[ron_daemon] trailer: [copy:] dropped, empty "
                       f"label or text: {copies!r}", flush=True)
-            elif not _button_fits_context(label, clean):
+            elif _button_denied(label):
+                print(f"[ron_daemon] trailer: denied boilerplate copy "
+                      f"button dropped: {label!r}", flush=True)
+            elif not skip_context_filter and not _button_fits_context(
+                    label, clean):
                 print(f"[ron_daemon] trailer: off-topic copy button dropped: "
                       f"{label!r}", flush=True)
             else:
@@ -3111,7 +3169,7 @@ def send_blocks(chat_id, blocks, reply_to=None, thread_id=None,
 
 
 def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
-                      business_connection_id=None):
+                      business_connection_id=None, user_text=""):
     """Trailer parsing + IN-BUBBLE rich buttons with safe fallbacks.
 
     When the reply carries [buttons:]/[links:] trailers, the message goes
@@ -3119,8 +3177,17 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
     the markdown, plus one buttons block per row) so the buttons render
     inside the bubble. Any failure degrades to the classic markdown +
     under-bubble keyboard, then plain text — the reply always lands.
+
+    user_text: the incoming user message. When it explicitly asks for
+    buttons ("show all buttons", "/menu"), the contextual button filter
+    is bypassed for this turn (v1.21.1 — the "phantom buttons" bug).
     """
-    clean, markup = parse_trailers(reply)
+    skip = _explicit_button_request(user_text)
+    if skip:
+        print(f"[ron_daemon] trailer: explicit button request "
+              f"{user_text[:40]!r} — contextual filter bypassed this turn",
+              flush=True)
+    clean, markup = parse_trailers(reply, skip_context_filter=skip)
     if not clean:
         clean = "On it ✓"  # trailer-only/empty reply: say something
     # In-bubble rich buttons only come from an inline keyboard; reply
@@ -3211,13 +3278,13 @@ def canned_reply(text, chat_id):
     return variants[abs(hash((str(chat_id), norm))) % len(variants)]
 
 
-def _stream_with_draft(chat_id, produce):
+def _stream_with_draft(chat_id, produce, user_text=""):
     """Shared native-draft streaming core (Bot API sendMessageDraft).
 
     produce(on_token, stop_event) runs the AI call and returns the full
     reply text. Handles the stop-event slot, throttled draft pushes, and
-    the final rich send. Returns the reply text.
-    """
+    the final rich send. Returns the reply text. user_text threads the
+    explicit-button-request flag to the final send (v1.21.1)."""
     stop_event = threading.Event()
     STOP_EVENTS[chat_id] = stop_event
     buf = []
@@ -3267,7 +3334,7 @@ def _stream_with_draft(chat_id, produce):
     # short reply (nothing streamed) or post-stream: single rich send.
     # on generation failure the exception propagates and the caller's
     # single-send fallback replies — never an expired preview with nothing.
-    send_rich_with_kb(chat_id, reply)
+    send_rich_with_kb(chat_id, reply, user_text=user_text)
     return reply
 
 
@@ -3283,7 +3350,8 @@ def stream_ai_reply(chat_id, user_id, user_name, text, username=""):
         lambda on_token, stop_event: ron_ai.chat_stream(
             chat_id, text, user_name, on_token,
             stop_event=stop_event, system_extra=group_context(),
-            user_id=user_id, is_private=True, username=username))
+            user_id=user_id, is_private=True, username=username),
+        user_text=text)
     handle_group_sends(chat_id, user_id, user_name, reply)
     handle_send_topic(chat_id, user_id, user_name, reply)
     handle_topic_actions(chat_id, user_name, reply)
@@ -3304,7 +3372,8 @@ def stream_vision_reply(chat_id, user_id, user_name, caption, image_b64):
     reply = _stream_with_draft(
         chat_id,
         lambda on_token, stop_event: ron_ai.vision_stream(
-            image_b64, caption, on_token, stop_event))
+            image_b64, caption, on_token, stop_event),
+        user_text=caption or "")
     try:
         ron_ai._save_turn(chat_id, ("[photo] " + (caption or "")).strip(),
                           user_name, reply, user_id)
@@ -3379,7 +3448,8 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                         if lm:
                             cached += ron_ai.light_mode_notice(user_id)
                         send_rich_with_kb(chat_id, cached, reply_to,
-                                          thread_id, business_connection_id)
+                                          thread_id, business_connection_id,
+                                          user_text=text)
                         handle_group_sends(chat_id, user_id, user_name,
                                            cached)
                         handle_send_topic(chat_id, user_id, user_name,
@@ -3477,7 +3547,7 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 # users should know the bot is capable of heavier lifting.
                 reply += ron_ai.light_mode_notice(user_id)
             send_rich_with_kb(chat_id, reply, reply_to, thread_id,
-                              business_connection_id)
+                              business_connection_id, user_text=text)
             handle_group_sends(chat_id, user_id, user_name, reply)
             handle_send_topic(chat_id, user_id, user_name, reply)
             handle_topic_actions(chat_id, user_name, reply,
@@ -3546,7 +3616,8 @@ def ai_vision_reply(chat_id, user_id, user_name, caption, file_id,
                     if lm:
                         reply += ron_ai.light_mode_notice(user_id)
                     send_rich_with_kb(chat_id, reply, reply_to, thread_id,
-                                      business_connection_id)
+                                      business_connection_id,
+                                      user_text=caption or "")
             except Exception as e:
                 msg = str(e)
                 if "not connected yet" in msg:

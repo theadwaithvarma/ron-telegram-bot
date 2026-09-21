@@ -20,6 +20,11 @@ Covers:
 - handle_inline_query: 2 article results with a query, 1 without.
 - Prompt sync: repo DEFAULT_CONFIG and live ron_ai.json carry the same
   new-button-types paragraph.
+- v1.21.1: explicit button requests ("show all buttons", "/menu") bypass
+  the contextual filter for that turn (deny-list still applies);
+  comma-separated [buttons:] labels split as a fallback when no pipe is
+  present; the button-trailer-rules prompt paragraph stays word-for-word
+  in sync between repo default and live json.
 """
 import importlib.util
 import io
@@ -52,6 +57,11 @@ ron_richvalidate = _load_repo_module("ron_richvalidate")
 def _parse(reply):
     with redirect_stdout(io.StringIO()):
         return ron_daemon.parse_trailers(reply)
+
+
+def _parse_flag(reply, skip):
+    with redirect_stdout(io.StringIO()):
+        return ron_daemon.parse_trailers(reply, skip_context_filter=skip)
 
 
 class TestCopyTrailer(unittest.TestCase):
@@ -315,6 +325,130 @@ class TestPromptSync(unittest.TestCase):
             j = s.find("never generic continuations. ") + \
                 len("never generic continuations. ")
             self.assertTrue(i >= 0 and j > i)
+            return s[i:j]
+        self.assertEqual(grab(repo_sys), grab(live))
+
+
+class TestExplicitButtonRequest(unittest.TestCase):
+    def test_detection_positives(self):
+        for t in ["show all buttons", "show me the buttons",
+                  "display buttons", "give me the buttons",
+                  "I need buttons", "i want buttons", "/menu",
+                  "Show All Buttons"]:
+            self.assertTrue(ron_daemon._explicit_button_request(t), t)
+
+    def test_detection_negatives(self):
+        for t in ["press the button below", "the button says ok",
+                  "buttons are cool", "what does this button do",
+                  "hello", "", "the buttons on my remote broke"]:
+            self.assertFalse(ron_daemon._explicit_button_request(t), t)
+
+
+class TestExplicitBypass(unittest.TestCase):
+    # The live "phantom buttons" case (2026-09-21): the user said "show
+    # all buttons", the model replied "Pick an option:" with a [buttons:]
+    # trailer, and the contextual filter dropped every label.
+    REPLY = "Pick an option:\n[buttons: More callback tips | Show reply keyboard]"
+
+    def test_filter_drops_without_flag(self):
+        clean, kb = _parse_flag(self.REPLY, False)
+        self.assertIsNone(kb)
+
+    def test_bypass_keeps_labels_with_flag(self):
+        clean, kb = _parse_flag(self.REPLY, True)
+        self.assertIsNotNone(kb)
+        labels = [b["text"] for b in kb["inline_keyboard"][0]]
+        self.assertEqual(labels,
+                         ["More callback tips", "Show reply keyboard"])
+
+    def test_deny_list_still_applies_with_flag(self):
+        # Boilerplate is dropped even on an explicit button request.
+        clean, kb = _parse_flag("Here\n[buttons: Click here]", True)
+        self.assertIsNone(kb)
+
+    def test_copy_bypass_with_flag(self):
+        clean, kb = _parse_flag(
+            "Pick one\n[copy: Copy code | xyz]", True)
+        row = kb["inline_keyboard"][0]
+        self.assertEqual(row[0]["copy_text"], {"text": "xyz"})
+
+
+class TestCommaFallback(unittest.TestCase):
+    def test_comma_split_yields_separate_buttons(self):
+        clean, kb = _parse_flag(
+            "Options\n[buttons: Alpha one, Beta two, Gamma three]", True)
+        labels = [b["text"] for b in kb["inline_keyboard"][0]]
+        self.assertEqual(labels, ["Alpha one", "Beta two", "Gamma three"])
+
+    def test_pipe_stays_primary(self):
+        # A pipe anywhere means commas are literal text, not separators.
+        clean, kb = _parse_flag("Options\n[buttons: Yes | No, maybe]", True)
+        labels = [b["text"] for b in kb["inline_keyboard"][0]]
+        self.assertEqual(labels, ["Yes", "No, maybe"])
+
+    def test_comma_split_still_filtered_without_flag(self):
+        # Splitting on commas doesn't exempt labels from the filter.
+        clean, kb = _parse("Valorant tips\n[buttons: Alpha one, Beta two]")
+        self.assertIsNone(kb)
+
+
+class TestExplicitThreading(unittest.TestCase):
+    """send_rich_with_kb threads the user's explicit request into
+    parse_trailers — end to end at the function level, no network."""
+
+    def _send(self, user_text):
+        calls = []
+        real_api_json = ron_daemon.rich_mod.api_json
+        real_api = ron_daemon.api
+        ron_daemon.rich_mod.api_json = (
+            lambda m, p=None, **k: calls.append((m, p)) or {"ok": True})
+        ron_daemon.api = (
+            lambda m, p=None, **k: calls.append((m, p)) or {"ok": True})
+        try:
+            with redirect_stdout(io.StringIO()):
+                ron_daemon.send_rich_with_kb(
+                    123,
+                    "Pick an option:\n"
+                    "[buttons: More callback tips | Show reply keyboard]",
+                    user_text=user_text)
+        finally:
+            ron_daemon.rich_mod.api_json = real_api_json
+            ron_daemon.api = real_api
+        return calls
+
+    @staticmethod
+    def _has_keyboard(calls):
+        # Buttons render either as rich in-bubble blocks (rich_message)
+        # or as a classic reply_markup.inline_keyboard. Either way the
+        # trailer labels ("More callback tips") appear in the payload —
+        # they were stripped from the visible text, so their presence
+        # proves buttons were attached.
+        return any("More callback tips" in json.dumps(p or {})
+                   for _, p in calls)
+
+    def test_explicit_request_gets_buttons(self):
+        self.assertTrue(self._has_keyboard(self._send("show all buttons")))
+
+    def test_ordinary_message_still_filtered(self):
+        self.assertFalse(self._has_keyboard(self._send("hello there")))
+
+
+class TestHardeningSync(unittest.TestCase):
+    def test_trailer_rules_paragraph_in_sync(self):
+        spec = importlib.util.spec_from_file_location(
+            "ron_ai_repo2", os.path.join(REPO, "ron_ai.py"))
+        repo_ai = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(repo_ai)
+        repo_sys = repo_ai.DEFAULT_CONFIG["system"]
+        live = json.load(open(os.path.expanduser(
+            "~/workspace/telegram-bot/ron_ai.json")))["system"]
+
+        def grab(s):
+            i = s.find("Button trailer rules.")
+            j = s.find("filtering is relaxed for explicit requests. ") + \
+                len("filtering is relaxed for explicit requests. ")
+            self.assertTrue(i >= 0 and j > i,
+                            "hardening paragraph missing")
             return s[i:j]
         self.assertEqual(grab(repo_sys), grab(live))
 
