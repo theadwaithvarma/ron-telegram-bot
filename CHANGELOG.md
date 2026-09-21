@@ -12,8 +12,8 @@ Public-bot identity fixes (no features removed):
   the reply already said — never a new topic, never a personalized
   suggestion. No natural drill-down means no buttons.
 - **Real @username in context**: the requester's actual Telegram handle is
-  now passed into the prompt (`_who_line`), so the bot mentions
-  @TheAdwaithVarma instead of inventing "@Adwaith". Works per-requester —
+  now passed into the prompt (`_who_line`), so the bot mentions @TheAdwaith
+  instead of inventing "@Adwaith". Works per-requester —
   correct for any user, not just the owner. Invalid handles are dropped.
 - **Config override lesson**: `ron_ai.DIR` is hardcoded to the live dir, so
   `~/workspace/telegram-bot/ron_ai.json` overrides the repo's

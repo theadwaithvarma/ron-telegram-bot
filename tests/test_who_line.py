@@ -3,7 +3,7 @@
 
 - _who_line: valid handle -> identity line; missing/invalid -> "".
 - chat()/chat_stream() inject the who-line so the model never invents
-  handles like "@Adwaith" for @TheAdwaithVarma.
+  handles like "@Adwaith" for @TheAdwaith.
 - System prompt carries the no-profiling rule and the drill-down-only
   button rule.
 
@@ -58,8 +58,8 @@ class FakeStreamResp:
 
 class WhoLineTest(unittest.TestCase):
     def test_valid_username(self):
-        line = ron_ai._who_line("Adwaith", "TheAdwaithVarma")
-        self.assertIn("@TheAdwaithVarma", line)
+        line = ron_ai._who_line("Adwaith", "TheAdwaith")
+        self.assertIn("@TheAdwaith", line)
         self.assertIn("never shorten, guess, or invent", line)
 
     def test_missing_username(self):
@@ -110,8 +110,8 @@ class ChatUsernameTest(unittest.TestCase):
 
     def test_chat_injects_who_line(self):
         ron_ai.chat("W1", "ping me in the playground group",
-                    user_name="Adwaith", username="TheAdwaithVarma")
-        self.assertIn("@TheAdwaithVarma", self._system())
+                    user_name="Adwaith", username="TheAdwaith")
+        self.assertIn("@TheAdwaith", self._system())
 
     def test_chat_without_username_has_no_who_line(self):
         ron_ai.chat("W2", "hello", user_name="Adwaith")
@@ -128,10 +128,10 @@ class ChatUsernameTest(unittest.TestCase):
             seen = []
             ron_ai.chat_stream("W3", "ping me", "Adwaith",
                                on_token=seen.append,
-                               username="TheAdwaithVarma")
+                               username="TheAdwaith")
         finally:
             ron_ai._request = orig
-        self.assertIn("@TheAdwaithVarma", self._system())
+        self.assertIn("@TheAdwaith", self._system())
 
 
 if __name__ == "__main__":
