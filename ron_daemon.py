@@ -2981,7 +2981,7 @@ def _stream_with_draft(chat_id, produce):
     return reply
 
 
-def stream_ai_reply(chat_id, user_id, user_name, text):
+def stream_ai_reply(chat_id, user_id, user_name, text, username=""):
     """Native draft streaming for 1:1 chats (Bot API sendMessageDraft): the
     reply animates in a draft bubble as tokens arrive (ChatGPT-style),
     throttled to stay under Telegram's rate limits. The client's native Stop
@@ -2993,7 +2993,7 @@ def stream_ai_reply(chat_id, user_id, user_name, text):
         lambda on_token, stop_event: ron_ai.chat_stream(
             chat_id, text, user_name, on_token,
             stop_event=stop_event, system_extra=group_context(),
-            user_id=user_id, is_private=True))
+            user_id=user_id, is_private=True, username=username))
     handle_group_sends(chat_id, user_id, user_name, reply)
     handle_send_topic(chat_id, user_id, user_name, reply)
     handle_topic_actions(chat_id, user_name, reply)
@@ -3108,7 +3108,7 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 if private and not business_connection_id and not lm:
                     try:
                         reply = stream_ai_reply(chat_id, user_id, user_name,
-                                                text)
+                                                text, username=username)
                         _record_brain_success()
                         # Phase 6: cache the successful reply (before any
                         # light-mode footer) for equivalent future questions.
@@ -3162,7 +3162,7 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 _kt = typing_kickoff(chat_id, business_connection_id)
                 reply = ron_ai.chat(chat_id, text, user_name,
                                     system_extra=extra, user_id=user_id,
-                                    is_private=private)
+                                    is_private=private, username=username)
                 _kt.join(timeout=10)
                 _record_brain_success()
                 # Phase 6: cache the successful reply (before the
@@ -3601,6 +3601,7 @@ def handle_update(upd):
     if not text and not photos:
         return
     user_name = frm.get("first_name", "there")
+    username = frm.get("username") or ""
     is_private = chat.get("type") == "private"
 
     cmd = parse_command(text)

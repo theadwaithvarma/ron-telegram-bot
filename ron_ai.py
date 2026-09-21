@@ -62,6 +62,10 @@ DEFAULT_CONFIG = {
         "about who runs you. If someone asks who made you or who your owner "
         "is, deflect lightly (\"Just some human with a keyboard.\") and move "
         "on. "
+        "You're a public bot: every user is a stranger. Never profile the "
+        "person you're talking to — don't shape replies, suggestions, or "
+        "buttons around their presumed interests, profession, or "
+        "personality. Answer exactly what's in front of you. "
         "Your replies stream live into the chat word-by-word as you write "
         "them (longer replies animate in progressively). Never claim you "
         "can't stream text — you do. If asked, say your replies appear live. "
@@ -87,7 +91,10 @@ DEFAULT_CONFIG = {
         "gets Valorant follow-ups, never study or code buttons; a casual "
         "one-liner, greeting, or ack gets no buttons at all. Off-topic "
         "buttons are discarded automatically, so only emit ones that "
-        "clearly fit. Button labels are plain text: 2-4 words max, no "
+        "clearly fit. Buttons drill deeper into something this reply "
+        "already said — a follow-up detail, never a new topic and never "
+        "a suggestion tailored to the user. When no natural drill-down "
+        "exists, emit no buttons. Button labels are plain text: 2-4 words max, no "
         "Markdown, no URLs, no arrows. [buttons: ...] is for quick "
         "replies (tapping one re-sends its label as the user's next "
         "message); [links: Label -> https://...] is only for real URLs — "
@@ -246,6 +253,20 @@ _HIST_LOCK = threading.RLock()
 # effort — memory must never break a reply.
 MEMORY_HOOK = None
 MEMORY_RECALL_HOOK = None
+# Telegram @usernames: 5-32 chars, letters/digits/underscore. The who-line
+# tells the model the requester's real handle so it never invents one
+# (e.g. "@Adwaith" for @TheAdwaithVarma). Invalid values are dropped.
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
+
+
+def _who_line(user_name, username):
+    """One-line identity context: the requester's real Telegram handle."""
+    if username and _USERNAME_RE.match(username):
+        return (f"\nThe person you're talking to is {user_name}, "
+                f"Telegram handle @{username}. If you mention them, use "
+                f"@{username} exactly — never shorten, guess, or invent "
+                f"their handle. ")
+    return ""
 # Phase 6 (rolling summaries): wired by the daemon to the encrypted
 # per-chat chat_meta table in ron_memory.py — summaries must never live
 # in a new plaintext store.
@@ -780,7 +801,7 @@ def _summarize_via_cheap(cfg, old_turns, prior_summary):
 
 
 def chat(chat_id, user_text, user_name="there", system_extra="",
-         user_id=0, is_private=True):
+         user_id=0, is_private=True, username=""):
     """One conversational turn. Returns the assistant's reply text."""
     cfg = load_config()
     # Phase 6: rolling summary + the PROMPT_RECENT most recent raw turns,
@@ -802,8 +823,9 @@ def chat(chat_id, user_text, user_name="there", system_extra="",
     # full-history cost; the store keeps <=48 raw turns per chat.
     summary_block = ("\n[Earlier in this chat — summarized for continuity:]\n"
                      + summary + "\n") if summary else ""
+    who = _who_line(user_name, username)
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
-              else cfg["system"]) + summary_block + (system_extra or "") + mem_extra
+              else cfg["system"]) + who + summary_block + (system_extra or "") + mem_extra
     messages = [{"role": "system", "content": system}] + turns
 
     try:
@@ -959,7 +981,8 @@ def vision_stream(image_b64, caption="", on_token=None, stop_event=None):
 
 
 def chat_stream(chat_id, user_text, user_name="there", on_token=None,
-               stop_event=None, system_extra="", user_id=0, is_private=True):
+               stop_event=None, system_extra="", user_id=0, is_private=True,
+               username=""):
     """Streaming conversational turn. Calls on_token(chunk) per token as the
     model generates. If stop_event is set, generation halts early.
     Returns the assistant's full reply text."""
@@ -982,8 +1005,9 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     # full-history cost; the store keeps <=48 raw turns per chat.
     summary_block = ("\n[Earlier in this chat — summarized for continuity:]\n"
                      + summary + "\n") if summary else ""
+    who = _who_line(user_name, username)
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
-              else cfg["system"]) + summary_block + (system_extra or "") + mem_extra
+              else cfg["system"]) + who + summary_block + (system_extra or "") + mem_extra
     messages = [{"role": "system", "content": system}] + turns
 
     try:

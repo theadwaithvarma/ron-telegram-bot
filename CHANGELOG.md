@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.17.0 — 2026-09-21
+
+Public-bot identity fixes (no features removed):
+
+- **No more profiling**: the system prompt told the bot to "tailor labels
+  to this person's apparent interests" — that instruction is gone. The bot
+  now treats every user as a stranger: no replies, suggestions, or buttons
+  shaped around presumed interests, profession, or personality.
+- **Buttons are drill-downs only**: a button must dig deeper into something
+  the reply already said — never a new topic, never a personalized
+  suggestion. No natural drill-down means no buttons.
+- **Real @username in context**: the requester's actual Telegram handle is
+  now passed into the prompt (`_who_line`), so the bot mentions
+  @TheAdwaithVarma instead of inventing "@Adwaith". Works per-requester —
+  correct for any user, not just the owner. Invalid handles are dropped.
+- **Config override lesson**: `ron_ai.DIR` is hardcoded to the live dir, so
+  `~/workspace/telegram-bot/ron_ai.json` overrides the repo's
+  DEFAULT_CONFIG at runtime. Prompt-text edits must land in the live json;
+  the repo default is kept in sync as fallback.
+
 ## 1.16.1 — 2026-09-21
 
 - **`/ping` now reports real latency**: times one live `getMe` round-trip
