@@ -18,6 +18,7 @@ from dynamic_credentials import dynamic_credential_entry, DynamicCredentialError
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 import http_pool
+import ron_owner_rules
 
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, "workspace", "telegram-bot")
@@ -834,8 +835,12 @@ def chat(chat_id, user_text, user_name="there", system_extra="",
     summary_block = ("\n[Earlier in this chat — summarized for continuity:]\n"
                      + summary + "\n") if summary else ""
     who = _who_line(user_name, username)
+    try:
+        rules_extra = ron_owner_rules.rules_block()
+    except Exception:
+        rules_extra = ""
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
-              else cfg["system"]) + who + summary_block + (system_extra or "") + mem_extra
+              else cfg["system"]) + who + summary_block + (system_extra or "") + mem_extra + rules_extra
     messages = [{"role": "system", "content": system}] + turns
 
     try:
@@ -1016,8 +1021,12 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     summary_block = ("\n[Earlier in this chat — summarized for continuity:]\n"
                      + summary + "\n") if summary else ""
     who = _who_line(user_name, username)
+    try:
+        rules_extra = ron_owner_rules.rules_block()
+    except Exception:
+        rules_extra = ""
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
-              else cfg["system"]) + who + summary_block + (system_extra or "") + mem_extra
+              else cfg["system"]) + who + summary_block + (system_extra or "") + mem_extra + rules_extra
     messages = [{"role": "system", "content": system}] + turns
 
     try:

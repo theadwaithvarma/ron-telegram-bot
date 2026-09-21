@@ -1,3 +1,19 @@
+## 1.19.0 — owner rulebook: teach the bot from Telegram (2026-09-21)
+
+- **Teach Ron directly from your DM.** As the owner, say "remember: ...",
+  "from now on, ...", "new rule: ..." or "note: ..." in your DM and it
+  becomes a standing rule in `owner_rules.json` — injected into every AI
+  reply's system prompt, so it shapes the bot in every chat it speaks in.
+  Only your user id can teach; trigger phrases are deliberately narrow so
+  normal chat never becomes a rule, and "remember this ..." still means
+  per-chat memory as before.
+- **`/rules`** lists the rulebook, **`/forgetrule <n>`** drops one — both
+  owner-only and ephemeral like the other power commands. Rules are
+  behavior config, separate from per-chat isolated memory: nothing leaks
+  between users' chats.
+- 15 new tests (`tests/test_owner_rules.py`); full suite 558 tests green
+  (3 pre-existing `cryptography` import errors unchanged).
+
 ## 1.18.1 — pull quotes + math blocks (2026-09-21)
 
 - **Two more native block types.** `>>>` lines now render as real pull

@@ -26,6 +26,7 @@ import http_pool
 
 sys.path.insert(0, os.path.join(os.path.expanduser("~"), "workspace", "telegram-bot"))
 import ron_ai
+import ron_owner_rules
 import rich_send as rich_mod
 # Phase 6: semantic answer cache. None-safe — the bot replies normally
 # (just without caching) if the module ever fails to import.
@@ -807,6 +808,31 @@ def _handle_memory_nl(chat_id, user_id, user_name, text):
                else "There's nothing stored to forget.")
     send(chat_id, ack)
     _record_turn(chat_id, user_id, user_name, text, ack)
+    return True
+
+
+def _handle_owner_teach(chat_id, user_id, text, msg_id):
+    """Owner-only teach interception for the owner's DM.
+
+    "remember: ...", "from now on, ...", "new rule: ..." etc. become
+    standing rules in the owner rulebook (ron_owner_rules) that shape
+    the bot in every chat. Checked BEFORE _handle_memory_nl so an owner
+    teach line never lands in per-chat memory by accident. True if
+    handled (teach phrase matched); the AI must not also reply.
+    """
+    rule = ron_owner_rules.detect_teach(text)
+    if rule is None:
+        return False
+    added, err = ron_owner_rules.add_rule(rule)
+    if err:
+        ack = err
+    else:
+        n = len(ron_owner_rules.load_rules())
+        ack = (f"Learned ✓ — rule #{n}: “{added['text']}”\n"
+               f"It now applies everywhere I talk. /rules to review, "
+               f"/forgetrule {n} to undo.")
+    _owner_reply(chat_id, user_id, msg_id, ack)
+    _record_turn(chat_id, user_id, "Adwaith", text, ack)
     return True
 
 
@@ -2401,6 +2427,38 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
                          f"Unbanned {target}." if lifted
                          else f"{target} wasn't banned.")
         return True
+    if cmd == "rules":
+        # Owner-only: list the standing rules taught in the owner's DM.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        rules = ron_owner_rules.load_rules()
+        if not rules:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Rulebook is empty \u2014 teach me with "
+                         "\u201cremember: \u2026\u201d in your DM.")
+        else:
+            lines = [f"{i}. {r['text']}"
+                     for i, r in enumerate(rules, 1)]
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Standing rules (apply everywhere I talk):\n"
+                         + "\n".join(lines))
+        return True
+    if cmd == "forgetrule":
+        # Owner-only: drop rule number n (as shown by /rules).
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        arg = _cmd_args(text).strip()
+        try:
+            n = int(arg)
+        except (TypeError, ValueError):
+            n = -1
+        removed = ron_owner_rules.remove_rule(n)
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     f"Forgot rule #{n}: \u201c{removed}\u201d" if removed
+                     else "Usage: /forgetrule <number from /rules>")
+        return True
     if cmd == "broadcast":
         # Owner-only: one message to every known chat. Two-step confirm —
         # "/broadcast <text>" stages, "/broadcast yes" (within 60s) sends.
@@ -3731,6 +3789,12 @@ def handle_update(upd):
         # Phase 4: DM answers to pending approval asks, then natural
         # memory commands ("remember this ...", "forget ...").
         if mem is not None and _resolve_dm_approval(user_id, text):
+            return
+        # Owner rulebook: teach phrases ("remember: ...", "from now on,
+        # ...") become standing rules for every chat. DM-only, owner-only.
+        if (user_id == OWNER_ID
+                and _handle_owner_teach(chat_id, user_id, text,
+                                        msg.get("message_id"))):
             return
         if mem is not None and _handle_memory_nl(chat_id, user_id,
                                                   user_name, text):
