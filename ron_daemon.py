@@ -995,7 +995,17 @@ def api(method, params=None, timeout=65):
     {"ok": False, "error": ...}), but reuses warm TLS connections instead
     of paying ~0.7s of proxy CONNECT + handshake per call."""
     t0 = time.perf_counter()
-    body = urllib.parse.urlencode(params or {}).encode() if params else None
+    if params:
+        # Telegram expects JSON-serialized arrays/objects for complex
+        # params (allowed_updates, reply_markup, media, ...). urlencode()
+        # would otherwise send the Python repr ("['message', ...]"),
+        # which Telegram can't parse as JSON and silently ignores — so
+        # the update subscription, for one, would never actually update.
+        body = urllib.parse.urlencode(
+            {k: (json.dumps(v) if isinstance(v, (list, dict)) else v)
+             for k, v in params.items()}).encode()
+    else:
+        body = None
     try:
         status, data = http_pool.pool_for("api.telegram.org").post(
             f"/bot{_SURROGATE}/{method}", body,

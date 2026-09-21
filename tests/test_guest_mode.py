@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import unittest
+import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -241,6 +242,55 @@ class HandlerTests(unittest.TestCase):
         results = json.loads(params["results"])
         self.assertEqual([r["id"] for r in results], ["openron"])
         self.assertEqual(self.fake_ai.calls, [])
+
+
+class ApiEncodingTests(unittest.TestCase):
+    """api() must JSON-serialize list/dict params (v1.24.0).
+
+    Regression: urlencode() turned allowed_updates into the Python repr
+    "['message', ...]", which Telegram can't parse as JSON and silently
+    ignores — the daemon's update subscription could never actually
+    change (this is why guest_message never appeared server-side).
+    """
+
+    def _call(self, params):
+        captured = {}
+
+        class FakePool:
+            def post(self, path, body, content_type, timeout=65,
+                     extra_headers=None):
+                captured["body"] = body
+                return (200, b'{"ok": true, "result": []}')
+
+        orig = ron_daemon.http_pool.pool_for
+        ron_daemon.http_pool.pool_for = lambda host: FakePool()
+        try:
+            return ron_daemon.api("getUpdates", params), captured
+        finally:
+            ron_daemon.http_pool.pool_for = orig
+
+    def test_list_param_is_json_array(self):
+        r, captured = self._call(
+            {"offset": 1, "timeout": 50,
+             "allowed_updates": ["message", "guest_message"]})
+        self.assertTrue(r["ok"])
+        qs = urllib.parse.parse_qs(captured["body"].decode())
+        self.assertEqual(json.loads(qs["allowed_updates"][0]),
+                         ["message", "guest_message"])
+        self.assertEqual(qs["offset"][0], "1")  # scalars untouched
+
+    def test_dict_param_is_json_object(self):
+        r, captured = self._call({"chat_id": 5,
+                                  "reply_markup": {"inline_keyboard": []}})
+        self.assertTrue(r["ok"])
+        qs = urllib.parse.parse_qs(captured["body"].decode())
+        self.assertEqual(json.loads(qs["reply_markup"][0]),
+                         {"inline_keyboard": []})
+
+    def test_no_python_repr_leaks(self):
+        _, captured = self._call({"allowed_updates": ["message"]})
+        body = captured["body"].decode()
+        self.assertNotIn("%27", body)  # %27 = ' — Python repr quotes
 
 
 if __name__ == "__main__":

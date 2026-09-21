@@ -22,9 +22,15 @@ protocol.
 - **Observability.** Successful `answerInlineQuery`/`answerGuestQuery`
   calls now log one line — tonight's inline outage was undebuggable
   precisely because successes were silent.
-- **Tests.** `tests/test_guest_mode.py`: 15 offline tests (mention
+- **Tests.** `tests/test_guest_mode.py`: 18 offline tests (mention
   stripping, ban silence, throttle, echo fallback, trailer stripping,
-  quick_answer shape/timeout/cheap routing).
+  quick_answer shape/timeout/cheap routing, api() param encoding).
+- **Fixed: `api()` mangled list/dict params.** `urlencode()` turned
+  `allowed_updates` into the Python repr `"['message', ...]"`, which
+  Telegram can't parse as JSON and silently ignores — the daemon's update
+  subscription could never actually change (this is why `guest_message`
+  never appeared server-side despite being requested every poll).
+  List/dict params are now JSON-serialized before encoding.
 
 ## 1.23.0 — Stop-button UX: no fallback after an intentional stop (2026-09-21)
 
