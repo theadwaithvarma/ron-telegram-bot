@@ -1,3 +1,13 @@
+## 1.25.2 — Drain survives transient 429 waves (2026-09-21)
+
+- `_drain_queue_inner` now retries the `ron_ai.chat` call up to 3 times
+  (20s breather between attempts) when it raises `RateLimitedError`,
+  instead of abandoning the whole queue on the first 429 wave. Observed
+  twice tonight: the bake drain broke after a single rate-limit error with
+  13–19 genuine messages still queued (incl. business chats) and no later
+  drain trigger scheduled. Other exceptions still break immediately.
+- 2 new offline tests in `tests/test_apology.py` (`DrainRetryTest`).
+
 ## 1.25.1 — Test isolation fix (2026-09-21)
 
 - `tests/test_business_secretary.py` now patches `DEGRADED_QUEUE` to a temp

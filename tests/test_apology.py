@@ -192,5 +192,75 @@ class ApologyOfferTest(unittest.TestCase):
             self.assertNotIn(provider, ron_daemon._APOLOGY_TEXT)
 
 
+class DrainRetryTest(unittest.TestCase):
+    """v1.25.2: a transient 429 wave during the drain retries the AI call
+    (up to 3 attempts) instead of abandoning the whole queue."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.orig_q = ron_daemon.DEGRADED_QUEUE
+        ron_daemon.DEGRADED_QUEUE = os.path.join(self.tmp.name, "dq.jsonl")
+        self.calls = []
+
+        def flaky_chat(*a, **k):
+            self.calls.append(1)
+            if len(self.calls) <= 2:
+                raise ron_daemon.ron_ai.RateLimitedError(
+                    "rate limited by all AI providers tried")
+            return "drained reply"
+
+        patches = [
+            mock.patch.object(ron_daemon.ron_ai, "chat", flaky_chat),
+            mock.patch.object(ron_daemon, "send_rich_with_kb",
+                              lambda *a, **k: None),
+            mock.patch.object(ron_daemon, "send_typing",
+                              lambda *a, **k: None),
+            mock.patch.object(ron_daemon, "group_context", lambda: ""),
+            mock.patch.object(ron_daemon, "handle_group_sends",
+                              lambda *a, **k: None),
+            mock.patch.object(ron_daemon, "handle_send_topic",
+                              lambda *a, **k: None),
+            mock.patch.object(ron_daemon, "handle_topic_actions",
+                              lambda *a, **k: None),
+            mock.patch.object(ron_daemon.time, "sleep", lambda s: None),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+    def tearDown(self):
+        ron_daemon.DEGRADED_QUEUE = self.orig_q
+        self.tmp.cleanup()
+
+    def test_drain_retries_on_429_then_succeeds(self):
+        entries = [_queue_entry(111), _queue_entry(222, conn_id="bc1")]
+        with open(ron_daemon.DEGRADED_QUEUE, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        replied = []
+        self.assertTrue(ron_daemon._drain_queue_inner(replied))
+        # First entry: 2x 429 then success = 3 chat calls; second: 1 call.
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(len(replied), 2)
+        # Queue file emptied — nothing stuck.
+        with open(ron_daemon.DEGRADED_QUEUE) as f:
+            self.assertEqual([l for l in f if l.strip()], [])
+
+    def test_drain_gives_up_after_3_429s(self):
+        def always_429(*a, **k):
+            raise ron_daemon.ron_ai.RateLimitedError(
+                "rate limited by all AI providers tried")
+
+        with mock.patch.object(ron_daemon.ron_ai, "chat", always_429):
+            with open(ron_daemon.DEGRADED_QUEUE, "w") as f:
+                f.write(json.dumps(_queue_entry(111)) + "\n")
+            replied = []
+            ron_daemon._drain_queue_inner(replied)
+            self.assertEqual(replied, [])
+            # Entry stays queued for the next drain trigger.
+            with open(ron_daemon.DEGRADED_QUEUE) as f:
+                self.assertEqual(len([l for l in f if l.strip()]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

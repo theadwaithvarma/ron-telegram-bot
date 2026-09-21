@@ -516,11 +516,25 @@ def _drain_queue_inner(replied):
             _dq_extra = group_context()
             if not _dq_private and _MEM_MODULES:
                 _dq_extra += ron_privacy.GROUP_PRIVACY_RULE
-            reply = ron_ai.chat(e["chat_id"], e["text"],
-                                e.get("user_name", "there"),
-                                system_extra=_dq_extra,
-                                user_id=e.get("user_id", 0),
-                                is_private=_dq_private)
+            # v1.25.2: transient 429 waves (Groq bursting on the sequential
+            # drain) must not kill the whole drain — retry the AI call a few
+            # times with a breather before giving up on the rest of the queue.
+            reply = None
+            for _attempt in range(3):
+                try:
+                    reply = ron_ai.chat(e["chat_id"], e["text"],
+                                        e.get("user_name", "there"),
+                                        system_extra=_dq_extra,
+                                        user_id=e.get("user_id", 0),
+                                        is_private=_dq_private)
+                    break
+                except ron_ai.RateLimitedError:
+                    if _attempt < 2:
+                        print(f"[ron_daemon] queue replay 429, retrying "
+                              f"({_attempt + 1}/3)", flush=True)
+                        time.sleep(20)
+                    else:
+                        raise
             send_rich_with_kb(e["chat_id"], reply, e.get("reply_to"),
                               e.get("thread_id"),
                               e.get("business_connection_id"),
