@@ -1,3 +1,16 @@
+## 1.24.1 — In-bubble buttons: prompt fix (2026-09-21)
+
+- The daemon has rendered `[buttons:]`/`[links:]`/`[copy:]/[switch_inline:]/
+  [login:]` trailers as in-bubble buttons (Bot API 10.3 rich blocks) for a
+  while, but the system prompt still told the model buttons render "under
+  the message" — so Ron told users it can't put buttons in the message
+  body. Prompt now says in-bubble and instructs the model to never claim
+  it can't. Verified end-to-end: model emits the trailer, daemon sends
+  the blocks form, buttons land inside the bubble.
+- `systemd/deploy.sh`: committed the `$PPID` hardening (deploy no longer
+  risks SIGTERM'ing its own invoking shell when the caller's cmdline
+  mentions the daemon file).
+
 ## 1.24.0 — Guest Mode + smart one-shot answers (2026-09-21)
 
 Adwaith asked for Telegram's Guest Bots feature (Bot API 10.0): anyone can
