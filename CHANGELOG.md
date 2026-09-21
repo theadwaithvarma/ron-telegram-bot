@@ -1,3 +1,21 @@
+## 1.24.2 — Business connection self-healing (2026-09-21)
+
+- Root-caused dead Chat Automation: Adwaith's business connection
+  (`oycO_-CygVUoAwAAeoeykm6R78w`, can_reply=true) was live on Telegram's
+  side, the daemon was subscribed to `business_connection`/`business_message`
+  updates, and business messages were arriving — but every one was dropped
+  as "unknown connection" because the original `business_connection` update
+  was consumed before the handler was deployed, so
+  `business_connections.json` was never created.
+- Immediate fix: recovered the live connection via `getBusinessConnection`
+  and seeded `business_connections.json`; the daemon picks it up with no
+  restart (loaded per message).
+- Hardening: `handle_business_message` now self-heals on unknown connection
+  ids — one `getBusinessConnection` call, persisted in the same shape as
+  `handle_business_connection`; unrecoverable ids are still ignored.
+- 5 new offline tests in `tests/test_business_recovery.py` (693 total, same
+  6 pre-existing failures/errors as baseline).
+
 ## 1.24.1 — In-bubble buttons: prompt fix (2026-09-21)
 
 - The daemon has rendered `[buttons:]`/`[links:]`/`[copy:]/[switch_inline:]/

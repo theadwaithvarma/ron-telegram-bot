@@ -1681,6 +1681,49 @@ def handle_business_connection(bc):
         save_business_connections(conns)
 
 
+def _recover_business_connection(conn_id):
+    """Recover a missed business connection via getBusinessConnection.
+
+    Called when a business_message arrives for a connection id we never saw
+    a business_connection update for. Fetches the live connection object,
+    persists it in the same shape as handle_business_connection, and returns
+    it. Returns None when the connection is disabled/unknown (caller keeps
+    ignoring the message).
+    """
+    try:
+        r = api("getBusinessConnection",
+                {"business_connection_id": conn_id}, timeout=20)
+    except Exception as e:
+        print(f"[ron_daemon] business recovery api error: {e}", flush=True)
+        return None
+    if not r.get("ok"):
+        print(f"[ron_daemon] business recovery failed for {conn_id}: "
+              f"{str(r.get('error'))[:100]}", flush=True)
+        return None
+    bc = r.get("result") or {}
+    if not bc.get("is_enabled"):
+        return None
+    rights = bc.get("rights") or {}
+    can_reply = bc.get("can_reply")
+    if can_reply is None:
+        can_reply = rights.get("can_reply", True)
+    user = bc.get("user") or {}
+    conn = {
+        "user_chat_id": bc.get("user_chat_id"),
+        "can_reply": bool(can_reply),
+        "user_id": user.get("id"),
+        "first_name": user.get("first_name", ""),
+        "date": bc.get("date", 0),
+    }
+    with _FILE_LOCK:
+        conns = load_business_connections()
+        conns[conn_id] = conn
+        save_business_connections(conns)
+    print(f"[ron_daemon] business connection {conn_id}: recovered via API, "
+          f"can_reply={bool(can_reply)}", flush=True)
+    return conn
+
+
 def handle_business_message(msg):
     """Reply inside the owner's business account chats.
 
@@ -1693,6 +1736,12 @@ def handle_business_message(msg):
     if not conn_id:
         return
     conn = load_business_connections().get(conn_id)
+    if not conn:
+        # Self-heal (v1.24.2): the business_connection update can be missed
+        # entirely (e.g. consumed before this handler was deployed), leaving
+        # every later business_message orphaned. Recover via API once instead
+        # of ignoring forever.
+        conn = _recover_business_connection(conn_id)
     if not conn:
         print(f"[ron_daemon] business message for unknown connection "
               f"{conn_id}, ignoring", flush=True)
