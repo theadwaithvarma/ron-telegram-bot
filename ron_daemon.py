@@ -1606,7 +1606,8 @@ def handle_business_message(msg):
         return
     ai_reply(chat_id, sender, frm.get("first_name", "there"), text,
              private=True, reply_to=msg.get("message_id"),
-             business_connection_id=conn_id)
+             business_connection_id=conn_id,
+             username=frm.get("username") or "")
 
 
 def resolve_topic(group_id, name):
@@ -3058,7 +3059,8 @@ def _cache_store(chat_id, text, reply, cacheable):
 
 
 def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
-           thread_id=None, business_connection_id=None, cacheable=True):
+           thread_id=None, business_connection_id=None, cacheable=True,
+           username=""):
     """Run the LLM call off the poll loop so updates keep flowing."""
     def _go():
         cur = threading.current_thread()
@@ -3659,7 +3661,7 @@ def handle_update(upd):
             ron_ai._save_turn(chat_id, text, user_name, canned, user_id)
             send_rich_with_kb(chat_id, canned)
             return
-        ai_reply(chat_id, user_id, user_name, text)
+        ai_reply(chat_id, user_id, user_name, text, username=username)
         return
 
     # Groups: only when mentioned or replied to.
@@ -3703,7 +3705,8 @@ def handle_update(upd):
             return
         ai_reply(chat_id, user_id, user_name, clean or text, private=False,
                  reply_to=msg.get("message_id"),
-                 thread_id=msg.get("message_thread_id"))
+                 thread_id=msg.get("message_thread_id"),
+                 username=username)
 
 
 def handle_callback(query):
@@ -3778,7 +3781,8 @@ def handle_callback(query):
             return
         ai_reply(chat_id, frm.get("id", 0), frm.get("first_name", "there"),
                  data[2:], private=(chat.get("type") == "private"),
-                 thread_id=(msg.get("message_thread_id")))
+                 thread_id=(msg.get("message_thread_id")),
+                 username=frm.get("username") or "")
 
 
 def ephemeral_welcome(chat_id, user, group_title=None):

@@ -1,3 +1,16 @@
+## 1.17.1 — username NameError hotfix (2026-09-21)
+
+- **Fixed**: v1.17.0 referenced a bare `username` inside `ai_reply()`,
+  but it was only defined in `handle_update()`'s scope. Every AI reply
+  died with `NameError: name 'username' is not defined`; the failures
+  looked systemic, degraded mode queued messages, and the bot went
+  unresponsive. `ai_reply()` now takes `username=""` and all call sites
+  (DM, group, business, button callbacks) pass the real handle through.
+- **Regression tests**: `tests/test_username_plumbing.py` — live
+  `ai_reply` calls (stream + non-stream paths) verify the username is
+  forwarded with no NameError, plus a closure-aware static scope check
+  that every `username` load in ron_daemon.py resolves.
+
 # Changelog
 
 ## 1.17.0 — 2026-09-21
