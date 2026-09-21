@@ -544,6 +544,14 @@ class TestMidlineTrailersV1212(unittest.TestCase):
         self.assertEqual(btn["url"], "https://example.com")
         self.assertEqual(btn["text"], "Visit Site")
 
+    def test_duplicate_trailer_buttons_deduped(self):
+        clean, kb = _parse_flag(
+            "- Demo: [buttons: Alpha | Beta]\n\n[buttons: Alpha | Beta]",
+            True)
+        labels = [b["text"] for row in kb["inline_keyboard"]
+                  for b in row if "callback_data" in b]
+        self.assertEqual(labels, ["Alpha", "Beta"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

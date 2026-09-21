@@ -2287,6 +2287,24 @@ def parse_trailers(reply, skip_context_filter=False):
         kb.append(link_row[:8])
     if dropped_labels:
         clean = (clean + "\n" + "\n".join(dropped_labels)).strip()
+    # v1.21.2: the model sometimes emits the same trailer twice (a mid-line
+    # demo plus an own-line repeat) — collapse identical buttons, keep the
+    # first occurrence and row order.
+    if kb:
+        _seen = set()
+        _deduped = []
+        for _row in kb:
+            _nrow = []
+            for _b in _row:
+                _key = (_b.get("text"),) + tuple(
+                    (_k, json.dumps(_b[_k], sort_keys=True))
+                    for _k in sorted(_b) if _k != "text")
+                if _key not in _seen:
+                    _seen.add(_key)
+                    _nrow.append(_b)
+            if _nrow:
+                _deduped.append(_nrow)
+        kb = _deduped
     markup = None
     if kb:
         markup = {"inline_keyboard": kb}
