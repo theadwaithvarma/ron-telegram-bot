@@ -17,14 +17,17 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# ron_daemon.py inserts the LIVE dir (~/workspace/telegram-bot) at
-# sys.path[0]; test modules that import it first (e.g. test_active) leave
-# the live dir's stale ron_ai in sys.modules. Evict it so the import
-# below resolves to this repo's copy.
-for _mod in ("ron_ai", "http_pool"):
-    sys.modules.pop(_mod, None)
+# Load THIS repo's ron_ai under a distinct module name, hermetic to the
+# full-discover run (see test_user_stop.py for the rationale: evicting
+# sys.modules['ron_ai'] perturbs other test modules while ron_daemon
+# still holds its own copy).
+import importlib.util as _ilu
 
-import ron_ai
+_spec = _ilu.spec_from_file_location(
+    "ron_ai_under_test",
+    os.path.join(os.path.dirname(__file__), "..", "ron_ai.py"))
+ron_ai = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(ron_ai)
 
 
 class FakeStreamResp:

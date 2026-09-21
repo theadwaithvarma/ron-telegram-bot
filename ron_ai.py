@@ -192,6 +192,17 @@ class RateLimitedError(RuntimeError):
     """
 
 
+class UserStoppedError(RuntimeError):
+    """Raised when the user hits Telegram's Stop button before the first
+    token arrived (empty stream + stop_event set).
+
+    NOT a backend failure: the daemon must send nothing and — critically —
+    skip the single-send fallback. Re-running the full AI chain after an
+    intentional stop burns tokens and ignores the user. Subclasses
+    RuntimeError so generic handlers still catch it.
+    """
+
+
 # NOTE 2026-09-20: llama-3.3-70b-versatile was retired by Groq (404s
 # "model does not exist"), so the live primary is gpt-oss-120b again with
 # gpt-oss-20b as the in-provider fallback — same model family,
@@ -1076,6 +1087,8 @@ def vision_stream(image_b64, caption="", on_token=None, stop_event=None):
         raise RuntimeError("AI key not connected yet")
     reply = _drain_stream(resp, stop_event, on_token).strip()
     if not reply:
+        if stop_event is not None and stop_event.is_set():
+            raise UserStoppedError("generation stopped by user")
         raise RuntimeError("AI backend returned empty reply")
     return reply[:MAX_REPLY]
 
@@ -1121,6 +1134,10 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
 
     reply = _drain_stream(resp, stop_event, on_token).strip()
     if not reply:
+        if stop_event is not None and stop_event.is_set():
+            # User hit Stop before the first token: not a backend
+            # failure — the daemon skips the single-send fallback.
+            raise UserStoppedError("generation stopped by user")
         raise RuntimeError("AI backend returned empty reply")
     reply = reply[:MAX_REPLY]
     _save_turn(chat_id, user_text, user_name, reply, user_id)

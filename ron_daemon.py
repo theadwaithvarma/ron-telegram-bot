@@ -3562,6 +3562,16 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                         # light-mode footer) for equivalent future questions.
                         _cache_store(chat_id, text, reply, cacheable)
                         return
+                    except ron_ai.UserStoppedError:
+                        # Stop pressed before the first token arrived: the
+                        # draft bubble is already gone client-side. Send
+                        # nothing — and crucially do NOT run the single-send
+                        # fallback below. Re-running the full AI chain after
+                        # an intentional stop burns tokens and ignores the
+                        # user (the 2026-09-21 outage pattern).
+                        print(f"[ron_daemon] user stopped generation, "
+                              f"chat={chat_id} — no fallback", flush=True)
+                        return
                     except Exception as e:
                         emsg = str(e)
                         # Token economy (2026-09-20): the stream attempt
@@ -3705,6 +3715,12 @@ def ai_vision_reply(chat_id, user_id, user_name, caption, file_id,
                     send_rich_with_kb(chat_id, reply, reply_to, thread_id,
                                       business_connection_id,
                                       user_text=caption or "")
+            except ron_ai.UserStoppedError:
+                # Stop pressed before the first token: nothing to send,
+                # no "couldn't read that image" error — the user stopped it.
+                print(f"[ron_daemon] user stopped vision generation, "
+                      f"chat={chat_id}", flush=True)
+                return
             except Exception as e:
                 msg = str(e)
                 if "not connected yet" in msg:

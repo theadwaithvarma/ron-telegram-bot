@@ -1,3 +1,32 @@
+## 1.23.0 — Stop-button UX: no fallback after an intentional stop (2026-09-21)
+
+Adwaith hit it live during the 5xx outage: he pressed Stop twice, and
+each time the bot silently re-ran the entire AI failover chain
+("single-send fallback") — the exact opposite of what Stop means.
+Root cause: `chat_stream`/`vision_stream` raised the generic "AI
+backend returned empty reply" when Stop arrived before the first
+token, and the daemon treated it as a stream failure.
+
+- **`UserStoppedError`.** New `ron_ai` exception (a `RuntimeError`
+  subclass, so generic handlers still catch it), raised only when the
+  stream is empty AND the stop event is set. A genuinely empty stream
+  with no stop still raises the old error; a mid-stream stop keeps
+  returning the partial text as before.
+- **Daemon.** Both streaming call sites (chat + vision) catch it
+  specifically: log, send nothing, no brain-failure record, no answer
+  cache write, and — critically — no single-send retry.
+- **Tests.** `tests/test_user_stop.py`: 6 offline tests (stop+empty ->
+  UserStoppedError, empty+no-stop -> old error, stop+partial -> partial
+  kept, RuntimeError subclassing, vision variants). The daemon's
+  `_stream_with_draft` stop path was also exercised directly in a
+  harness: exception propagates to the caller, nothing sent,
+  STOP_EVENTS slot cleaned, normal path unchanged.
+- Test-isolation hardening: the two new test files load the repo's
+  `ron_ai` under a distinct module name (`ron_ai_under_test`) instead
+  of evicting `sys.modules['ron_ai']` — the eviction perturbed other
+  test modules in full-discover runs while ron_daemon still held its
+  own copy.
+
 ## 1.22.0 — 5xx circuit breaker (2026-09-21)
 
 Adwaith hit it live: the bot showed only the typing indicator for
