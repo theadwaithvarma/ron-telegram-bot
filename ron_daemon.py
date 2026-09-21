@@ -1131,8 +1131,13 @@ def _blocks_text(blocks):
         if not isinstance(b, dict):
             return ""
         t = b.get("type")
-        if t in ("paragraph", "pre", "footer", "heading"):
+        if t in ("paragraph", "pre", "footer", "heading",
+                 "expandable_blockquote"):
             return _rt(b.get("text", ""))
+        if t == "details":
+            head = _rt(b.get("summary", ""))
+            body = "\n".join(_block(x) for x in b.get("blocks", []) or [])
+            return (head + ("\n" + body if body else "")).strip()
         if t == "blockquote":
             return "\n".join(_block(x)
                              for x in b.get("blocks", []) or [])
@@ -2109,6 +2114,37 @@ def send_rich(chat_id, text, reply_markup=None, reply_to=None, thread_id=None,
             # fall through to the plain-text fallback below (which also
             # carries the connection id).
             kw["business_connection_id"] = business_connection_id
+        # v1.18.0: tables, checklists, headings, details and expandable
+        # quotes have no Markdown rendering — route them through the
+        # blocks form so they arrive as native elements instead of literal
+        # text. The blocks builder never raises; validator pre-flights
+        # locally; any failure falls through to the markdown path below.
+        # The reply always lands — streaming drafts stay plain text, so
+        # partial markdown mid-stream needs no special handling and the
+        # can_stop/stop flow is untouched.
+        if ron_richblocks is not None:
+            try:
+                blocks = ron_richblocks.markdown_to_blocks(text)
+            except Exception as e:
+                print(f"[ron_daemon] blocks parse error: {e}", flush=True)
+                blocks = None
+            if blocks and ron_richblocks.needs_blocks_form(blocks):
+                bpayload = {"chat_id": chat_id,
+                            "rich_message": {"blocks": blocks}}
+                bpayload.update(kw)
+                bpayload.update(rp)
+                if _rich_violations(bpayload, "sendRichMessage"):
+                    print("[ron_daemon] blocks form failed local "
+                          "validation, falling back to markdown",
+                          flush=True)
+                else:
+                    r = send_healed("sendRichMessage", bpayload, as_json=True)
+                    if r.get("ok"):
+                        _note_sent(r)
+                        return r
+                    print(f"[ron_daemon] blocks send not ok "
+                          f"({str(r)[:120]}), falling back to markdown",
+                          flush=True)
         # Self-healing: malformed AI markdown ("can't parse entities") is
         # stripped and retried as plain text inside send_healed, so the
         # reply lands without anyone touching it.

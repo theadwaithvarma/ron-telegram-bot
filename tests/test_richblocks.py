@@ -82,10 +82,14 @@ class TestMarkdownToBlocks(unittest.TestCase):
         self.assertEqual([b["type"] for b in blks],
                          ["paragraph", "paragraph"])
 
-    def test_heading_degrades_to_bold(self):
+    def test_heading_is_real_heading_block(self):
+        # v1.18.0: headings are real heading blocks (InputRichBlockSectionHeading).
         blks = markdown_to_blocks("## Title")
-        self.assertEqual(blks[0]["type"], "paragraph")
-        self.assertEqual(blks[0]["text"][0]["type"], "bold")
+        self.assertEqual(blks[0]["type"], "heading")
+        self.assertEqual(blks[0]["size"], 2)
+        self.assertEqual(blks[0]["text"], "Title")
+        blks = markdown_to_blocks("# Big")
+        self.assertEqual(blks[0]["size"], 1)
 
     def test_quote(self):
         blks = markdown_to_blocks("> quoted\n> lines")

@@ -1,3 +1,33 @@
+## 1.18.0 — native rich formatting v2 (2026-09-21)
+
+- **Native Bot API 10.1-10.3 rich blocks, end to end.** The bot now renders
+  markdown constructs that have no Markdown representation as real native
+  Telegram elements instead of literal text: compact tables (first row as
+  header cells, `is_compact`), checklists (`- [ ]` / `- [x]` become real
+  checkboxes), true `##` headings, tap-to-expand `<details><summary>`
+  sections (plus the "Tap to expand:" shorthand, collapsed by default),
+  auto-collapsing long quotes (`expandable_blockquote`, 400+ chars), and
+  language-tagged fenced code blocks (syntax highlighting).
+- `send_rich()` now parses replies and routes any text needing these
+  constructs through the `sendRichMessage` **blocks** form (with a local
+  pre-flight via `ron_richvalidate`); anything else keeps the existing
+  Markdown path. Any failure falls back to Markdown, then plain text —
+  the reply always lands. Streaming drafts stay plain text, so native
+  streaming, can_stop/stop handling, and the stop button flow are
+  untouched.
+- In-body button rows are documented as the official `buttons` block
+  shape (1-8 per row, 64-byte callback cap, left/center/right align).
+- Prompt guidance added (live `ron_ai.json` + repo default): the model
+  is taught when to emit tables, checklists, headings, code languages,
+  and the one allowed HTML exception (`<details><summary>`).
+- **Fixed** two converter bugs found by tests: `<details>` open+close on
+  one line was dropped to a paragraph, and checklist lines were swallowed
+  by the plain bullet-list collector.
+- Tests: new `tests/test_rich_blocks.py` (30 cases), validator updated
+  for the new documented shapes (details, expandable_blockquote,
+  is_header, checkbox flags, table caption/border/stripe fields),
+  heading test updated to expect real heading blocks.
+
 ## 1.17.3 — honest instant /ping (2026-09-21)
 
 - **Fixed**: /ping measured one live getMe per call, which often caught a

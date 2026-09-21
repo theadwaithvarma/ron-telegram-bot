@@ -33,16 +33,23 @@ headline traps this validator exists to catch:
   blockquote takes ``blocks`` (``{"text": ...}`` 400s RICH_MESSAGE_EMPTY);
   list items are ``{"blocks": [...]}`` (``{"text": ...}`` 400s);
   tables take ``cells`` (``"rows"`` 400s "Can't find field \"cells\"").
+* New in v1.18.0 (shapes from the official Bot API docs, not yet live-probed):
+  ``heading`` (InputRichBlockSectionHeading), ``details``, and
+  ``expandable_blockquote`` blocks; ``is_header`` on table cells;
+  ``has_checkbox``/``is_checked`` on list items.
 
 Deliberate strict choices (so a later wiring stage knows what it is opting
 into):
 
 * ``divider`` blocks take no fields beyond ``type``.
-* ``table`` blocks are allowed ONLY in the live-verified
-  ``{type, cells: [[{text: RichText}]]}`` shape (plus optional ``is_compact``
-  bool, which is officially verified). ``details`` / ``expandable_blockquote``
-  / ``pull_quote`` / media blocks fail loud — we don't emit them and their
-  exact input shapes are unverified.
+* ``table`` blocks take ``cells`` (a 2-D array of cell dicts) plus the
+  optional official fields ``is_compact``, ``is_bordered``, ``is_striped``
+  and ``caption``. Cells take ``text`` plus the optional official fields
+  ``is_header``, ``colspan``, ``rowspan``, ``align`` and ``valign``.
+* ``details`` takes ``summary`` (RichText) + ``blocks`` (+ optional
+  ``is_open``); ``expandable_blockquote`` takes ``text`` (RichText, +
+  optional ``credit``). ``pull_quote`` / media blocks still fail loud —
+  we don't emit them and their exact input shapes are unverified.
 * ``style`` on classic ``reply_markup`` inline-keyboard buttons is a
   violation: ``style`` is a ``RichMessageButton`` (in-bubble) field; the
   official ``InlineKeyboardButton`` has no such field.
@@ -332,13 +339,23 @@ def _check_block(block, path, out):
         else:
             # Live-verified (2026-09-21): items are InputRichBlockListItem
             # = {"blocks": [...]}. The {"text": ...} shape 400s
-            # RICH_MESSAGE_EMPTY.
+            # RICH_MESSAGE_EMPTY. v1.18.0: the docs also allow the
+            # optional checkbox fields has_checkbox/is_checked.
             for i, item in enumerate(items):
                 ip = f"{path}.items[{i}]"
-                if not isinstance(item, dict) or set(item) != {"blocks"}:
-                    out.append(f"{ip}: item must be {{\"blocks\": [blocks]}}, "
-                               f"got {item!r}")
+                if not isinstance(item, dict):
+                    out.append(f"{ip}: item must be a dict, got {item!r}")
                     continue
+                extra_i = set(item) - {"blocks", "has_checkbox",
+                                       "is_checked"}
+                if extra_i:
+                    out.append(f"{ip}: unexpected fields {sorted(extra_i)} "
+                               f"on list item")
+                    continue
+                for f in ("has_checkbox", "is_checked"):
+                    if f in item and not isinstance(item[f], bool):
+                        out.append(f"{ip}.{f}: must be bool, "
+                                   f"got {item[f]!r}")
                 nested = item["blocks"]
                 if not isinstance(nested, list) or not nested:
                     out.append(f"{ip}.blocks: must be a non-empty list of "
@@ -368,25 +385,64 @@ def _check_block(block, path, out):
     elif t == "table":
         _check_table(block, path, out)
 
+    elif t == "details":
+        # Docs shape (v1.18.0): {"type": "details", "summary": RichText,
+        # "blocks": [...], "is_open"?: True}. is_open omitted = collapsed.
+        extra = set(block) - {"type", "summary", "blocks", "is_open"}
+        if extra:
+            out.append(f"{path}: unexpected fields {sorted(extra)} on "
+                       f"'details' block")
+        _check_richtext_required(block.get("summary"), f"{path}.summary",
+                                 out)
+        nested = block.get("blocks")
+        if not isinstance(nested, list) or not nested:
+            out.append(f"{path}.blocks: required non-empty list of nested "
+                       f"blocks, got {nested!r}")
+        else:
+            for i, nb in enumerate(nested):
+                _check_block(nb, f"{path}.blocks[{i}]", out)
+        if "is_open" in block and not isinstance(block["is_open"], bool):
+            out.append(f"{path}.is_open: must be bool, "
+                       f"got {block['is_open']!r}")
+
+    elif t == "expandable_blockquote":
+        # Docs shape (v1.18.0): {"type": "expandable_blockquote",
+        # "text": RichText, "credit"?: RichText}.
+        extra = set(block) - {"type", "text", "credit"}
+        if extra:
+            out.append(f"{path}: unexpected fields {sorted(extra)} on "
+                       f"'expandable_blockquote' block")
+        _check_richtext_required(block.get("text"), f"{path}.text", out)
+        if "credit" in block and block["credit"] is not None:
+            _check_richtext(block["credit"], f"{path}.credit", out)
+
     else:
         out.append(f"{path}: unsupported/unverified block type {t!r} — fail loud "
                    "(only paragraph/blockquote/footer/heading/pre/divider/list/"
-                   "buttons and the strict table shape are allowed)")
+                   "buttons/details/expandable_blockquote and the strict "
+                   "table shape are allowed)")
 
 
 def _check_table(block, path, out):
     """Live-verified table shape: {type, cells: [[{text: RichText}]]}.
 
     The server rejects a "rows" field ("Can't find field \"cells\"").
+    v1.18.0: cells may also carry the official is_header flag (plus the
+    documented colspan/rowspan/align/valign); the block accepts the
+    official is_compact/is_bordered/is_striped/caption fields.
     """
-    extra = set(block) - {"type", "cells", "is_compact"}
+    extra = set(block) - {"type", "cells", "is_compact", "is_bordered",
+                          "is_striped", "caption"}
     if extra:
-        out.append(f"{path}: table allows only type/cells/is_compact, got extra "
-                   f"{sorted(extra)}")
-    if "is_compact" in block and block["is_compact"] is not None:
-        if not isinstance(block["is_compact"], bool):
-            out.append(f"{path}.is_compact: must be bool, "
-                       f"got {block['is_compact']!r}")
+        out.append(f"{path}: unexpected table fields {sorted(extra)} "
+                   f"(allowed: type/cells/is_compact/is_bordered/"
+                   f"is_striped/caption)")
+    for f in ("is_compact", "is_bordered", "is_striped"):
+        if f in block and block[f] is not None and not isinstance(block[f],
+                                                                   bool):
+            out.append(f"{path}.{f}: must be bool, got {block[f]!r}")
+    if "caption" in block and block["caption"] is not None:
+        _check_richtext(block["caption"], f"{path}.caption", out)
     cells = block.get("cells")
     if not isinstance(cells, list) or not cells:
         out.append(f"{path}.cells: must be a non-empty 2-D list of cells, "
@@ -399,11 +455,27 @@ def _check_table(block, path, out):
             continue
         for c, cell in enumerate(row):
             cp = f"{path}.cells[{r}][{c}]"
-            if not isinstance(cell, dict) or set(cell) != {"text"}:
-                out.append(f"{cp}: cell must be {{\"text\": RichText}}, "
-                           f"got {cell!r}")
-            else:
-                _check_richtext_required(cell.get("text"), f"{cp}.text", out)
+            if not isinstance(cell, dict):
+                out.append(f"{cp}: cell must be a dict, got {cell!r}")
+                continue
+            extra_c = set(cell) - {"text", "is_header", "colspan",
+                                   "rowspan", "align", "valign"}
+            if extra_c:
+                out.append(f"{cp}: unexpected cell fields {sorted(extra_c)}")
+                continue
+            _check_richtext_required(cell.get("text"), f"{cp}.text", out)
+            if "is_header" in cell and not isinstance(cell["is_header"],
+                                                      bool):
+                out.append(f"{cp}.is_header: must be bool, "
+                           f"got {cell['is_header']!r}")
+            for f in ("colspan", "rowspan"):
+                if f in cell and not _is_int(cell[f]):
+                    out.append(f"{cp}.{f}: must be int, got {cell[f]!r}")
+            for f, allowed in (("align", {"left", "center", "right"}),
+                               ("valign", {"top", "middle", "bottom"})):
+                if f in cell and cell[f] not in allowed:
+                    out.append(f"{cp}.{f}: must be one of {sorted(allowed)}, "
+                               f"got {cell[f]!r}")
 
 
 # ---------------------------------------------------------------------------

@@ -215,12 +215,12 @@ class TestBlocks(unittest.TestCase):
         # The old guessed {"text": ...} item shape 400s on the server.
         assert_invalid(self, rich([{"type": "list", "ordered": True,
                                          "items": [{"text": "a"}]}]),
-                       "sendRichMessage", "must be {\"blocks\": [blocks]}")
+                       "sendRichMessage", "unexpected fields")
 
     def test_list_item_missing_blocks_rejected(self):
         assert_invalid(self, rich([{"type": "list", "ordered": True,
-                                         "items": [{"nope": 1}]}]),
-                       "sendRichMessage", "must be {\"blocks\": [blocks]}")
+                                         "items": [{"blocks": None}]}]),
+                       "sendRichMessage", "must be a non-empty list of blocks")
 
     def test_list_item_empty_blocks_rejected(self):
         assert_invalid(self, rich([{"type": "list", "ordered": True,
@@ -319,15 +319,21 @@ class TestBlocks(unittest.TestCase):
         t = {"type": "table", "is_compact": True, "cells": [[{"text": "h"}]]}
         assert_valid(self, rich([t]), "sendRichMessage")
 
+    def test_table_is_header_valid(self):
+        t = {"type": "table", "is_compact": True,
+             "cells": [[{"text": "h", "is_header": True}]]}
+        assert_valid(self, rich([t]), "sendRichMessage")
+
     def test_table_extra_cell_key_rejected(self):
-        t = {"type": "table", "cells": [[{"text": "h", "is_header": True}]]}
-        assert_invalid(self, rich([t]), "sendRichMessage", "must be {\"text\": RichText}")
+        t = {"type": "table", "cells": [[{"text": "h", "bogus": 1}]]}
+        assert_invalid(self, rich([t]), "sendRichMessage",
+                       "unexpected cell fields")
 
     def test_table_rows_field_rejected(self):
         # The old guessed "rows" field is rejected by the server.
         t = {"type": "table", "rows": [[{"text": "h"}]]}
         assert_invalid(self, rich([t]), "sendRichMessage",
-                       "only type/cells/is_compact")
+                       "unexpected table fields")
 
     def test_table_cells_empty_rejected(self):
         assert_invalid(self, rich([{"type": "table", "cells": []}]),
@@ -335,16 +341,25 @@ class TestBlocks(unittest.TestCase):
 
     def test_table_extra_block_field_rejected(self):
         t = {"type": "table", "cells": [[{"text": "h"}]], "title": "x"}
-        assert_invalid(self, rich([t]), "sendRichMessage", "only type/cells/is_compact")
+        assert_invalid(self, rich([t]), "sendRichMessage",
+                       "unexpected table fields")
 
-    # unverified / unknown block types fail loud
-    def test_details_rejected(self):
-        assert_invalid(self, rich([{"type": "details", "title": "t", "content": []}]),
-                       "sendRichMessage", "unsupported/unverified")
+    # v1.18.0: details and expandable_blockquote are documented shapes
+    def test_details_valid(self):
+        d = {"type": "details", "summary": "t",
+             "blocks": [{"type": "paragraph", "text": "x"}]}
+        assert_valid(self, rich([d]), "sendRichMessage")
 
-    def test_expandable_blockquote_rejected(self):
-        assert_invalid(self, rich([{"type": "expandable_blockquote", "text": "x"}]),
-                       "sendRichMessage", "unsupported/unverified")
+    def test_details_missing_blocks_rejected(self):
+        d = {"type": "details", "summary": "t"}
+        assert_invalid(self, rich([d]), "sendRichMessage",
+                       "required non-empty list of nested blocks")
+
+    def test_expandable_blockquote_valid(self):
+        assert_valid(self, rich([{"type": "expandable_blockquote",
+                                        "text": "x"}]), "sendRichMessage")
+
+    # unverified / unknown block types still fail loud
 
     def test_pull_quote_rejected(self):
         assert_invalid(self, rich([{"type": "pull_quote", "text": "x"}]),

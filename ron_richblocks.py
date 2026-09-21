@@ -23,9 +23,21 @@ Verified shapes:
                NOT {"text": ...}, which 400s with RICH_MESSAGE_EMPTY)
 - divider:    {"type": "divider"}
 - table:      {"type": "table", "cells": [[{"text": RichText}, ...], ...],
-               "is_compact"?: bool}
+               "is_compact": True}
               (field is "cells", a 2-D array — NOT "rows"; "rows" 400s with
-               "Can't find field \"cells\"")
+               "Can't find field \"cells\"". First-row cells carry
+               "is_header": True; is_compact renders the compact table.)
+- checklist:  {"type": "list", "ordered": False,
+               "items": [{"blocks": [{"type": "paragraph",
+                                      "text": RichText}],
+                          "has_checkbox": True, "is_checked": bool}]}
+- heading:    {"type": "heading", "text": RichText, "size": 1-6}
+              (InputRichBlockSectionHeading, official docs)
+- details:    {"type": "details", "summary": RichText,
+               "blocks": [nested blocks]}   (is_open omitted = collapsed)
+- expandable_blockquote:
+              {"type": "expandable_blockquote", "text": RichText}
+              (official docs shape; for long quotes)
 - buttons:    {"type": "buttons", "buttons": [RichMessageButton, ...],
                "align": "left"|"center"|"right"}   (ONE row per block, 1-8)
 - RichText:   plain str, or a list mixing str and inline nodes
@@ -34,8 +46,7 @@ Verified shapes:
               {"type": "url", "text": RichText, "url": str}   ("url" REQUIRED)
 
 NOT emitted (shapes unverified — fail loud locally rather than guess):
-heading blocks (degrade to bold paragraph), expandable_blockquote,
-pull_quote, details, media blocks. Mention/hashtag/subscript parsing is
+pull_quote, media blocks. Mention/hashtag/subscript parsing is
 not implemented — #/@ stay plain text on the blocks path (the markdown
 path entity-parses them), by design.
 
@@ -43,7 +54,8 @@ Pure functions, no network. Safe to import anywhere.
 """
 import re
 
-__all__ = ["parse_inline", "text_blocks", "markdown_to_blocks"]
+__all__ = ["parse_inline", "text_blocks", "markdown_to_blocks",
+           "needs_blocks_form"]
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +195,42 @@ _DIVIDER_RE = re.compile(r"^(---+$|\*\*\*+$|___+)\s*$")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _UL_RE = re.compile(r"^\s*[-*]\s+(.*)$")
 _OL_RE = re.compile(r"^\s*\d+[.)]\s+(.*)$")
+_CHECKLIST_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.*)$")
+_DETAILS_OPEN_RE = re.compile(r"<details\b[^>]*>", re.I)
+_DETAILS_CLOSE_RE = re.compile(r"</details\s*>", re.I)
+_SUMMARY_RE = re.compile(r"<summary\b[^>]*>(.*?)</summary\s*>", re.I | re.S)
+# Human/test shorthand: a standalone "Tap to expand: <title>" line followed
+# by the expandable content. Only treated as a block when it starts a
+# paragraph (previous line blank / start of input).
+_EXPAND_MARKER_RE = re.compile(
+    r"^(tap to expand|tap for details|show more|read more)\s*:?\s*(.*)$",
+    re.I)
+# Quotes longer than this become expandable_blockquote instead of a tall
+# static blockquote. Threshold is a local UX choice, not an API rule.
+_LONG_QUOTE_CHARS = 400
+
+
+def needs_blocks_form(blocks):
+    """True when the block list contains something the server's Markdown
+    parser cannot render, so the daemon must use the blocks form.
+
+    Tables, checklists, headings, details and expandable quotes have no
+    Markdown representation in sendRichMessage — they would arrive as
+    literal text. Paragraphs, dividers, pre fences, plain lists and plain
+    quotes render fine through the markdown path (which also entity-parses
+    #/@, so we prefer it whenever nothing richer is present).
+    """
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t in ("table", "details", "heading", "expandable_blockquote"):
+            return True
+        if t == "list" and any(
+                isinstance(it, dict) and it.get("has_checkbox")
+                for it in b.get("items", []) or []):
+            return True
+    return False
 
 
 def _split_cells(s):
@@ -214,11 +262,13 @@ def markdown_to_blocks(md):
     """Convert a Telegram-Markdown reply into rich-message blocks.
 
     Covers what the bot's replies actually use: paragraphs, ## headings
-    (degraded to bold paragraph — heading blocks are unverified locally),
-    > quotes, - / 1. lists, ``` code fences, --- dividers, tables (real
-    table blocks with inline-parsed cells), and all inline formatting via
-    parse_inline. Never raises on weird input — worst case it degrades to
-    plain paragraph blocks. Never emits an empty pre block.
+    (real heading blocks, size 1-6), > quotes (long ones become
+    expandable_blockquote), <details><summary> expandable sections,
+    - / 1. lists, - [ ] / - [x] checklists (real checkbox items),
+    ``` code fences (with language), --- dividers, tables (real compact
+    table blocks, first row flagged as header cells), and all inline
+    formatting via parse_inline. Never raises on weird input — worst case
+    it degrades to plain paragraph blocks. Never emits an empty pre block.
     """
     lines = (md or "").split("\n")
     blocks, para = [], []
@@ -268,33 +318,113 @@ def markdown_to_blocks(md):
             # Closed-but-empty fence (```\n```): carries no content at
             # all — dropped rather than sent as an empty pre.
             continue
+        # <details><summary>…</summary>…</details> expandable section.
+        # Collected across lines; an UNCLOSED <details> is not a real
+        # block — its lines fall back to plain paragraphs, never dropped.
+        if _DETAILS_OPEN_RE.search(s):
+            flush_para()
+            chunk = [line]
+            # The closing tag may sit on the same line as the opening one.
+            closed = bool(_DETAILS_CLOSE_RE.search(line))
+            i += 1
+            while i < len(lines) and not closed:
+                chunk.append(lines[i])
+                if _DETAILS_CLOSE_RE.search(lines[i]):
+                    closed = True
+                i += 1
+            if not closed:
+                para.extend(chunk)
+                continue
+            raw = "\n".join(chunk)
+            msum = _SUMMARY_RE.search(raw)
+            summary = msum.group(1).strip() if msum else ""
+            body = _SUMMARY_RE.sub("", raw)
+            body = _DETAILS_OPEN_RE.sub("", body)
+            body = _DETAILS_CLOSE_RE.sub("", body).strip("\n")
+            inner = markdown_to_blocks(body) if body.strip() else []
+            blocks.append({
+                "type": "details",
+                "summary": (parse_inline(summary) if summary else "Details"),
+                "blocks": inner or [{"type": "paragraph", "text": ""}],
+            })
+            continue
+        # "Tap to expand: <title>" shorthand — a paragraph-starting marker
+        # line followed by the expandable content up to the next blank line.
+        # The prompt teaches <details> first; this is the human shorthand.
+        mm = _EXPAND_MARKER_RE.match(s)
+        if mm and not para:
+            summary = mm.group(2).strip() or "Details"
+            i += 1
+            content = []
+            while i < len(lines) and lines[i].strip():
+                content.append(lines[i])
+                i += 1
+            body = "\n".join(content).strip()
+            inner = markdown_to_blocks(body) if body else []
+            blocks.append({
+                "type": "details",
+                "summary": parse_inline(summary),
+                "blocks": inner or [{"type": "paragraph", "text": ""}],
+            })
+            continue
         # --- divider
         if _DIVIDER_RE.match(s):
             flush_para()
             blocks.append({"type": "divider"})
             i += 1
             continue
-        # ## heading -> bold paragraph (heading block shape unknown)
+        # ## heading -> real heading block (InputRichBlockSectionHeading,
+        # official docs: type "heading", text RichText, size 1-6).
         m = _HEADING_RE.match(s)
         if m:
             flush_para()
-            blocks.append({"type": "paragraph",
-                           "text": [{"type": "bold",
-                                     "text": parse_inline(m.group(2))}]})
+            blocks.append({"type": "heading",
+                           "text": parse_inline(m.group(2)),
+                           "size": len(m.group(1))})
             i += 1
             continue
         # > quote block — verified shape: {"type": "blockquote",
         # "blocks": [nested blocks]}. The {"text": ...} shape 400s with
         # RICH_MESSAGE_EMPTY (harness B7 + shape probes, 2026-09-21).
+        # Long quotes collapse into an expandable_blockquote instead of a
+        # wall of quoted text.
         if s.startswith(">"):
             flush_para()
             q = []
             while i < len(lines) and lines[i].strip().startswith(">"):
                 q.append(re.sub(r"^>\s?", "", lines[i].strip()))
                 i += 1
-            blocks.append({"type": "blockquote", "blocks": [
-                {"type": "paragraph",
-                 "text": parse_inline("\n".join(q))}]})
+            joined = "\n".join(q)
+            if len(joined) > _LONG_QUOTE_CHARS:
+                blocks.append({"type": "expandable_blockquote",
+                               "text": parse_inline(joined)})
+            else:
+                blocks.append({"type": "blockquote", "blocks": [
+                    {"type": "paragraph",
+                     "text": parse_inline(joined)}]})
+            continue
+        # - [ ] / - [x] checklists — real checkbox items (docs-verified
+        # InputRichBlockListItem fields has_checkbox/is_checked). Checked
+        # BEFORE the plain list regex below: "- [ ] task" would otherwise
+        # match as a bullet whose text is "[ ] task".
+        cm = _CHECKLIST_RE.match(line)
+        if cm:
+            flush_para()
+            items = []
+            while i < len(lines):
+                cmm = _CHECKLIST_RE.match(lines[i])
+                if not cmm:
+                    break
+                items.append({
+                    "blocks": [{"type": "paragraph",
+                                "text": parse_inline(cmm.group(2))}],
+                    "has_checkbox": True,
+                    "is_checked": cmm.group(1).lower() == "x",
+                })
+                i += 1
+            if items:
+                blocks.append({"type": "list", "ordered": False,
+                               "items": items})
             continue
         # - / * / 1. lists — items are InputRichBlockListItem =
         # {"blocks": [...]}. The {"text": ...} shape 400s with
@@ -305,6 +435,10 @@ def markdown_to_blocks(md):
             ordered = bool(_OL_RE.match(line))
             items = []
             while i < len(lines):
+                # Checklist lines ("- [ ] task") are their own block kind —
+                # don't swallow them into a plain bullet list.
+                if _CHECKLIST_RE.match(lines[i]):
+                    break
                 mm = (_OL_RE.match(lines[i]) if ordered
                       else _UL_RE.match(lines[i]))
                 if not mm:
@@ -338,7 +472,13 @@ def markdown_to_blocks(md):
                 width = max(len(r) for r in rows)
                 cells2d = [r + [{"text": ""}] * (width - len(r))
                            for r in rows]
-                blocks.append({"type": "table", "cells": cells2d})
+                # Pipe tables lead with a header row: flag its non-empty
+                # cells as header cells; compact rendering for the table.
+                for c in cells2d[0]:
+                    if c.get("text"):
+                        c["is_header"] = True
+                blocks.append({"type": "table", "cells": cells2d,
+                               "is_compact": True})
             continue
         # blank line = paragraph break
         if not s:
