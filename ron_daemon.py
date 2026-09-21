@@ -3664,6 +3664,11 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 # path above builds its own inside stream_ai_reply, so
                 # computing it earlier did the disk reads twice per DM.
                 extra = group_context()
+                if business_connection_id:
+                    # v1.24.3: business replies go out as Adwaith himself
+                    # (his name/avatar), so the model answers as his
+                    # personal assistant — never as Ron the bot.
+                    extra += ron_ai.BUSINESS_SECRETARY_INSTRUCTION
                 if not private and _MEM_MODULES:
                     # Phase 4 backstop: the deterministic tripwire catches
                     # most personal questions, but if one slips through the

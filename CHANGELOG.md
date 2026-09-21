@@ -1,3 +1,16 @@
+## 1.24.3 — Business secretary instruction (2026-09-21)
+
+- Business (Chat Automation) replies go out from Adwaith's personal
+  account — his name and avatar, not the bot. `ai_reply` now injects
+  `BUSINESS_SECRETARY_INSTRUCTION` into the system prompt for business
+  chats: answer as his personal assistant in first person, never claim to
+  be "Ron"/a bot/an AI, never mention models/providers/keys, and never
+  invent commitments or personal details. Kept as a module constant in
+  `ron_ai.py` (not in DEFAULT_CONFIG) so live `ron_ai.json` overrides
+  can't clobber it.
+- 5 new offline tests in `tests/test_business_secretary.py` (content +
+  end-to-end injection through `ai_reply` with mocked Telegram).
+
 ## 1.24.2 — Business connection self-healing (2026-09-21)
 
 - Root-caused dead Chat Automation: Adwaith's business connection
