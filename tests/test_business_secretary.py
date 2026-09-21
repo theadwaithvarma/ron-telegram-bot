@@ -58,6 +58,12 @@ class SecretaryInjectionTest(unittest.TestCase):
             def join(self, timeout=None):
                 pass
 
+        # v1.25.0: neutralize the bake window — this test is about the
+        # secretary instruction, not canary deploys.
+        orig_bake = ron_daemon._BAKE_UNTIL
+        ron_daemon._BAKE_UNTIL = 0
+        self.addCleanup(lambda: setattr(ron_daemon, "_BAKE_UNTIL", orig_bake))
+
         patches = [
             mock.patch.object(ron_daemon.ron_ai, "chat", fake_chat),
             mock.patch.object(ron_daemon.ron_ai, "light_mode_enabled",

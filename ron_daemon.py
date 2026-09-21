@@ -12,6 +12,7 @@ business_message updates on the owner's business account.
 Run: nohup python3 ron_daemon.py >/tmp/ron_daemon.log 2>&1 &
 State: offset persisted to ~/workspace/telegram-bot/ron_daemon.offset
 """
+import datetime
 import json
 import os
 import re
@@ -158,6 +159,10 @@ _INFLIGHT_USERS = {}
 _FILE_LOCK = threading.RLock()
 # Phase 7: daemon start time for /health uptime. Set once at import.
 _START_TS = time.time()
+# v1.25.0 — canary deploy bake window: for 10 min after (re)start only the
+# owner is served; everyone else is queued with a "warming up" notice.
+_BAKE_MINUTES = 10
+_BAKE_UNTIL = _START_TS + _BAKE_MINUTES * 60
 # Phase 7: last provider probe results, refreshed by the startup health
 # ping and the degraded-mode recovery loop. /health reads this — no live
 # probing on the status path, so the card is instant and free.
@@ -260,11 +265,15 @@ def _record_brain_failure(err_text):
 
 def _record_brain_success():
     """A real answer got through — clear the failure streak."""
+    global _LAST_OUTAGE_SINCE
     with _BRAIN_LOCK:
         if _brain_failures:
             _brain_failures.clear()
         if _degraded["active"]:
             _degraded["active"] = False
+            # v1.25.0: remember when this outage started so the apology
+            # offer can size it after the queue drains.
+            _LAST_OUTAGE_SINCE = _degraded.get("since")
             print("[ron_daemon] DEGRADED MODE OFF: provider recovered",
                   flush=True)
 
@@ -333,6 +342,30 @@ def _maybe_degraded_notice(chat_id, reply_to=None, thread_id=None,
 
 
 # ---------------------------------------------------------------------------
+# v1.25.0 — canary deploy bake notice. During the 10-min post-start bake
+# window, non-owner messages are queued; each chat gets this notice once
+# (never the degraded text — the backends aren't down, we're warming up).
+# ---------------------------------------------------------------------------
+_bake_noticed = set()
+
+
+def _maybe_bake_notice(chat_id, reply_to=None, thread_id=None,
+                       business_connection_id=None):
+    """'Warming up' notice for bake-window queueing — once per chat."""
+    key = str(chat_id)
+    if key in _bake_noticed:
+        return
+    _bake_noticed.add(key)
+    notice = ("Just restarted \u2014 warming up for a couple of minutes. "
+              "Your message is queued and I'll answer it shortly. \U0001F527")
+    try:
+        send_rich_with_kb(chat_id, notice, reply_to, thread_id,
+                          business_connection_id)
+    except Exception as e:
+        print(f"[ron_daemon] bake notice failed: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # v1.24.4 — rescue mode ("ghost mode"). When every AI provider is down the
 # bot is dying but not dead: the owner still gets an answer. Any owner
 # message (a "you alive?" ping or a real question) triggers a low-energy
@@ -377,8 +410,78 @@ def _send_rescue_pulse(chat_id, reply_to=None, thread_id=None,
         print(f"[ron_daemon] rescue pulse failed: {e}", flush=True)
 
 
-def _drain_queue():
-    """Answer queued messages after recovery. True when the queue is empty.
+# ---------------------------------------------------------------------------
+# v1.25.0 — canary self-test. A daemon thread probes the AI chain every 15
+# min with a one-shot cheap prompt (quick_answer: no history, no memory,
+# no turn saving, no cache — the cheapest real path through the chain).
+# Silent on success. Two consecutive failures DM the owner once; recovery
+# DMs once. Each failure also feeds _record_brain_failure so degraded mode
+# trips naturally. Never raises; the loop logs and continues.
+# ---------------------------------------------------------------------------
+CANARY_INTERVAL = 15 * 60
+_CANARY_LOCK = threading.Lock()
+_canary_fails = 0
+_canary_alerted = False
+
+
+def _canary_probe():
+    """One canary probe. Returns True on success. Never raises."""
+    global _canary_fails, _canary_alerted
+    try:
+        ans = ron_ai.quick_answer("Reply with exactly: ok", "canary")
+        ok = (ans or "").strip().rstrip(".").lower() == "ok"
+        err = ""
+    except Exception as e:
+        ok = False
+        err = f"{type(e).__name__}: {str(e)[:100]}"
+    with _CANARY_LOCK:
+        if ok:
+            if _canary_fails:
+                print("[ron_daemon] canary green again", flush=True)
+            if _canary_alerted:
+                try:
+                    send(OWNER_ID, "\u2705 canary green again \u2014 "
+                                   "providers are answering.")
+                except Exception as e:
+                    print(f"[ron_daemon] canary recovery DM failed: {e}",
+                          flush=True)
+                _canary_alerted = False
+            _canary_fails = 0
+            return True
+        _canary_fails += 1
+        print(f"[ron_daemon] canary probe failed "
+              f"(streak={_canary_fails}) {err}", flush=True)
+        _record_brain_failure("canary probe failed")
+        if _canary_fails >= 2 and not _canary_alerted:
+            _canary_alerted = True
+            try:
+                send(OWNER_ID, "\U0001F424 canary failing 2x in a row \u2014 "
+                               "providers may be sick. Rescue mode will "
+                               "keep your pings answered.")
+            except Exception as e:
+                print(f"[ron_daemon] canary alert DM failed: {e}",
+                      flush=True)
+        return False
+
+
+def _canary_loop():
+    """Daemon thread: probe every CANARY_INTERVAL. Never dies on errors."""
+    # First probe after a minute so startup isn't slowed; then the interval.
+    if _SHUTDOWN.wait(60):
+        return
+    while not _SHUTDOWN.is_set():
+        try:
+            _canary_probe()
+        except Exception as e:
+            print(f"[ron_daemon] canary loop error (continuing): {e}",
+                  flush=True)
+        if _SHUTDOWN.wait(CANARY_INTERVAL):
+            return
+
+
+def _drain_queue_inner(replied):
+    """Inner queue drain. Appends (chat_id, business_connection_id) for
+    every entry that actually got a reply (not stale drops) to `replied`.
 
     Only entries answered successfully are removed (matched by qid), so a
     mid-drain failure or a message queued concurrently is never lost or
@@ -433,6 +536,7 @@ def _drain_queue():
                                  origin_thread_id=(None if e.get("private", True)
                                                     else e.get("thread_id")))
             answered.add(e.get("qid"))
+            replied.append((e.get("chat_id"), e.get("business_connection_id")))
             _record_brain_success()
         except Exception as ex:
             print(f"[ron_daemon] queue replay failed, staying degraded: {ex}",
@@ -459,6 +563,117 @@ def _drain_queue():
     return not rest
 
 
+def _drain_queue():
+    """Answer queued messages after recovery. True when the queue is empty.
+
+    Wrapper around _drain_queue_inner that also drives the v1.25.0 outage
+    apology offer: after a degraded episode drains with real answers, the
+    owner gets a one-tap "send apologies?" prompt.
+    """
+    replied = []
+    ok = _drain_queue_inner(replied)
+    try:
+        _maybe_offer_apology(replied)
+    except Exception as e:
+        print(f"[ron_daemon] apology offer failed: {e}", flush=True)
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# v1.25.0 — outage apology. After a degraded episode ends and the queue
+# drains with >=1 answered entry, the owner gets a DM offering a one-tap
+# apology broadcast to the affected chats. Off by default per incident:
+# nothing is sent without his tap. Flap protection: at most one offer/hour.
+# ---------------------------------------------------------------------------
+_APOLOGY_TEXT = ("Heads up \u2014 my systems had a brief outage earlier, "
+                 "so my reply was delayed. Sorry about that!")
+_APOLOGY_OFFER_COOLDOWN = 3600
+_apology_last_offer = 0
+_apology_pending = {}  # episode_id -> [(chat_id, business_connection_id)]
+_LAST_OUTAGE_SINCE = None
+
+
+def _maybe_offer_apology(replied_chats):
+    """Offer the owner a one-tap apology broadcast after a degraded
+    episode drains. replied_chats: [(chat_id, business_connection_id)] for
+    entries that actually got answers. Never raises."""
+    global _apology_last_offer, _LAST_OUTAGE_SINCE
+    since = _LAST_OUTAGE_SINCE
+    if not replied_chats or not since:
+        return
+    if _brain_down():
+        return  # episode still ongoing — keep the marker for later
+    _LAST_OUTAGE_SINCE = None  # consume: one offer max per episode
+    now = time.time()
+    if now - since > 7200:
+        return  # stale marker (e.g. a pure bake drain) — no apology
+    if now - _apology_last_offer < _APOLOGY_OFFER_COOLDOWN:
+        return
+    _apology_last_offer = now
+    ep = str(int(since))
+    seen = set()
+    uniq = []
+    for c, b in replied_chats:
+        key = (str(c), str(b))
+        if key not in seen:
+            seen.add(key)
+            uniq.append((c, b))
+    if not uniq:
+        return
+    _apology_pending[ep] = uniq
+    mins = max(1, int((now - since) / 60))
+    text = (f"\U0001F527 Brain was down ~{mins} min. {len(uniq)} chat(s) "
+            f"got delayed replies.\nSend them a brief apology?")
+    kb = {"inline_keyboard": [[
+        {"text": "Yes, send", "callback_data": _cb64(f"apology:yes:{ep}")},
+        {"text": "No", "callback_data": _cb64(f"apology:no:{ep}")},
+    ]]}
+    try:
+        send_markup(OWNER_ID, text, kb)
+        print(f"[ron_daemon] apology offered for episode {ep} "
+              f"({len(uniq)} chats)", flush=True)
+    except Exception as e:
+        print(f"[ron_daemon] apology offer send failed: {e}", flush=True)
+
+
+def _handle_apology_callback(query, data):
+    """Owner tapped an apology offer button. data: apology:<yes|no>:<ep>."""
+    frm = query.get("from") or {}
+    if frm.get("id") != OWNER_ID:
+        return
+    parts = (data or "").split(":")
+    if len(parts) != 3:
+        return
+    _, verdict, ep = parts
+    pending = _apology_pending.pop(ep, None)
+    if pending is None:
+        try:
+            send(OWNER_ID, "That apology offer already expired.")
+        except Exception:
+            pass
+        return
+    if verdict == "yes":
+        sent = 0
+        for chat_id, conn_id in pending:
+            try:
+                send(chat_id, _APOLOGY_TEXT,
+                     business_connection_id=conn_id)
+                sent += 1
+            except Exception as e:
+                print(f"[ron_daemon] apology send failed "
+                      f"(chat={chat_id}): {e}", flush=True)
+        try:
+            send(OWNER_ID, f"Sent apologies to {sent}/{len(pending)} "
+                           f"chat(s).")
+        except Exception:
+            pass
+    else:
+        try:
+            send(OWNER_ID, "OK, no apologies sent.")
+        except Exception:
+            pass
+
+
 def _recovery_loop():
     """While degraded, probe providers every minute; drain the queue on
     recovery."""
@@ -481,6 +696,21 @@ def _recovery_loop():
             with _BRAIN_LOCK:
                 _degraded["active"] = False
             print("[ron_daemon] DEGRADED MODE OFF: queue drained", flush=True)
+
+
+def _bake_drain_loop():
+    """v1.25.0: sleep until the bake window ends, then drain the queue once
+    so bake-window messages get answered. Never raises."""
+    wait = _BAKE_UNTIL - time.time()
+    if wait > 0:
+        _SHUTDOWN.wait(wait)  # True on shutdown, False on timeout
+    if _SHUTDOWN.is_set():
+        return
+    print("[ron_daemon] bake window over — draining queue", flush=True)
+    try:
+        _drain_queue()
+    except Exception as e:
+        print(f"[ron_daemon] bake drain failed: {e}", flush=True)
 
 
 def _health_ping():
@@ -1769,6 +1999,136 @@ def _recover_business_connection(conn_id):
     return conn
 
 
+# ---------------------------------------------------------------------------
+# v1.25.0 — stale chat radar. Tracks business-chat activity per chat:
+# incoming messages mark a chat as waiting; an observed outgoing message
+# clears it (the owner's own messages DO arrive as business_message
+# updates, as do the bot's echoes — only the human owner's count).
+# Once a day (~09:00 IST) the owner gets a digest of chats waiting >24h
+# with no reply observed since. Silent when empty, one digest/day max.
+# ---------------------------------------------------------------------------
+BUSINESS_STALE_FILE = os.path.join(HOME, "workspace", "telegram-bot",
+                                   "business_stale.json")
+_STALE_DIGEST_HOUR_IST = 9
+_STALE_WAIT_SECS = 24 * 3600
+_IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _stale_load():
+    """{"chats": {cid: {...}}, "last_digest_day": "YYYY-MM-DD"}."""
+    try:
+        with open(BUSINESS_STALE_FILE) as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            return {"chats": {}}
+        if not isinstance(d.get("chats"), dict):
+            d["chats"] = {}
+        return d
+    except (FileNotFoundError, ValueError):
+        return {"chats": {}}
+    except Exception as e:
+        print(f"[ron_daemon] stale radar load failed: {e}", flush=True)
+        return {"chats": {}}
+
+
+def _stale_save(store):
+    try:
+        tmp = BUSINESS_STALE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(store, f, ensure_ascii=False)
+        os.replace(tmp, BUSINESS_STALE_FILE)
+    except Exception as e:
+        print(f"[ron_daemon] stale radar save failed: {e}", flush=True)
+
+
+def _stale_note_incoming(chat_id, name, text, now=None):
+    """Record an incoming business-chat message."""
+    now = now if now is not None else time.time()
+    with _FILE_LOCK:
+        store = _stale_load()
+        e = store["chats"].get(str(chat_id)) or {}
+        e["name"] = name or e.get("name", "there")
+        e["last_in_ts"] = now
+        e["snippet"] = (text or "")[:80]
+        store["chats"][str(chat_id)] = e
+        _stale_save(store)
+
+
+def _stale_note_outgoing(chat_id, now=None):
+    """An observed outgoing (owner-human) message clears staleness."""
+    now = now if now is not None else time.time()
+    with _FILE_LOCK:
+        store = _stale_load()
+        e = store["chats"].get(str(chat_id)) or {}
+        e["replied_ts"] = now
+        store["chats"][str(chat_id)] = e
+        _stale_save(store)
+
+
+def _stale_digest_list(now=None):
+    """[(chat_id, name, hours_waiting, snippet)] for chats with an incoming
+    >24h old and no reply observed since. Oldest-waiting first."""
+    now = now if now is not None else time.time()
+    store = _stale_load()
+    out = []
+    for cid, e in store["chats"].items():
+        if not isinstance(e, dict):
+            continue
+        last_in = e.get("last_in_ts", 0)
+        replied = e.get("replied_ts", 0)
+        if last_in > replied and now - last_in > _STALE_WAIT_SECS:
+            out.append((cid, e.get("name", "there"),
+                        (now - last_in) / 3600, e.get("snippet", "")))
+    out.sort(key=lambda t: t[2], reverse=True)
+    return out
+
+
+def _stale_format_digest(items):
+    lines = [f"\U0001F4EC stale chats \u2014 {len(items)} waiting 24h+:"]
+    for _cid, name, hours, snippet in items:
+        snip = f' \u2014 "{snippet}"' if snippet else ""
+        lines.append(f"\u2022 {name} \u2014 {hours:.0f}h{snip}")
+    return "\n".join(lines)
+
+
+def _stale_maybe_digest(now=None):
+    """Hourly entry point: at ~09:00 IST, DM the owner the stale digest.
+    One digest per day max; silent when empty. Returns True if sent."""
+    now = now if now is not None else time.time()
+    ist = datetime.datetime.fromtimestamp(now, _IST)
+    day = ist.strftime("%Y-%m-%d")
+    with _FILE_LOCK:
+        store = _stale_load()
+        if store.get("last_digest_day") == day:
+            return False
+        if ist.hour != _STALE_DIGEST_HOUR_IST:
+            return False
+        items = _stale_digest_list(now)
+        store["last_digest_day"] = day
+        _stale_save(store)
+    if not items:
+        return False
+    try:
+        send(OWNER_ID, _stale_format_digest(items))
+        print(f"[ron_daemon] stale digest sent ({len(items)} chats)",
+              flush=True)
+        return True
+    except Exception as e:
+        print(f"[ron_daemon] stale digest failed: {e}", flush=True)
+        return False
+
+
+def _stale_radar_loop():
+    """Daemon thread: hourly digest check. Never dies on errors."""
+    while not _SHUTDOWN.is_set():
+        try:
+            _stale_maybe_digest()
+        except Exception as e:
+            print(f"[ron_daemon] stale radar error (continuing): {e}",
+                  flush=True)
+        _SHUTDOWN.wait(3600)
+
+
 def handle_business_message(msg):
     """Reply inside the owner's business account chats.
 
@@ -1804,6 +2164,14 @@ def handle_business_message(msg):
         return
     frm = msg.get("from") or {}
     sender = frm.get("id", 0)
+    # v1.25.0 stale-chat radar: the owner's own outgoing messages DO
+    # arrive as business_message updates — an observed outgoing reply
+    # clears the chat's staleness; any other human message is tracked.
+    # (Bot echoes match neither branch.)
+    if sender == conn.get("user_id"):
+        _stale_note_outgoing(chat_id)
+    elif sender and not frm.get("is_bot"):
+        _stale_note_incoming(chat_id, frm.get("first_name", "there"), text)
     # Skip the business owner's own messages and any bot's echoes.
     if sender and (sender == conn.get("user_id") or frm.get("is_bot")):
         return
@@ -3615,7 +3983,10 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
         cur = threading.current_thread()
         try:
             # Phase 3 degraded mode: every provider is down — don't burn
-            # API calls, queue the message and be honest about it.
+            # API calls, queue the message and be honest about it. This
+            # stays FIRST: if the brain is down during the bake window,
+            # the degraded notice is the truthful one ("warming up"
+            # would be a lie).
             if _brain_down():
                 if _owner_gate(user_id):
                     # v1.24.4 rescue mode: the owner's message is queued
@@ -3633,6 +4004,16 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                                    business_connection_id, private)
                     _maybe_degraded_notice(chat_id, reply_to, thread_id,
                                            business_connection_id)
+                return
+            # v1.25.0 canary deploy: 10-min bake window after (re)start —
+            # only the owner is served; everyone else is queued with a
+            # "warming up" notice (never the degraded text — backends
+            # aren't down). Owner messages pass through normally.
+            if time.time() < _BAKE_UNTIL and not _owner_gate(user_id):
+                _queue_message(chat_id, user_id, user_name, text, reply_to,
+                               thread_id, business_connection_id, private)
+                _maybe_bake_notice(chat_id, reply_to, thread_id,
+                                   business_connection_id)
                 return
             try:
                 # Phase 6: semantic answer cache — serve a recent
@@ -4462,6 +4843,10 @@ def handle_callback(query):
     # get silence (the /start command still explains the break).
     if maintenance_on() and frm.get("id") != OWNER_ID:
         return
+    # v1.25.0 outage apology buttons (owner-only, sent in his DM).
+    if data.startswith("apology:"):
+        _handle_apology_callback(query, data)
+        return
     if data == "demo_more":
         msg = query.get("message") or {}
         chat = msg.get("chat") or {}
@@ -4568,6 +4953,13 @@ def main():
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     threading.Thread(target=_health_ping, daemon=True).start()
     threading.Thread(target=_recovery_loop, daemon=True).start()
+    # v1.25.0: canary self-test (15m AI-chain probe), stale-chat radar
+    # (hourly digest check), bake-window drain (fires once at startup+10m).
+    threading.Thread(target=_canary_loop, daemon=True).start()
+    print("[ron_daemon] canary self-test thread started (15m interval)",
+          flush=True)
+    threading.Thread(target=_stale_radar_loop, daemon=True).start()
+    threading.Thread(target=_bake_drain_loop, daemon=True).start()
     while not _SHUTDOWN.is_set():
         try:
             r = api("getUpdates", {"offset": offset, "timeout": 50,

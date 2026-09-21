@@ -50,9 +50,13 @@ class AiReplyUsernameTest(unittest.TestCase):
                      "_record_brain_success", "_cache_store",
                      "typing_kickoff", "send_rich_with_kb",
                      "handle_group_sends", "handle_send_topic",
-                     "handle_topic_actions", "_track", "_untrack"):
+                     "handle_topic_actions", "_track", "_untrack",
+                     "_BAKE_UNTIL"):
             self._orig[name] = getattr(ron_daemon, name)
         ron_daemon._brain_down = lambda: False
+        # v1.25.0: neutralize the canary-deploy bake window — these tests
+        # are about username plumbing, not bake routing.
+        ron_daemon._BAKE_UNTIL = 0
         ron_daemon._cache_lookup = lambda *a, **k: None
         ron_daemon.stream_ai_reply = (
             lambda *a, **k: self.stream_calls.append((a, k)) or "canned")

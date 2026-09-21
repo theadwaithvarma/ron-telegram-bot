@@ -1,3 +1,33 @@
+## 1.25.0 — Canary self-test, stale-chat radar, canary deploys, outage apology (2026-09-21)
+
+Four reliability/secretary features:
+
+- Canary self-test: a daemon thread probes the AI chain every 15 min via
+  `quick_answer` (no history/memory/cache/turn-saving — the cheapest real
+  path). Silent on success. Two consecutive failures DM the owner once
+  ("canary failing 2x — providers may be sick"); recovery DMs once. Each
+  failure feeds `_record_brain_failure` so degraded mode trips naturally.
+- Stale-chat radar: `handle_business_message` tracks per-chat incoming
+  timestamps/snippets (`business_stale.json`); an observed outgoing
+  owner-human message clears staleness (owner messages do arrive as
+  business_message updates; bot echoes don't count). Hourly thread DMs
+  the owner once/day ~09:00 IST with chats waiting >24h — silent when
+  empty.
+- Canary deploys: 10-min bake window after (re)start — only the owner is
+  served; everyone else is queued with a "warming up" notice (never the
+  degraded text). At bake end the queue drains once. The degraded/rescue
+  path stays first: if the brain is down during bake, the honest notice
+  wins.
+- Outage apology: when a degraded episode ends and the queue drains with
+  >=1 answered entry, the owner gets a DM with [Yes, send]/[No] inline
+  buttons (64-byte-safe callback data `apology:<yes|no>:<episode>`).
+  Nothing sends without his tap. Yes -> one provider-neutral apology per
+  affected chat (business ones via their business_connection_id). At most
+  one offer/hour; only when >=1 chat was affected.
+- 31 new offline tests: test_canary (6), test_stale_radar (10),
+  test_bake (6), test_apology (9). Full suite: 735 tests, same 6
+  pre-existing failures/errors as baseline.
+
 ## 1.24.4 — Rescue mode ("ghost mode") (2026-09-21)
 
 - When every AI provider is down the bot is dying but not dead: any
