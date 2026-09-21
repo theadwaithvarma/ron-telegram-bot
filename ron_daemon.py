@@ -1378,27 +1378,53 @@ def typing_kickoff(chat_id, business_connection_id=None):
     return t
 
 
-BTN_RE = re.compile(r"^\[buttons:\s*(.+?)\s*\]\s*$", re.M | re.I)
-LINK_RE = re.compile(r"^\[links:\s*(.+?)\s*\]\s*$", re.M | re.I)
-# trailers the model tacks onto the end of a sentence instead of their own line
-BTN_TAIL_RE = re.compile(r"\[buttons:\s*([^\]]+?)\s*\]\s*$", re.I)
-LINK_TAIL_RE = re.compile(r"\[links:\s*([^\]]+?)\s*\]\s*$", re.I)
+# (button/link trailer patterns live in the v1.21.2 helpers below)
 # v1.21.0: more button types. [copy: Label | text] -> copy_text button
 # (1-256 chars copied to clipboard); [switch_inline: Label | query] ->
 # switch_inline_query button; [login: Log in] -> login_url button (URL from
 # ron_ai.json "login_url"; trailer dropped if unconfigured);
 # [reply_keyboard: a, b, c] -> ReplyKeyboardMarkup shortcut menu;
 # [hide_keyboard] -> ReplyKeyboardRemove.
-COPY_RE = re.compile(r"^\[copy:\s*(.+?)\s*\]\s*$", re.M | re.I)
-COPY_TAIL_RE = re.compile(r"\[copy:\s*([^\]]+?)\s*\]\s*$", re.I)
-SWITCH_RE = re.compile(r"^\[switch_inline:\s*(.+?)\s*\]\s*$", re.M | re.I)
-SWITCH_TAIL_RE = re.compile(r"\[switch_inline:\s*([^\]]+?)\s*\]\s*$", re.I)
-LOGIN_RE = re.compile(r"^\[login:\s*(.+?)\s*\]\s*$", re.M | re.I)
-LOGIN_TAIL_RE = re.compile(r"\[login:\s*([^\]]+?)\s*\]\s*$", re.I)
-RK_RE = re.compile(r"^\[reply_keyboard:\s*(.+?)\s*\]\s*$", re.M | re.I)
-RK_TAIL_RE = re.compile(r"\[reply_keyboard:\s*([^\]]+?)\s*\]\s*$", re.I)
-HIDEKB_RE = re.compile(r"^\[hide_keyboard\]\s*$", re.M | re.I)
-HIDEKB_TAIL_RE = re.compile(r"\[hide_keyboard\]\s*$", re.I)
+#
+# v1.21.2: the model often embeds trailers mid-line ("- External link:
+# [links: Label -> url]") instead of on their own line. The old ^...$
+# (own-line) / tail ($ = string end) patterns missed those entirely — no
+# buttons were built AND the raw [links: ...] syntax stayed visible in
+# the message ("blank for URL and other buttons"). These helpers find
+# EVERY trailer of a type, anywhere in the reply.
+def _trailer_bodies(reply, name):
+    """All bodies of [name: ...] trailers in reply, in order."""
+    return re.findall(r"\[" + name + r":\s*([^\]]+?)\s*\]", reply or "",
+                      re.I)
+
+
+def _strip_trailer(reply, name):
+    """Remove every [name: ...] trailer, wherever it sits."""
+    return re.sub(r"\[" + name + r":\s*[^\]]+?\s*\]", "", reply or "",
+                  flags=re.I)
+
+
+def _has_hide_keyboard(reply):
+    return bool(re.search(r"\[hide_keyboard\]", reply or "", re.I))
+
+
+def _strip_hide_keyboard(reply):
+    return re.sub(r"\[hide_keyboard\]", "", reply or "", flags=re.I)
+
+
+def _looks_like_url(s):
+    """Bare domain/URL without scheme ('google.com', 't.me/x')."""
+    s = (s or "").strip()
+    if not s or " " in s:
+        return False
+    return bool(re.match(r"^(https?://)?[\w-]+(\.[\w-]+)+(:\d+)?(/\S*)?$",
+                         s))
+
+
+def _url_host_label(url):
+    """Readable button label from a URL when the model gives no label."""
+    host = re.sub(r"^https?://", "", url or "").split("/")[0]
+    return host or url
 
 
 # ---------------------------------------------------------------------------
@@ -1932,19 +1958,18 @@ def handle_group_sends(origin_chat_id, user_id, user_name, reply):
 def strip_trailer_syntax(reply):
     """Remove every trailer form: [buttons:...]/[links:...]/[send_group:...]
     /[send_topic:...]/[topic:...]/[copy:...]/[switch_inline:...]/[login:...]
-    /[reply_keyboard:...]/[hide_keyboard], line or inline."""
-    reply = BTN_RE.sub("", LINK_RE.sub("", reply))
+    /[reply_keyboard:...]/[hide_keyboard], wherever they sit in the reply
+    (v1.21.2: the model embeds them mid-line, not just on their own line).
+    Group/topic trailers keep their own-line handling — separate feature."""
+    for _name in ("buttons", "links", "copy", "switch_inline", "login",
+                  "reply_keyboard"):
+        reply = _strip_trailer(reply, _name)
+    reply = _strip_hide_keyboard(reply)
     reply = GROUP_RE.sub("", reply)
     reply = SEND_TOPIC_RE.sub("", reply)
     reply = TOPIC_RE.sub("", reply)
-    reply = BTN_TAIL_RE.sub("", LINK_TAIL_RE.sub("", reply))
     reply = GROUP_TAIL_RE.sub("", reply)
     reply = SEND_TOPIC_TAIL_RE.sub("", reply)
-    reply = COPY_RE.sub("", COPY_TAIL_RE.sub("", reply))
-    reply = SWITCH_RE.sub("", SWITCH_TAIL_RE.sub("", reply))
-    reply = LOGIN_RE.sub("", LOGIN_TAIL_RE.sub("", reply))
-    reply = RK_RE.sub("", RK_TAIL_RE.sub("", reply))
-    reply = HIDEKB_RE.sub("", HIDEKB_TAIL_RE.sub("", reply))
     return TOPIC_TAIL_RE.sub("", reply).strip()
 
 
@@ -2063,14 +2088,20 @@ def parse_trailers(reply, skip_context_filter=False):
     reply_markup kind — an inline keyboard wins; a dropped menu is logged.
     skip_context_filter=True (v1.21.1): the user's message explicitly
     asked for buttons, so off-topic quick replies are kept — the deny-list
-    still drops boilerplate. Returns (clean_text, reply_markup_dict_or_None)."""
-    btns = (BTN_RE.search(reply) or BTN_TAIL_RE.search(reply) or [None, None])[1]
-    links = (LINK_RE.search(reply) or LINK_TAIL_RE.search(reply) or [None, None])[1]
-    copies = (COPY_RE.search(reply) or COPY_TAIL_RE.search(reply) or [None, None])[1]
-    switches = (SWITCH_RE.search(reply) or SWITCH_TAIL_RE.search(reply) or [None, None])[1]
-    login = (LOGIN_RE.search(reply) or LOGIN_TAIL_RE.search(reply) or [None, None])[1]
-    rkb = (RK_RE.search(reply) or RK_TAIL_RE.search(reply) or [None, None])[1]
-    hidekb = HIDEKB_RE.search(reply) or HIDEKB_TAIL_RE.search(reply)
+    still drops boilerplate. v1.21.2: trailers are found ANYWHERE in the
+    reply (mid-line too, not just own-line/string-tail), every trailer of
+    a type is honored, and [links:] tolerates bare URLs and missing
+    schemes. Returns (clean_text, reply_markup_dict_or_None)."""
+    # v1.21.2: every trailer of a type, wherever it sits in the reply
+    # (own line or mid-line) — the old first-match-only search missed
+    # mid-line trailers entirely.
+    btn_bodies = _trailer_bodies(reply, "buttons")
+    link_bodies = _trailer_bodies(reply, "links")
+    copy_bodies = _trailer_bodies(reply, "copy")
+    switch_bodies = _trailer_bodies(reply, "switch_inline")
+    login_bodies = _trailer_bodies(reply, "login")
+    rkb_bodies = _trailer_bodies(reply, "reply_keyboard")
+    hidekb = _has_hide_keyboard(reply)
     clean = strip_trailer_syntax(reply)
     kb = []
     link_row = []
@@ -2078,25 +2109,26 @@ def parse_trailers(reply, skip_context_filter=False):
     dropped_labels = []  # non-http link targets: kept as visible text
     # Spoiler markers contain the "|" separator — erase them before the
     # split, or "||x||" shatters into phantom buttons.
-    if btns:
-        btns = btns.replace("||", "")
-    if btns:
+    btn_parts = []
+    for _body in btn_bodies:
+        _body = _body.replace("||", "")
         # v1.21.1: the model sometimes emits comma-separated labels as one
         # giant button ("a, b, c"). "|" stays the primary separator —
         # commas are only a fallback when no pipe is present.
-        if "|" in btns:
-            parts = btns.split("|")
-        elif "," in btns:
+        if "|" in _body:
+            btn_parts.extend(_body.split("|"))
+        elif "," in _body:
             print(f"[ron_daemon] trailer: [buttons:] has no pipes, "
-                  f"splitting on commas (prompt says pipes): {btns!r}",
+                  f"splitting on commas (prompt says pipes): {_body!r}",
                   flush=True)
-            parts = btns.split(",")
+            btn_parts.extend(_body.split(","))
         else:
-            parts = [btns]
+            btn_parts.append(_body)
+    if btn_parts:
         # callback_data is capped at 64 bytes by Telegram — truncate by bytes,
         # not chars, so multibyte labels can't produce BUTTON_DATA_INVALID.
         row = []
-        for b in (x.strip() for x in parts):
+        for b in (x.strip() for x in btn_parts):
             if not b:
                 continue
             # The AI sometimes puts link syntax inside [buttons: ...] —
@@ -2107,7 +2139,14 @@ def parse_trailers(reply, skip_context_filter=False):
                     link_row.append({"text": _clean_btn_label(label)[:40],
                                      "url": url})
                     continue
-                # Non-http target: not a link. Keep the left side as the
+                if _looks_like_url(url):
+                    # Missing scheme ("google.com") — assume https.
+                    link_row.append({"text": _clean_btn_label(label)[:40],
+                                     "url": "https://" + url})
+                    print(f"[ron_daemon] trailer: added https:// scheme "
+                          f"to [buttons:] link target: {url!r}", flush=True)
+                    continue
+                # Non-URL target: not a link. Keep the left side as the
                 # callback label instead of junk like "a -> nothttp".
                 print(f"[ron_daemon] trailer: non-http '->' target dropped "
                       f"in [buttons:], label {label!r}", flush=True)
@@ -2136,48 +2175,51 @@ def parse_trailers(reply, skip_context_filter=False):
                 break
         if row:
             kb.append(row)
-    if copies:
+    for _copy_body in copy_bodies:
         # CopyTextButton.text: official 1-256 chars. One copy button per
         # trailer — "Label | text"; multiple pairs are ambiguous, so extra
         # pipes are treated as literal text of the copied value.
-        if "|" not in copies:
+        if "|" not in _copy_body:
             print(f"[ron_daemon] trailer: [copy:] dropped, needs "
-                  f"'Label | text', got {copies!r}", flush=True)
+                  f"'Label | text', got {_copy_body!r}", flush=True)
+            continue
+        label, ctext = (x.strip() for x in _copy_body.split("|", 1))
+        label = _clean_btn_label(label)
+        # The label is a quick-reply-grade button, so it passes the
+        # same contextual filter — a stray "Copy" button is dropped
+        # like any off-topic one.
+        if not label or not ctext:
+            print(f"[ron_daemon] trailer: [copy:] dropped, empty "
+                  f"label or text: {_copy_body!r}", flush=True)
+        elif _button_denied(label):
+            print(f"[ron_daemon] trailer: denied boilerplate copy "
+                  f"button dropped: {label!r}", flush=True)
+        elif not skip_context_filter and not _button_fits_context(
+                label, clean):
+            print(f"[ron_daemon] trailer: off-topic copy button dropped: "
+                  f"{label!r}", flush=True)
         else:
-            label, ctext = (x.strip() for x in copies.split("|", 1))
-            label = _clean_btn_label(label)
-            # The label is a quick-reply-grade button, so it passes the
-            # same contextual filter — a stray "Copy" button is dropped
-            # like any off-topic one.
-            if not label or not ctext:
-                print(f"[ron_daemon] trailer: [copy:] dropped, empty "
-                      f"label or text: {copies!r}", flush=True)
-            elif _button_denied(label):
-                print(f"[ron_daemon] trailer: denied boilerplate copy "
-                      f"button dropped: {label!r}", flush=True)
-            elif not skip_context_filter and not _button_fits_context(
-                    label, clean):
-                print(f"[ron_daemon] trailer: off-topic copy button dropped: "
-                      f"{label!r}", flush=True)
-            else:
-                kb.append([{"text": label[:40],
-                            "copy_text": {"text": ctext[:256]}}])
-    if switches:
+            kb.append([{"text": label[:40],
+                        "copy_text": {"text": ctext[:256]}}])
+    for _switch_body in switch_bodies:
         # Same "Label | query" pair rule as [copy:]. The query is prefilled
         # into inline mode; it may be empty (just inserts the bot name).
-        if "|" not in switches:
+        if "|" not in _switch_body:
             print(f"[ron_daemon] trailer: [switch_inline:] dropped, "
-                  f"needs 'Label | query', got {switches!r}", flush=True)
+                  f"needs 'Label | query', got {_switch_body!r}", flush=True)
+            continue
+        label, query = (x.strip() for x in _switch_body.split("|", 1))
+        label = _clean_btn_label(label)
+        if label:
+            kb.append([{"text": label[:40],
+                        "switch_inline_query": query[:256]}])
         else:
-            label, query = (x.strip() for x in switches.split("|", 1))
-            label = _clean_btn_label(label)
-            if label:
-                kb.append([{"text": label[:40],
-                            "switch_inline_query": query[:256]}])
-            else:
-                print(f"[ron_daemon] trailer: [switch_inline:] dropped, "
-                      f"empty label: {switches!r}", flush=True)
-    if login:
+            print(f"[ron_daemon] trailer: [switch_inline:] dropped, "
+                  f"empty label: {_switch_body!r}", flush=True)
+    login_parts = []
+    for _body in login_bodies:
+        login_parts.extend(_body.split("|"))
+    if login_parts:
         # LoginUrl needs the owner's website bound in BotFather; the URL
         # lives in ron_ai.json "login_url". Unconfigured -> the button is
         # dropped loudly, never sent with an empty/placeholder URL.
@@ -2191,7 +2233,7 @@ def parse_trailers(reply, skip_context_filter=False):
             print("[ron_daemon] trailer: [login:] dropped — no login_url "
                   "configured in ron_ai.json", flush=True)
         else:
-            for part in (x.strip() for x in login.split("|") if x.strip()):
+            for part in (x.strip() for x in login_parts if x.strip()):
                 label = _clean_btn_label(part)
                 if not label:
                     continue
@@ -2201,22 +2243,46 @@ def parse_trailers(reply, skip_context_filter=False):
                     break
             if login_row:
                 kb.append(login_row)
-    if links:
-        for part in (x.strip() for x in links.split("|") if x.strip()):
-            if "->" not in part:
-                continue
-            label, url = (x.strip() for x in part.split("->", 1))
-            if url.startswith("http"):
-                link_row.append({"text": _clean_btn_label(label)[:40],
-                                 "url": url})
+    link_parts = []
+    for _body in link_bodies:
+        link_parts.extend(_body.split("|"))
+    if link_parts:
+        for part in (x.strip() for x in link_parts if x.strip()):
+            if "->" in part:
+                label, url = (x.strip() for x in part.split("->", 1))
+                if url.startswith("http"):
+                    link_row.append({"text": _clean_btn_label(label)[:40],
+                                     "url": url})
+                elif _looks_like_url(url):
+                    # Missing scheme ("google.com") — assume https.
+                    link_row.append({"text": _clean_btn_label(label)[:40],
+                                     "url": "https://" + url})
+                    print(f"[ron_daemon] trailer: added https:// scheme "
+                          f"to [links:] target: {url!r}", flush=True)
+                else:
+                    # Non-URL target: never let the label vanish silently —
+                    # keep it as visible plain text in the message and log it.
+                    kept = _clean_btn_label(label)
+                    if kept:
+                        dropped_labels.append(kept)
+                    print(f"[ron_daemon] trailer: non-URL link target "
+                          f"dropped, label {label!r}", flush=True)
+            elif part.startswith("http"):
+                # Bare URL with no "Label ->" — host becomes the label.
+                link_row.append({"text": _clean_btn_label(
+                    _url_host_label(part))[:40], "url": part})
+                print(f"[ron_daemon] trailer: [links:] bare URL, host "
+                      f"used as label: {part!r}", flush=True)
+            elif _looks_like_url(part):
+                url = "https://" + part
+                link_row.append({"text": _clean_btn_label(
+                    _url_host_label(url))[:40], "url": url})
+                print(f"[ron_daemon] trailer: [links:] bare domain, "
+                      f"https:// added: {part!r}", flush=True)
             else:
-                # Non-http target: never let the label vanish silently —
-                # keep it as visible plain text in the message and log it.
-                kept = _clean_btn_label(label)
-                if kept:
-                    dropped_labels.append(kept)
-                print(f"[ron_daemon] trailer: non-http link target dropped, "
-                      f"label {label!r}", flush=True)
+                # Was a silent `continue` — a part with no URL at all.
+                print(f"[ron_daemon] trailer: [links:] part dropped, "
+                      f"no URL found: {part!r}", flush=True)
     if link_row:
         kb.append(link_row[:8])
     if dropped_labels:
@@ -2224,14 +2290,17 @@ def parse_trailers(reply, skip_context_filter=False):
     markup = None
     if kb:
         markup = {"inline_keyboard": kb}
-    if rkb:
+    rkb_parts = []
+    for _body in rkb_bodies:
+        rkb_parts.extend(_body.split(","))
+    if rkb_parts:
         # Reply keyboards replace the user's typing bar, and a message can
         # carry only ONE reply_markup kind. If an inline keyboard already
         # won, the menu is dropped loudly instead of silently merged.
         if markup is None:
             rows = []
             rrow = []
-            for part in (x.strip() for x in rkb.split(",") if x.strip()):
+            for part in (x.strip() for x in rkb_parts if x.strip()):
                 label = _clean_btn_label(part)[:40]
                 if label:
                     rrow.append({"text": label})
@@ -2246,7 +2315,7 @@ def parse_trailers(reply, skip_context_filter=False):
                           "one_time_keyboard": True}
             else:
                 print(f"[ron_daemon] trailer: [reply_keyboard:] dropped, "
-                      f"no usable buttons: {rkb!r}", flush=True)
+                      f"no usable buttons: {rkb_bodies!r}", flush=True)
         else:
             print(f"[ron_daemon] trailer: [reply_keyboard:] dropped — "
                   f"message already has an inline keyboard", flush=True)

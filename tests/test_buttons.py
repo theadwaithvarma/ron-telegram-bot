@@ -453,5 +453,97 @@ class TestHardeningSync(unittest.TestCase):
         self.assertEqual(grab(repo_sys), grab(live))
 
 
+class TestMidlineTrailersV1212(unittest.TestCase):
+    """v1.21.2: the model embeds trailers mid-line ('- External link:
+    [links: L -> url]'). They must build buttons AND be stripped from
+    the visible text — previously they did neither."""
+
+    DEMO = ("Here are all the button types I support:\n"
+            "- Quick replies: [buttons: Drill down one | Drill down two]\n"
+            "- External link: [links: Visit Tech Channel -> "
+            "https://t.me/TheAdwaithVarma]\n"
+            "- One-tap copy: [copy: Copy Sample Code | echo hello]\n"
+            "- Inline switch: [switch_inline: Share Ron | hey]\n"
+            "- Reply keyboard toggle: "
+            "[reply_keyboard: /ping, /help, /health]\n"
+            "\n"
+            "[buttons: Drill down one | Drill down two]")
+
+    def test_midline_links_build_url_buttons(self):
+        clean, kb = _parse_flag(self.DEMO, True)
+        rows = kb["inline_keyboard"]
+        urls = [b["url"] for row in rows for b in row if "url" in b]
+        self.assertIn("https://t.me/TheAdwaithVarma", urls)
+
+    def test_midline_copy_builds_button(self):
+        clean, kb = _parse_flag(self.DEMO, True)
+        rows = kb["inline_keyboard"]
+        copies = [b for row in rows for b in row if "copy_text" in b]
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0]["copy_text"], {"text": "echo hello"})
+
+    def test_midline_switch_builds_button(self):
+        clean, kb = _parse_flag(self.DEMO, True)
+        rows = kb["inline_keyboard"]
+        sw = [b for row in rows for b in row if "switch_inline_query" in b]
+        self.assertEqual(len(sw), 1)
+        self.assertEqual(sw[0]["switch_inline_query"], "hey")
+
+    def test_midline_trailers_stripped_from_text(self):
+        clean, kb = _parse_flag(self.DEMO, True)
+        for marker in ("[buttons:", "[links:", "[copy:", "[switch_inline:",
+                       "[reply_keyboard:"):
+            self.assertNotIn(marker, clean)
+
+    def test_multiple_buttons_trailers_merge(self):
+        clean, kb = _parse_flag(
+            "Pick one:\n[buttons: Alpha | Beta]\n[buttons: Gamma]", True)
+        labels = [b["text"] for row in kb["inline_keyboard"]
+                  for b in row if "callback_data" in b]
+        self.assertEqual(labels, ["Alpha", "Beta", "Gamma"])
+
+    def test_links_bare_url_gets_host_label(self):
+        clean, kb = _parse_flag(
+            "Read this:\n[links: https://example.com/page]", True)
+        btn = kb["inline_keyboard"][0][0]
+        self.assertEqual(btn["url"], "https://example.com/page")
+        self.assertEqual(btn["text"], "example.com")
+
+    def test_links_bare_domain_gets_https(self):
+        clean, kb = _parse_flag("Read this:\n[links: example.com]", True)
+        btn = kb["inline_keyboard"][0][0]
+        self.assertEqual(btn["url"], "https://example.com")
+
+    def test_links_label_with_bare_domain_gets_https(self):
+        clean, kb = _parse_flag(
+            "Read this:\n[links: Example -> example.com]", True)
+        btn = kb["inline_keyboard"][0][0]
+        self.assertEqual(btn["url"], "https://example.com")
+        self.assertEqual(btn["text"], "Example")
+
+    def test_links_junk_part_dropped_loudly(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            clean, kb = ron_daemon.parse_trailers(
+                "Hi\n[links: not a url at all]", skip_context_filter=True)
+        self.assertIsNone(kb)
+        self.assertIn("no URL found", buf.getvalue())
+
+    def test_multiple_copy_trailers_each_get_a_row(self):
+        clean, kb = _parse_flag(
+            "Codes:\n[copy: Copy A | aaa]\n[copy: Copy B | bbb]", True)
+        rows = kb["inline_keyboard"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][0]["copy_text"], {"text": "aaa"})
+        self.assertEqual(rows[1][0]["copy_text"], {"text": "bbb"})
+
+    def test_buttons_arrow_bare_domain_rescued(self):
+        clean, kb = _parse_flag(
+            "Go:\n[buttons: Visit Site -> example.com]", True)
+        btn = kb["inline_keyboard"][-1][0]
+        self.assertEqual(btn["url"], "https://example.com")
+        self.assertEqual(btn["text"], "Visit Site")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

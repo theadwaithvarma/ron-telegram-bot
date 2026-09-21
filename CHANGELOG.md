@@ -1,3 +1,26 @@
+## 1.21.2 — mid-line trailers fix (2026-09-21)
+
+Adwaith hit it live: "show all buttons" came back with URL/copy/switch
+buttons blank. Root cause found by replaying the model's actual reply:
+when it demos button types it embeds trailers mid-line ("- External
+link: [links: Label -> url]") instead of on their own line. The old
+`^...$` (own-line) / tail (`$` = string end) regexes missed those
+entirely — no buttons were built AND the raw `[links: ...]` syntax
+stayed visible in the message.
+
+- **Find-everywhere trailers.** `_trailer_bodies()` / `_strip_trailer()`
+  replace the anchored `*_RE` / `*_TAIL_RE` pairs: every `[name: ...]`
+  trailer is found wherever it sits, and all of them are stripped from
+  the visible text. Multiple trailers of one type merge (buttons,
+  links, login, reply keyboards) or each get their own row (copy,
+  switch_inline).
+- **`[links:]` robustness.** Bare URLs (`[links: https://x/y]`) become
+  buttons with the host as label; bare domains (`example.com`, with or
+  without `Label ->`) get `https://` prepended; a part with no URL at
+  all is now dropped with a loud log instead of a silent `continue`.
+  Same scheme-adding rescue for `->` links inside `[buttons:]`.
+- 11 new tests (54 total in `tests/test_buttons.py`), all passing.
+
 ## 1.21.1 — phantom buttons fix (2026-09-21)
 
 Adwaith hit it live: he said "show all buttons", the model replied "Pick
