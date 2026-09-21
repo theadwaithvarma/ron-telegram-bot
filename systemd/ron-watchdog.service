@@ -30,6 +30,10 @@ ExecStart=/usr/bin/python3 /home/hatch/workspace/telegram-bot/ron_watchdog.py --
 KillMode=process
 Restart=always
 RestartSec=30
+# Deep-fix (2026-09-21): deprioritize the watchdog for the OOM killer so
+# memory pressure takes almost anything else first. (The daemon gets the
+# same treatment from start_daemon() in ron_watchdog.py.)
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target

@@ -250,6 +250,15 @@ def start_daemon():
     pids = daemon_pids()
     if pids:
         log(f"daemon up, pid={pids[0]}")
+        # Deep-fix (2026-09-21): the daemon previously ran with oom_score
+        # ~670 — first in line if the box ever faces memory pressure.
+        # Deprioritize it (and the watchdog below in check_once) so
+        # random kills pick almost anything else first.
+        try:
+            with open(f"/proc/{pids[0]}/oom_score_adj", "w") as f:
+                f.write("-500")
+        except OSError:
+            pass
         return True
     log("daemon did not appear after launch")
     return False
