@@ -2269,6 +2269,7 @@ def _measure_ping():
 
 
 def handle_command(chat_id, user_id, cmd, is_private, text="",
+                   user_name="there", reply_to=None, thread_id=None,
                    cmd_msg_id=None, reply_msg=None):
     if cmd == "shutdown":
         # Owner-only maintenance mode: the bot goes quiet for everyone
