@@ -63,6 +63,15 @@ class SecretaryInjectionTest(unittest.TestCase):
         orig_bake = ron_daemon._BAKE_UNTIL
         ron_daemon._BAKE_UNTIL = 0
         self.addCleanup(lambda: setattr(ron_daemon, "_BAKE_UNTIL", orig_bake))
+        # Never let this test touch the LIVE degraded queue: if ai_reply
+        # ever queues (e.g. leaked _brain_down state), it must land in a
+        # temp file, not ~/workspace/telegram-bot/degraded_queue.jsonl.
+        import tempfile
+        _tmpq = tempfile.TemporaryDirectory()
+        self.addCleanup(_tmpq.cleanup)
+        orig_q = ron_daemon.DEGRADED_QUEUE
+        ron_daemon.DEGRADED_QUEUE = os.path.join(_tmpq.name, "dq.jsonl")
+        self.addCleanup(lambda: setattr(ron_daemon, "DEGRADED_QUEUE", orig_q))
 
         patches = [
             mock.patch.object(ron_daemon.ron_ai, "chat", fake_chat),
