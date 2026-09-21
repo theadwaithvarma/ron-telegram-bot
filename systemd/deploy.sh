@@ -53,7 +53,11 @@ EOF
 
 # 3. SIGTERM the daemon (isolated lookup: never match our own cmdline).
 #    The lookup and the kill are separate steps per the pid-lookup footgun.
-PIDS="$(pgrep -f 'ron_daemo[n]\.py' 2>/dev/null | grep -v "^$$$" || true)"
+#    Exclude $$ (this script) AND $PPID (the invoking shell): $$ is
+#    deploy.sh's own pid, not the caller's — a caller like
+#    `git add ron_daemon.py && … && deploy.sh` matches the pgrep pattern
+#    via its own cmdline and would otherwise be SIGTERM'd (2026-09-21).
+PIDS="$(pgrep -f 'ron_daemo[n]\.py' 2>/dev/null | grep -v -e "^$$$" -e "^$PPID$" || true)"
 if [ -z "$PIDS" ]; then
     echo "no daemon running; watchdog will launch one on its next check"
 else
@@ -65,7 +69,7 @@ fi
 #    then require a fresh heartbeat.
 for i in $(seq 1 20); do
     sleep 5
-    pid="$(pgrep -f 'ron_daemo[n]\.py' 2>/dev/null | head -1 || true)"
+    pid="$(pgrep -f 'ron_daemo[n]\.py' 2>/dev/null | grep -v -e "^$$$" -e "^$PPID$" | head -1 || true)"
     if [ -n "$pid" ]; then
         hb_age="$(python3 -c "
 import time, os
