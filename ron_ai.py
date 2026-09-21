@@ -204,10 +204,19 @@ _API_SEMAPHORE = threading.Semaphore(3)
 # Per-provider fail-fast cooldowns: when a provider 429s every model we
 # tried, it's skipped for COOLDOWN_AFTER_RATELIMIT_SECS so later calls go
 # straight to the next healthy provider instead of burning seconds on
-# doomed retries.
+# doomed retries. The 5xx circuit breaker below writes into this same dict.
 _provider_cooldown = {}
 _rate_limit_lock = threading.Lock()
 COOLDOWN_AFTER_RATELIMIT_SECS = 30.0
+# Circuit breaker for 5xx outages (2026-09-21): a provider whose models
+# 5xx repeatedly gets skipped for BREAKER_COOLDOWN_SECS, so one sick
+# provider can't make every reply burn a minute in failover before
+# reaching a healthy one. (2026-09-21 outage: Gemini 503'd for an
+# extended window; each reply tried it 3-4 times before healthy Groq —
+# the "endless typing indicator" Adwaith reported.)
+_provider_5xx_streak = {}
+BREAKER_TRIP_STREAK = 3        # consecutive 5xx responses to trip
+BREAKER_COOLDOWN_SECS = 120.0  # how long a tripped provider is skipped
 
 # Hook fired with the provider name before every /chat/completions POST
 # attempt (streaming and single-shot alike). The daemon wires it to its
@@ -223,6 +232,29 @@ def get_provider_cooldowns():
     """
     with _rate_limit_lock:
         return dict(_provider_cooldown)
+
+
+def _breaker_reset(name):
+    """A non-5xx outcome breaks the consecutive-5xx streak."""
+    with _rate_limit_lock:
+        _provider_5xx_streak.pop(name, None)
+
+
+def _breaker_note_5xx(name, status):
+    """Record a 5xx from this provider. Once the consecutive streak hits
+    BREAKER_TRIP_STREAK, the breaker trips: the shared cooldown dict gets
+    an entry so the plan builder skips this provider, and the streak
+    resets (a later recovery still needs a fresh streak to re-trip).
+    Returns True when the breaker just tripped."""
+    with _rate_limit_lock:
+        streak = _provider_5xx_streak.get(name, 0) + 1
+        if streak >= BREAKER_TRIP_STREAK:
+            _provider_5xx_streak[name] = 0
+            _provider_cooldown[name] = (time.monotonic()
+                                       + BREAKER_COOLDOWN_SECS)
+            return True
+        _provider_5xx_streak[name] = streak
+        return False
 
 # Multi-provider failover (2026-09-20): the bot no longer depends on a
 # single AI backend. Providers are tried in order; each one needs its key
@@ -448,7 +480,8 @@ def _request(cfg, messages, stream, timeout, cheap=False):
         with _rate_limit_lock:
             wait = _provider_cooldown.get(name, 0.0) - now
         if wait > 0:
-            continue  # cooling down after 429s — try the next provider
+            continue  # cooling down after 429s or tripped 5xx breaker —
+                      # try the next provider instead of burning seconds
         models = p.get("models") or []
         if cheap:
             # Token economy: smallest model first, but keep the rest of the
@@ -506,6 +539,7 @@ def _request(cfg, messages, stream, timeout, cheap=False):
                 break
             status = stream_resp.status
             if status == 200:
+                _breaker_reset(name)
                 return _PooledResponse(stream_resp)
             # Error status: read the body for classification, then recycle
             # the connection (body fully read, so the drain is instant).
@@ -522,6 +556,7 @@ def _request(cfg, messages, stream, timeout, cheap=False):
             last_err = RuntimeError(f"HTTP {status}: {err_body}"[:150])
             if status == 429:
                 saw_rate_limit = True
+                _breaker_reset(name)
                 # Honor the provider's "try again in" wait when it's
                 # short (bucket refills soon); a long wait means the
                 # provider is out for a while — cool it down and move
@@ -545,10 +580,16 @@ def _request(cfg, messages, stream, timeout, cheap=False):
                     or status == 400):
                 # Transient (5xx) or deterministic (bad model/params):
                 # one retry after backoff for 5xx only, then move on.
-                if 500 <= status < 600 and attempt == 0:
-                    time.sleep(RETRY_BACKOFF_SECS)
-                    attempt += 1
-                    continue
+                if 500 <= status < 600:
+                    if _breaker_note_5xx(name, status):
+                        print(f"[ron_ai] circuit breaker TRIPPED for "
+                              f"{name}: {BREAKER_TRIP_STREAK}+ consecutive "
+                              f"5xx, skipping it for "
+                              f"{BREAKER_COOLDOWN_SECS:.0f}s", flush=True)
+                    if attempt == 0:
+                        time.sleep(RETRY_BACKOFF_SECS)
+                        attempt += 1
+                        continue
                 break
             else:
                 break

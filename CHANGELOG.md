@@ -1,3 +1,26 @@
+## 1.22.0 — 5xx circuit breaker (2026-09-21)
+
+Adwaith hit it live: the bot showed only the typing indicator for
+~50s per reply. Root cause: Gemini's chat models were 503ing for an
+extended window, and every reply burned 3-4 attempts on the sick
+provider (including one 52s stall) before failing over to healthy
+Groq. The old code retried 5xx once and moved on — but the *next*
+reply started the doomed sequence all over again.
+
+- **Breaker.** `_breaker_note_5xx()` counts consecutive 5xx per
+  provider; at `BREAKER_TRIP_STREAK` (3) the provider is written into
+  the shared cooldown dict for `BREAKER_COOLDOWN_SECS` (120s), so the
+  plan builder skips it on later calls — replies go straight to the
+  next healthy provider with zero failover burn.
+- **Reset.** Any 200 (or 429, which has its own cooldown path) clears
+  the streak; after the cooldown expires the provider is tried again,
+  and a fresh streak re-trips if it's still sick.
+- **Tests.** `tests/test_circuit_breaker.py`: 6 offline tests (trip,
+  skip-while-tripped, success reset, cooldown expiry, 429 isolation,
+  healthy path). Full suite: no regressions (the 3 `cryptography`
+  loader errors, the `test_heal` nonhttp-link FAIL, and the
+  discovery-order `test_who_line` flake are all pre-existing).
+
 ## 1.21.2 — mid-line trailers fix (2026-09-21)
 
 Adwaith hit it live: "show all buttons" came back with URL/copy/switch
