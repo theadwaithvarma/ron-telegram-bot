@@ -5,7 +5,7 @@ LOCKED DESIGN (Adwaith, 2026-09-20):
 - Every row is scoped by Telegram chat_id. Every read filters by chat_id.
   A DM's memory never leaks into a group or another DM. No exceptions.
 - Encryption at rest: message text, fact text, and approval payloads are
-  Fernet-encrypted. The key comes from RON_MEMORY_KEY (env). No key ->
+  encrypted. The key comes from RON_MEMORY_KEY (env). No key ->
   MemoryStore refuses to init (fail closed). The key and plaintext never
   appear in logs, errors, or the repo.
 - Recall is FTS5 keyword search + decrypt on read. The FTS index is
@@ -16,6 +16,49 @@ LOCKED DESIGN (Adwaith, 2026-09-20):
   noted). No automatic LLM fact extraction (v2).
 - Raw messages expire via prune_expired(); facts persist until forgotten
   or contradicted.
+
+Track A implementation notes (2026-09-22):
+- The `cryptography` package is NOT installed in this environment, so the
+  old `from cryptography.fernet import Fernet` import killed the whole
+  module (every memory feature dead). Crypto now goes through a clean
+  `Cipher` interface (encrypt/decrypt bytes): `StdCipher` (stdlib only,
+  see construction below) is the default fallback; `FernetCipher` wraps
+  real Fernet when the package is importable. Swapping back is one line:
+  set RON_MEMORY_CIPHER=fernet after `pip install cryptography`
+  (or pass prefer="fernet" to make_cipher). Blob formats differ between
+  the two ciphers (Fernet token vs "RM1" magic header), so a store written
+  by one cipher cannot be read by the other — migrating ciphers means
+  re-encrypting (export/re-import) or wiping. No live rows exist from the
+  Fernet era (the module never imported here), so nothing needs migrating.
+- Isolation scheme: ONE SQLite file, chat-scoped tables, every query
+  filtered by chat_id. Chosen over per-chat DB files because: a single
+  WAL file gives one transaction boundary for cross-table ops (wipe_chat
+  touches six tables atomically; consent rows join chat+user+fact);
+  per-chat files would multiply inodes/SQLite handles across hundreds of
+  groups and complicate backups; one file is one thing to snapshot.
+  Enforcement = chat_id on every public read/write + the isolation tests
+  in tests/test_memory*.py (write to chat A, read/forget/wipe from chat B,
+  assert A untouched). The ONLY sanctioned cross-scope reads are
+  dm_facts()/consented_facts(), which match a DM-learned fact to a group
+  member SOLELY to ask that person's consent privately via DM — never
+  merged into another chat's recall.
+- Retention: prune_expired(retention_days) deletes raw messages older
+  than retention_days plus superseded (dead-lineage) facts that old;
+  active facts persist by default (explicit user knowledge) unless
+  fact_retention_days=N is passed. Returns total rows deleted (int).
+- New prompt-facing API: record_turn(chat_id, user_id, role, text)
+  records one turn side and deterministically extracts durable facts
+  from explicit "remember ..." phrasings in user turns (no LLM);
+  recall_context(chat_id, query, limit_chars) returns the compact
+  context string for the prompt (facts first, then history, char-bounded);
+  handle_memory_nl(store, chat_id, user_id, text) is the standalone
+  natural-language command dispatcher ("remember this ...", "forget
+  that/this/about X", "forget everything"). The live daemon path
+  (ron_daemon._handle_memory_nl) adds JSON-history parity around the
+  same store calls.
+- Logging rule: this module never prints, and no exception message ever
+  carries plaintext, key material, or ciphertext. Callers must uphold
+  the same rule (log counts and type names only).
 
 Phase 5 — memory lifecycle (2026-09-20):
 - Negation-aware contradiction replacement: a negation marker ("not",
@@ -37,21 +80,221 @@ Consent is recorded per (group_chat_id, user_id, fact_id): ask once.
 """
 import base64
 import hashlib
+import hmac
 import os
 import re
+import secrets
 import sqlite3
+import struct
 import threading
 import time
-
-from cryptography.fernet import Fernet, InvalidToken
 
 HOME = os.path.expanduser("~")
 DB_PATH = os.path.join(HOME, "workspace", "telegram-bot", "ron_memory.db")
 KEY_ENV = "RON_MEMORY_KEY"
+# One-line cipher swap: "auto" (default) | "fernet" | "stdlib".
+CIPHER_ENV = "RON_MEMORY_CIPHER"
 
 
 class MemoryStoreError(Exception):
     """Raised when the store can't operate safely (no key, bad key, DB error)."""
+
+
+class CipherError(Exception):
+    """Decryption failed: wrong key, tampered blob, or foreign format."""
+
+
+# ---------------------------------------------------------------------------
+# Cipher interface — encrypt/decrypt bytes. StdCipher is the stdlib
+# fallback; FernetCipher wraps real Fernet when `cryptography` is
+# installed. make_cipher() picks; MemoryStore takes an injected cipher
+# for tests.
+# ---------------------------------------------------------------------------
+class Cipher:
+    """Encrypt/decrypt interface (bytes in, bytes out)."""
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        raise NotImplementedError
+
+    def decrypt(self, blob: bytes) -> bytes:
+        raise NotImplementedError
+
+
+class StdCipher(Cipher):
+    """Stdlib-only authenticated stream cipher (no `cryptography` needed).
+
+    Construction: master key (32 bytes) is domain-separated with SHA-256
+    into k_enc / k_mac. Encryption picks a random 16-byte nonce, builds a
+    keystream from HMAC-SHA256(k_enc, nonce || be64(counter)) blocks (CTR
+    mode), XORs the plaintext, and appends a 16-byte tag =
+    HMAC-SHA256(k_mac, nonce || ciphertext). Blob layout:
+        b"RM1" || nonce(16) || ciphertext || tag(16)
+    Decryption verifies the tag with hmac.compare_digest before touching
+    the keystream, so tampered / wrong-key / foreign blobs all raise
+    CipherError without leaking anything about the plaintext.
+
+    LIMITS (read before trusting this with real secrets):
+    - DIY construction, NOT an audited primitive. It leans on HMAC-SHA256
+      (a solid MAC) used carefully (encrypt-then-MAC, random nonce,
+      constant-time tag check), but it has not been reviewed.
+    - Reveals plaintext length; no Fernet interoperability (different
+      blob format — migrating ciphers needs a re-encrypt or wipe).
+    - For production, `pip install cryptography` + RON_MEMORY_CIPHER=fernet
+      gets audited AES-128-CBC + HMAC. That is the recommended setup.
+    """
+
+    MAGIC = b"RM1"
+    NONCE_LEN = 16
+    TAG_LEN = 16
+    kind = "stdlib"
+
+    def __init__(self, key_material: bytes):
+        if not isinstance(key_material, (bytes, bytearray)) \
+                or len(key_material) != 32:
+            raise CipherError("StdCipher needs 32 bytes of key material")
+        km = bytes(key_material)
+        self._k_enc = hashlib.sha256(b"ron-mem-enc-v1" + km).digest()
+        self._k_mac = hashlib.sha256(b"ron-mem-mac-v1" + km).digest()
+
+    def _keystream(self, nonce: bytes, nbytes: int) -> bytes:
+        out = bytearray()
+        counter = 0
+        while len(out) < nbytes:
+            out += hmac.new(self._k_enc,
+                            nonce + struct.pack(">Q", counter),
+                            hashlib.sha256).digest()
+            counter += 1
+        return bytes(out[:nbytes])
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        pt = bytes(plaintext)
+        nonce = secrets.token_bytes(self.NONCE_LEN)
+        ct = bytes(a ^ b for a, b in
+                   zip(pt, self._keystream(nonce, len(pt))))
+        tag = hmac.new(self._k_mac, nonce + ct,
+                       hashlib.sha256).digest()[:self.TAG_LEN]
+        return self.MAGIC + nonce + ct + tag
+
+    def decrypt(self, blob: bytes) -> bytes:
+        blob = bytes(blob)
+        min_len = len(self.MAGIC) + self.NONCE_LEN + self.TAG_LEN
+        if len(blob) < min_len or blob[:len(self.MAGIC)] != self.MAGIC:
+            raise CipherError("not a stdlib-cipher blob (wrong magic)")
+        nonce = blob[3:3 + self.NONCE_LEN]
+        tag = blob[-self.TAG_LEN:]
+        ct = blob[3 + self.NONCE_LEN:-self.TAG_LEN]
+        expect = hmac.new(self._k_mac, nonce + ct,
+                          hashlib.sha256).digest()[:self.TAG_LEN]
+        if not hmac.compare_digest(tag, expect):
+            raise CipherError("authentication failed — wrong key or "
+                              "tampered blob")
+        ks = self._keystream(nonce, len(ct))
+        return bytes(a ^ b for a, b in zip(ct, ks))
+
+
+class FernetCipher(Cipher):
+    """Thin wrapper over cryptography.fernet.Fernet. Raises
+    MemoryStoreError at construction when the package is missing."""
+
+    kind = "fernet"
+
+    def __init__(self, fernet_key: bytes):
+        try:
+            from cryptography.fernet import Fernet, InvalidToken
+        except ImportError:
+            raise MemoryStoreError(
+                "RON_MEMORY_CIPHER=fernet requested but the `cryptography` "
+                "package is not installed — pip install cryptography or "
+                "unset the variable for the stdlib fallback.")
+        self._InvalidToken = InvalidToken
+        self._f = Fernet(fernet_key)
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        return self._f.encrypt(bytes(plaintext))
+
+    def decrypt(self, blob: bytes) -> bytes:
+        try:
+            return self._f.decrypt(bytes(blob))
+        except self._InvalidToken:
+            raise CipherError("Fernet decryption failed — wrong key or "
+                              "tampered token")
+
+
+def generate_key():
+    """New random key, Fernet-compatible format (urlsafe-b64, 32 bytes).
+
+    Works for both ciphers: FernetCipher takes it as-is, StdCipher uses
+    the decoded 32 bytes as key material. Store in RON_MEMORY_KEY."""
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+
+
+def has_cryptography():
+    """True when `cryptography` is importable (FernetCipher usable)."""
+    try:
+        import cryptography.fernet  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _derive_key(raw):
+    """Fernet-key bytes from RON_MEMORY_KEY (backward compatible).
+
+    A real Fernet key passes through byte-identical (ron_backup._fernet
+    feeds this straight into Fernet(), so this contract is frozen).
+    Anything else is treated as a passphrase and stretched with
+    PBKDF2-HMAC-SHA256 (600k iterations). The salt is a fixed app string:
+    documented v1 tradeoff — there is no secure salt store yet, and the
+    salt is not secret, it only needs to be unique per application. A
+    generated key (generate_key()) skips the KDF entirely and is
+    strictly preferred over a human passphrase.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        raise MemoryStoreError(
+            "RON_MEMORY_KEY is not set — refusing to start the memory "
+            "store rather than storing plaintext. Set RON_MEMORY_KEY to a "
+            "Fernet key and restart.")
+    try:
+        key = raw.encode("ascii")
+        if len(base64.urlsafe_b64decode(key)) == 32:
+            return key
+    except Exception:
+        pass
+    dk = hashlib.pbkdf2_hmac("sha256", raw.encode("utf-8"),
+                             b"ron-memory-kdf-v1", 600_000, dklen=32)
+    return base64.urlsafe_b64encode(dk)
+
+
+def make_cipher(key_raw=None, prefer=None):
+    """Build the cipher for a MemoryStore. Fail closed: no key -> raise.
+
+    prefer: "auto" (default: Fernet when importable, else stdlib),
+    "fernet" (require cryptography), or "stdlib" (force stdlib).
+    Also honors the RON_MEMORY_CIPHER env var. The auto->stdlib fallback
+    prints one config line (no key material, no content).
+    """
+    if key_raw is None:
+        key_raw = os.environ.get(KEY_ENV)
+    prefer = (prefer or os.environ.get(CIPHER_ENV, "") or "auto")
+    prefer = prefer.strip().lower()
+    if prefer not in ("auto", "fernet", "stdlib"):
+        raise MemoryStoreError(
+            f"bad {CIPHER_ENV}={prefer!r}: want auto|fernet|stdlib")
+    fkey = _derive_key(key_raw)  # raises when the key is missing: fail closed
+    material = base64.urlsafe_b64decode(fkey)
+    if prefer == "stdlib":
+        return StdCipher(material)
+    try:
+        return FernetCipher(fkey)
+    except MemoryStoreError:
+        if prefer == "fernet":
+            raise
+        print("[ron_memory] `cryptography` not installed — using the "
+              "stdlib cipher fallback (set RON_MEMORY_CIPHER=fernet after "
+              "pip install cryptography for audited Fernet)",
+              flush=True)
+        return StdCipher(material)
 
 
 _STOPWORDS = frozenset(
@@ -113,32 +356,48 @@ def _fts_query(text):
     return " AND ".join('"%s"' % t.replace('"', "") for t in toks)
 
 
-def _derive_key(raw):
-    """Accept a Fernet key as-is; otherwise derive one from a passphrase.
+# ---------------------------------------------------------------------------
+# Track A: deterministic v1 fact extraction. Explicit "remember ..."
+# phrasings only — no LLM, no guessing at implicit facts (that's v2).
+# ---------------------------------------------------------------------------
+_EXTRACT_RES = [
+    re.compile(r"\bremember\s+(?:that\s+)?(.{4,220})", re.I | re.S),
+    re.compile(r"\bnote\s+down\s+(?:that\s+)?(.{4,220})", re.I | re.S),
+    re.compile(r"\bdon'?t\s+forget\s+(?:that\s+)?(.{4,220})", re.I | re.S),
+]
+_EXTRACT_LEAD_RE = re.compile(r"^(this|that)\s*:\s*", re.I)
 
-    Deterministic SHA-256 derivation (no salt to store). Documented v1
-    tradeoff: a proper KDF salt would need secure storage; prefer setting
-    RON_MEMORY_KEY to a real Fernet key (Fernet.generate_key()).
+
+def extract_fact_statements(text):
+    """Fact strings explicitly asked to be remembered. [] when none.
+
+    Pure function (no store) so it unit-tests standalone. A leading
+    "this:"/"that:" is stripped ("remember this: my dog is Max" ->
+    "my dog is Max"). Duplicates collapse, order preserved.
     """
-    raw = (raw or "").strip()
-    if not raw:
-        raise MemoryStoreError(
-            "RON_MEMORY_KEY is not set — refusing to start the memory "
-            "store rather than storing plaintext. Set RON_MEMORY_KEY to a "
-            "Fernet key and restart.")
-    try:
-        Fernet(raw.encode())  # validates format
-        return raw.encode()
-    except Exception:
-        digest = hashlib.sha256(raw.encode()).digest()
-        return base64.urlsafe_b64encode(digest)
+    out = []
+    for rx in _EXTRACT_RES:
+        for m in rx.finditer(text or ""):
+            fact = _EXTRACT_LEAD_RE.sub(
+                "", re.sub(r"\s+", " ", m.group(1)).strip())
+            fact = fact.strip().strip(" .!?;:")
+            if len(fact) >= 4:
+                out.append(fact)
+    seen, uniq = set(), []
+    for f in out:
+        if f.lower() not in seen:
+            seen.add(f.lower())
+            uniq.append(f)
+    return uniq
 
 
 class MemoryStore:
     """SQLite-backed, per-chat isolated, encrypted memory."""
 
-    def __init__(self, path=DB_PATH):
-        self._fernet = Fernet(_derive_key(os.environ.get(KEY_ENV)))
+    def __init__(self, path=DB_PATH, cipher=None):
+        # Fail closed: make_cipher raises MemoryStoreError when
+        # RON_MEMORY_KEY is missing — the store never runs on plaintext.
+        self._cipher = cipher if cipher is not None else make_cipher()
         self._lock = threading.RLock()
         try:
             self._db = sqlite3.connect(path, check_same_thread=False)
@@ -149,6 +408,11 @@ class MemoryStore:
             raise
         except Exception as e:
             raise MemoryStoreError(f"cannot open memory DB: {e}")
+
+    @property
+    def cipher_kind(self):
+        """'fernet' or 'stdlib' — which cipher this store encrypts with."""
+        return getattr(self._cipher, "kind", "?")
 
     # -- schema ---------------------------------------------------------
     def _init_schema(self):
@@ -220,12 +484,13 @@ class MemoryStore:
 
     # -- crypto helpers -------------------------------------------------
     def _enc(self, text):
-        return self._fernet.encrypt((text or "").encode("utf-8"))
+        return self._cipher.encrypt((text or "").encode("utf-8"))
 
     def _dec(self, blob):
         try:
-            return self._fernet.decrypt(bytes(blob)).decode("utf-8")
-        except InvalidToken:
+            return self._cipher.decrypt(bytes(blob)).decode("utf-8")
+        except CipherError:
+            # Never hint at key material or content — generic message only.
             raise MemoryStoreError(
                 "cannot decrypt memory row — wrong RON_MEMORY_KEY?")
 
@@ -247,6 +512,24 @@ class MemoryStore:
                 (mid, text))
             self._db.commit()
             return mid
+
+    def record_turn(self, chat_id, user_id, role, text, ts=None):
+        """Record one turn side and extract durable facts from user turns.
+
+        Track A API: records the message row, then runs deterministic v1
+        fact extraction (explicit "remember ..." phrasings only, no LLM)
+        on USER turns — assistant turns never yield facts. Returns
+        {"message_id": int|None, "fact_ids": [int]}. remember() dedupes,
+        so re-recording the same statement returns the existing fact id.
+        """
+        mid = self.record_message(chat_id, user_id, role, text, ts=ts)
+        fids = []
+        if mid is not None and role == "user":
+            for fact in extract_fact_statements(text):
+                fid = self.remember(chat_id, fact)
+                if fid is not None:
+                    fids.append(fid)
+        return {"message_id": mid, "fact_ids": fids}
 
     def recall(self, chat_id, query, limit=3):
         """Keyword recall over THIS chat's messages only. Decrypted on read."""
@@ -531,6 +814,25 @@ class MemoryStore:
         items += [{**m, "kind": "message"} for m in msgs]
         return items[:limit]
 
+    def recall_context(self, chat_id, query, limit_chars=700, limit=3):
+        """Compact prompt-ready context string for this chat. "" when none.
+
+        Track A API: one ranked pass (facts above messages), each item on
+        its own line, the whole string hard-bounded to limit_chars so the
+        prompt never gets a transcript dump. Chat-scoped, zero LLM calls.
+        """
+        bits = []
+        for item in self.recall_all(str(chat_id), query,
+                                    limit=max(int(limit), 0)):
+            if item["kind"] == "fact":
+                bits.append("- " + item["text"])
+            else:
+                bits.append("- (earlier) " + item["text"][:160])
+        if not bits:
+            return ""
+        return ("\nRelevant memory from this chat:\n"
+                + "\n".join(bits))[:max(int(limit_chars), 0)]
+
     def dm_facts(self, user_id):
         """Active facts learned in a DM with this user (chat_id == user_id).
 
@@ -723,13 +1025,42 @@ class MemoryStore:
             self._db.commit()
             return out
 
-    def prune_expired(self, retention_days=30):
-        """Drop raw messages older than retention_days. Facts are kept."""
+    def prune_expired(self, retention_days=30, fact_retention_days=None):
+        """Expire old rows per the retention policy. Returns total deleted.
+
+        - Raw messages older than retention_days are always deleted.
+        - Superseded (dead-lineage) facts older than retention_days go too.
+        - Active facts persist by default — they are explicit user
+          knowledge ("remember this ..."), not raw history. Pass
+          fact_retention_days=N to also expire active facts whose
+          updated_ts is older than N days.
+        The daemon's approval sweeper calls prune_expired(days) daily.
+        """
         cutoff = time.time() - float(retention_days) * 86400
         with self._lock:
             mids = [r[0] for r in self._db.execute(
                 "SELECT id FROM messages WHERE ts < ?", (cutoff,)).fetchall()]
-        return self._delete_messages(mids)
+            fids = [r[0] for r in self._db.execute(
+                "SELECT id FROM facts WHERE updated_ts < ?"
+                " AND superseded_by IS NOT NULL", (cutoff,)).fetchall()]
+            if fact_retention_days is not None:
+                fcut = time.time() - float(fact_retention_days) * 86400
+                fids += [r[0] for r in self._db.execute(
+                    "SELECT id FROM facts WHERE updated_ts < ?"
+                    " AND superseded_by IS NULL", (fcut,)).fetchall()]
+        n = self._delete_messages(mids)
+        n += self._delete_facts(fids)
+        if fids:
+            # Orphan cleanup, same as forget_detailed().
+            with self._lock:
+                q = ",".join("?" * len(fids))
+                self._db.execute(
+                    f"DELETE FROM consents WHERE fact_id IN ({q})", fids)
+                self._db.execute(
+                    "DELETE FROM pending_approvals"
+                    f" WHERE fact_id IN ({q})", fids)
+                self._db.commit()
+        return n
 
     # -- chat_meta (Phase 6 rolling history summaries) ------------------
     def get_meta(self, chat_id, key):
@@ -832,7 +1163,7 @@ class MemoryStore:
                        group_message_id=None, target_name="", fact_id=None,
                        dm_chat_id=None, payload=None, timeout_secs=900):
         """Create a pending approval. payload (e.g. the overshare question
-        text) is Fernet-encrypted, not plaintext.
+        text) is encrypted, not plaintext.
 
         Privacy note: for overshare approvals we store the question text
         itself (encrypted) rather than just message_id+chat, because the
@@ -931,3 +1262,39 @@ class MemoryStore:
                 self._db.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Track A: natural-language memory commands, standalone dispatcher.
+# ---------------------------------------------------------------------------
+def handle_memory_nl(store, chat_id, user_id, text):
+    """'remember this ...' / 'forget ...' / 'forget everything' against a
+    MemoryStore. Returns (handled: bool, reply: str).
+
+    Standalone reference for integrators. The live daemon path
+    (ron_daemon._handle_memory_nl) wraps the same store calls and adds
+    JSON-history parity plus non-AI-turn dual-write — it stays the
+    production call site.
+    """
+    try:
+        # Same module family; lazy so ron_memory stays importable alone.
+        from ron_privacy import parse_remember, parse_forget
+    except Exception:
+        return False, ""
+    fact = parse_remember(text)
+    if fact is not None:
+        store.remember(chat_id, fact)
+        return True, "Noted \u2713 \u2014 I'll remember that for this chat."
+    parsed = parse_forget(text)
+    if parsed is None:
+        return False, ""
+    kind, q = parsed
+    if kind == "all":
+        store.wipe_chat(chat_id)
+        return True, "Wiped this chat's memory \u2713 \u2014 starting fresh."
+    if kind == "query":
+        n = store.forget(chat_id, q)
+        return True, "Forgotten \u2713" if n else "Nothing matching to forget."
+    fid = store.forget_latest_fact(chat_id)
+    return True, ("Forgotten \u2713" if fid
+                  else "There's nothing stored to forget.")

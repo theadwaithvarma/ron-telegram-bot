@@ -11,17 +11,57 @@ import tempfile
 import time
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.expanduser("~"), "workspace",
-                                "telegram-bot"))
+# Resolve against the REPO tree, never ~/workspace/telegram-bot: the
+# memory crypto here is stdlib-only, so `cryptography` must not be needed.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-from cryptography.fernet import Fernet
 
-import ron_memory
-import ron_privacy
-import ron_ai
-import ron_daemon
+def _use_repo_copy(name):
+    """Import `name`, forcing the repo copy.
 
-TEST_KEY = Fernet.generate_key().decode()
+    ron_daemon.py inserts ~/workspace/telegram-bot at sys.path[0] when it
+    imports, so under `unittest discover` a module imported afterwards can
+    resolve to the live tree instead of this repo. Memory tests must
+    exercise the repo copy, so any foreign copy is evicted and re-imported.
+    """
+    here = os.path.abspath(REPO) + os.sep
+    mod = sys.modules.get(name)
+    if mod is None or not os.path.abspath(
+            getattr(mod, "__file__", "")).startswith(here):
+        sys.modules.pop(name, None)
+        while REPO in sys.path:
+            sys.path.remove(REPO)
+        sys.path.insert(0, REPO)
+        __import__(name)
+        mod = sys.modules[name]
+    return mod
+
+
+ron_memory = _use_repo_copy("ron_memory")
+ron_privacy = _use_repo_copy("ron_privacy")
+ron_ai = _use_repo_copy("ron_ai")
+ron_daemon = _use_repo_copy("ron_daemon")
+
+# Repair case: another test module may have imported ron_daemon first, at
+# which point ron_daemon.py's own sys.path insert (live tree at [0])
+# made its `import ron_memory` resolve to the live copy and fail, leaving
+# _MEM_MODULES False and no ron_privacy global. Evict and re-import with
+# the repo copies pre-seeded so the daemon binds them from sys.modules.
+if not getattr(ron_daemon, "_MEM_MODULES", False) or not hasattr(
+        ron_daemon, "ron_privacy"):
+    for _m in ("ron_daemon", "ron_memory", "ron_privacy"):
+        sys.modules.pop(_m, None)
+    while REPO in sys.path:
+        sys.path.remove(REPO)
+    sys.path.insert(0, REPO)
+    import ron_memory as _rm  # noqa: E402  (repo copy, pre-seeded)
+    import ron_privacy as _rp  # noqa: E402
+    import ron_daemon as _rd  # noqa: E402
+    ron_memory, ron_privacy, ron_daemon = _rm, _rp, _rd
+    assert ron_daemon._MEM_MODULES and hasattr(ron_daemon, "ron_privacy"), \
+        "daemon memory modules still unavailable after repair"
+
+TEST_KEY = ron_memory.generate_key()
 
 
 def fresh_store():
@@ -80,11 +120,13 @@ class FakeSends:
 
         def ai_reply(chat_id, user_id, user_name, text, private=True,
                      reply_to=None, thread_id=None,
-                     business_connection_id=None, cacheable=True):
+                     business_connection_id=None, cacheable=True,
+                     username=None, **kwargs):
             self.ai_calls.append({"chat_id": chat_id, "user_id": user_id,
                                   "text": text, "private": private,
                                   "reply_to": reply_to,
-                                  "cacheable": cacheable})
+                                  "cacheable": cacheable,
+                                  "username": username})
 
         ron_daemon.send = send
         ron_daemon.send_markup = send_markup
@@ -308,6 +350,10 @@ class DisclosureFlowTest(unittest.TestCase):
         ron_daemon.mem = self.store
         self.fake = FakeSends()
         self.fake.install()
+        # isolate JSON history: update paths must never touch live files
+        self._tmp_hist = self.path + ".hist.json"
+        self._orig_hist = ron_ai.HISTORY_FILE
+        ron_ai.HISTORY_FILE = self._tmp_hist
         # P (user 111) had a DM with the bot; P is also in group G1.
         self.store.note_member("G1", 111, "Priya")
         self.fact_text = ("Priya carries an epipen for peanut allergy emergencies")
@@ -318,10 +364,12 @@ class DisclosureFlowTest(unittest.TestCase):
     def tearDown(self):
         self.fake.uninstall()
         self.store.close()
-        try:
-            os.unlink(self.path)
-        except OSError:
-            pass
+        ron_ai.HISTORY_FILE = self._orig_hist
+        for p in (self.path, self._tmp_hist):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
         ron_daemon.mem = None
 
     def test_a_trigger_sends_dm_not_group_message(self):
@@ -475,15 +523,21 @@ class OvershareGuardTest(unittest.TestCase):
         ron_daemon.mem = self.store
         self.fake = FakeSends()
         self.fake.install()
+        # isolate JSON history: update paths must never touch live files
+        self._tmp_hist = self.path + ".hist.json"
+        self._orig_hist = ron_ai.HISTORY_FILE
+        ron_ai.HISTORY_FILE = self._tmp_hist
         self.owner = ron_daemon.OWNER_ID
 
     def tearDown(self):
         self.fake.uninstall()
         self.store.close()
-        try:
-            os.unlink(self.path)
-        except OSError:
-            pass
+        ron_ai.HISTORY_FILE = self._orig_hist
+        for p in (self.path, self._tmp_hist):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
         ron_daemon.mem = None
 
     def _group_update(self, text, user_id=None):

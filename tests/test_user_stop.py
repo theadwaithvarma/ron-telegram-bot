@@ -64,7 +64,7 @@ class StopTestBase(unittest.TestCase):
         ron_ai._save_turn = self._orig_save
 
     def _fake_request(self, lines):
-        def fake(cfg, messages, stream, timeout, cheap=False):
+        def fake(cfg, messages, stream, timeout, tier="standard"):
             return FakeStreamResp(lines)
         ron_ai._request = fake
 

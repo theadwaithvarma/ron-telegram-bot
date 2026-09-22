@@ -62,9 +62,9 @@ class QuickAnswerTests(unittest.TestCase):
         self.req_kwargs = {}
         self.reply_text = "Paris is the capital of France."
 
-        def fake_request(cfg, messages, stream, timeout, cheap=False):
+        def fake_request(cfg, messages, stream, timeout, tier="standard"):
             self.req_kwargs = {"stream": stream, "timeout": timeout,
-                               "cheap": cheap, "n_messages": len(messages),
+                               "tier": tier, "n_messages": len(messages),
                                "system": messages[0]["content"],
                                "user": messages[1]["content"]}
             return FakeResp({"choices": [{"message":
@@ -89,7 +89,7 @@ class QuickAnswerTests(unittest.TestCase):
         out = ron_ai.quick_answer("capital of France?", "Guest")
         self.assertEqual(out, self.reply_text)
         k = self.req_kwargs
-        self.assertTrue(k["cheap"])            # small model first
+        self.assertEqual(k["tier"], "cheap")  # small model first
         self.assertEqual(k["timeout"], 30)     # clients won't wait around
         self.assertFalse(k["stream"])
         self.assertEqual(k["n_messages"], 2)   # system + one user turn

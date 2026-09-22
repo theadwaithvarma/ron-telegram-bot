@@ -97,7 +97,7 @@ class ChatUsernameTest(unittest.TestCase):
         self._orig = ron_ai._request
         self.captured = {}
 
-        def fake(cfg, messages, stream, timeout, cheap=False):
+        def fake(cfg, messages, stream, timeout, tier="standard"):
             self.captured["messages"] = messages
             return FakeResp("ok")
         ron_ai._request = fake
@@ -120,7 +120,7 @@ class ChatUsernameTest(unittest.TestCase):
     def test_chat_stream_injects_who_line(self):
         orig = ron_ai._request
 
-        def fake_stream(cfg, messages, stream, timeout, cheap=False):
+        def fake_stream(cfg, messages, stream, timeout, tier="standard"):
             self.captured["messages"] = messages
             return FakeStreamResp("ok")
         ron_ai._request = fake_stream

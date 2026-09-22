@@ -846,14 +846,67 @@ def init_memory():
     print("[ron_daemon] memory: enabled", flush=True)
 
 
+def init_reminders():
+    """Start reminder delivery. Independent of memory: reminders must
+    work even when the memory store is disabled or failed to start."""
+    # v1.28.0 Track B: the store lives in ron_tools; the daemon
+    # registers a plain-send handler and sweeps due reminders
+    # ~once a minute. Best effort, never crashes the loop.
+    try:
+        import ron_tools as _rt
+    except Exception:
+        _rt = None
+    if _rt is not None:
+        try:
+            _rt.set_delivery_handler(_deliver_reminder)
+            threading.Thread(target=_reminder_sweeper, args=(_rt,),
+                             daemon=True).start()
+            print("[ron_daemon] reminders: enabled", flush=True)
+        except Exception as e:
+            print(f"[ron_daemon] reminders unavailable "
+                  f"({type(e).__name__})", flush=True)
+
+
+def _deliver_reminder(rem):
+    """Send a fired reminder to its chat. Returns True when accepted."""
+    try:
+        r = send(rem.get("chat_id"), "⏰ " + str(rem.get("text", "")))
+        return bool(r.get("ok"))
+    except Exception:
+        return False
+
+
+def _reminder_sweeper(rt):
+    """Fire due reminders ~once a minute. Never raises."""
+    import time as _time
+    while True:
+        try:
+            _time.sleep(60)
+            rt.check_due()
+        except Exception:
+            pass
+
+
 def _memory_dual_write(chat_id, user_id, user_name, user_text, reply):
     """Every completed turn lands in SQLite alongside the JSON history."""
     try:
         if mem is None:
             return
         c = str(chat_id)
-        mem.record_message(c, user_id or 0, "user",
-                           f"[{user_name}]: {user_text}")
+        # v1.28.0 Track A: record_turn records the user row AND extracts
+        # durable facts from explicit "remember ..." phrasings (dedupe
+        # keeps it idempotent with the NL remember path).
+        try:
+            recorder = getattr(mem, "record_turn", None)
+            if callable(recorder):
+                recorder(c, user_id or 0, "user",
+                         f"[{user_name}]: {user_text}")
+            else:
+                mem.record_message(c, user_id or 0, "user",
+                                   f"[{user_name}]: {user_text}")
+        except Exception:
+            mem.record_message(c, user_id or 0, "user",
+                               f"[{user_name}]: {user_text}")
         mem.record_message(c, 0, "assistant", reply)
     except Exception as e:
         print(f"[ron_daemon] memory write failed: {type(e).__name__}",
@@ -5222,6 +5275,8 @@ def main():
           flush=True)
     # Phase 4: memory store (dual-write + recall hooks + approval sweeper).
     init_memory()
+    # v1.28.0 Track B: reminders start independently of memory.
+    init_reminders()
     # Owner power commands (v1.12.0): state dir, periodic state flush, and
     # the per-provider AI-call counter hook for /stats.
     ron_owner.set_dir(os.path.join(HOME, "workspace", "telegram-bot"))

@@ -19,6 +19,14 @@ from dynamic_credentials import dynamic_credential_entry, DynamicCredentialError
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 import http_pool
 import ron_owner_rules
+try:
+    import ron_routing  # v1.28.0 Track C: difficulty-based model routing
+except Exception:
+    ron_routing = None
+try:
+    import ron_tools  # v1.28.0 Track B: tool-use layer (search/weather/...)
+except Exception:
+    ron_tools = None
 
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, "workspace", "telegram-bot")
@@ -494,7 +502,7 @@ def _parse_retry_after(body):
     return (int(h or 0) * 3600 + int(mnt or 0) * 60 + float(s or 0) + 0.5)
 
 
-def _request(cfg, messages, stream, timeout, cheap=False):
+def _request(cfg, messages, stream, timeout, tier="standard"):
     """POST /chat/completions with multi-provider failover.
 
     Tries each provider in order, each of its models in order. Per model:
@@ -506,7 +514,13 @@ def _request(cfg, messages, stream, timeout, cheap=False):
     "rate limited", provider-neutral) if every keyed provider came back
     429, or RuntimeError("AI key not connected yet") if no provider has a
     key at all.
+
+    tier (v1.28.0 Track C): "cheap" (smallest model first), "standard"
+    (default ordering), "hard" (strongest model first). Reorders only —
+    no (provider, model) pair is ever dropped, so failover is intact.
     """
+    if tier not in ("cheap", "standard", "hard"):
+        tier = "standard"
     providers = cfg.get("providers") or DEFAULT_PROVIDERS
     now = time.monotonic()
     plan = []  # (name, base_url, key, model, extra_headers)
@@ -526,10 +540,16 @@ def _request(cfg, messages, stream, timeout, cheap=False):
             continue  # cooling down after 429s or tripped 5xx breaker —
                       # try the next provider instead of burning seconds
         models = p.get("models") or []
-        if cheap:
-            # Token economy: smallest model first, but keep the rest of the
-            # provider's list behind it — a cheap-model 429 still fails over
-            # to the big one instead of dying.
+        if ron_routing is not None:
+            # v1.28.0 Track C: tier-aware reorder, never drops a model.
+            try:
+                models = ron_routing.order_provider_models(name, models, tier)
+            except Exception:
+                pass
+        elif tier == "cheap":
+            # Fallback when ron_routing is unavailable — token economy:
+            # smallest model first, but keep the rest of the provider's
+            # list behind it so a cheap-model 429 still fails over.
             cm = _CHEAP_MODELS.get(name)
             if cm in models:
                 models = [cm] + [m for m in models if m != cm]
@@ -925,7 +945,7 @@ def _summarize_via_cheap(cfg, old_turns, prior_summary):
     messages = [{"role": "system", "content": _SUMMARIZER_SYSTEM},
                 {"role": "user", "content": body}]
     try:
-        resp = _request(cfg, messages, stream=False, timeout=60, cheap=True)
+        resp = _request(cfg, messages, stream=False, timeout=60, tier="cheap")
         with resp:
             data = json.loads(resp.read().decode())
         chunk = ((data.get("choices") or [{}])[0]
@@ -937,6 +957,56 @@ def _summarize_via_cheap(cfg, old_turns, prior_summary):
         return None
 
 
+def _complete_once(messages, tier="standard"):
+    """Non-streaming one-shot completion for the Track B tool loop.
+
+    Wired to the normal provider chain (with tier ordering); any failure
+    raises and the caller treats it as "no tool help". Never used for the
+    final user-visible reply — only for tool-call probes.
+    """
+    cfg = load_config()
+    resp = _request(cfg, messages, stream=False, timeout=60, tier=tier)
+    with resp:
+        data = json.loads(resp.read().decode())
+    reply = ((data.get("choices") or [{}])[0].get("message", {})
+             .get("content", "").strip())
+    if not reply:
+        raise RuntimeError("AI backend returned empty reply")
+    return reply[:MAX_REPLY]
+
+
+def _route_tier(user_text, cfg):
+    """v1.28.0 Track C: difficulty tier for this turn ("cheap"/"standard"/
+    "hard"). Falls back to the old _use_cheap semantics when ron_routing
+    is unavailable. Never raises."""
+    if ron_routing is not None:
+        try:
+            return ron_routing.routing_tier(user_text, cfg)
+        except Exception:
+            pass
+    return "cheap" if _use_cheap(user_text, cfg) else "standard"
+
+
+def _maybe_tools(messages, user_text, tier):
+    """v1.28.0 Track B: run the agentic tool loop (search/weather/news/
+    calendar/reminders) when the model wants tool help. Returns the
+    messages list with a tool-results block appended, or the list
+    unchanged. Never raises; skipped for cheap small-talk."""
+    if ron_tools is None or tier == "cheap":
+        return messages
+    try:
+        allow_acting = bool(
+            ron_tools.REMINDER_REQUEST_RE.search(user_text or ""))
+        block = ron_tools.maybe_run_tools(
+            messages, lambda ms: _complete_once(ms, tier),
+            user_text=user_text, allow_acting=allow_acting)
+    except Exception:
+        block = None
+    if block:
+        return messages + [{"role": "user", "content": block}]
+    return messages
+
+
 def chat(chat_id, user_text, user_name="there", system_extra="",
          user_id=0, is_private=True, username=""):
     """One conversational turn. Returns the assistant's reply text."""
@@ -945,8 +1015,10 @@ def chat(chat_id, user_text, user_name="there", system_extra="",
     # not the full raw history every call.
     turns, summary = _prompt_turns(chat_id, user_text, user_name)
     # Token economy: greetings/small-talk get the small model + short prompt.
-    # Light mode forces cheap routing for every message.
-    cheap = _use_cheap(user_text, cfg)
+    # Light mode forces cheap routing for every message. v1.28.0: "hard"
+    # questions (code, math, debugging, ...) get the strongest model first.
+    tier = _route_tier(user_text, cfg)
+    cheap = (tier == "cheap")
     # Phase 4: bounded memory recall injected into the prompt (skipped for
     # cheap small-talk — nothing worth recalling there).
     mem_extra = ""
@@ -968,10 +1040,13 @@ def chat(chat_id, user_text, user_name="there", system_extra="",
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
               else cfg["system"]) + who + summary_block + (system_extra or "") + mem_extra + rules_extra
     messages = [{"role": "system", "content": system}] + turns
+    # v1.28.0 Track B: tool help (web search, weather, news, calendar,
+    # reminders) before the main request.
+    messages = _maybe_tools(messages, user_text, tier)
 
     try:
         # 120s: reasoning models can think a while before the first token
-        resp = _request(cfg, messages, stream=False, timeout=120, cheap=cheap)
+        resp = _request(cfg, messages, stream=False, timeout=120, tier=tier)
         with resp:
             data = json.loads(resp.read().decode())
     except DynamicCredentialError:
@@ -1012,7 +1087,7 @@ def quick_answer(query_text, user_name="there"):
         # 30s: inline/guest clients won't wait around; cheap=True puts the
         # small model first for speed, the big models stay behind it for
         # 429/5xx failover.
-        resp = _request(cfg, messages, stream=False, timeout=30, cheap=True)
+        resp = _request(cfg, messages, stream=False, timeout=30, tier="cheap")
         with resp:
             data = json.loads(resp.read().decode())
     except DynamicCredentialError:
@@ -1173,8 +1248,10 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     # not the full raw history every call.
     turns, summary = _prompt_turns(chat_id, user_text, user_name)
     # Token economy: greetings/small-talk get the small model + short prompt.
-    # Light mode forces cheap routing for every message.
-    cheap = _use_cheap(user_text, cfg)
+    # Light mode forces cheap routing for every message. v1.28.0: "hard"
+    # questions get the strongest model first.
+    tier = _route_tier(user_text, cfg)
+    cheap = (tier == "cheap")
     # Phase 4: bounded memory recall (skipped for cheap small-talk).
     mem_extra = ""
     if MEMORY_RECALL_HOOK is not None and not cheap:
@@ -1195,9 +1272,11 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     system = ((cfg.get("system_cheap") or cfg["system"]) if cheap
               else cfg["system"]) + who + summary_block + (system_extra or "") + mem_extra + rules_extra
     messages = [{"role": "system", "content": system}] + turns
+    # v1.28.0 Track B: tool help before the main (streaming) request.
+    messages = _maybe_tools(messages, user_text, tier)
 
     try:
-        resp = _request(cfg, messages, stream=True, timeout=120, cheap=cheap)
+        resp = _request(cfg, messages, stream=True, timeout=120, tier=tier)
     except DynamicCredentialError:
         raise RuntimeError("AI key not connected yet")
 

@@ -1,3 +1,56 @@
+## 1.28.0 — Smarter bot: memory, tools, difficulty routing (2026-09-22)
+
+Adwaith asked for a much smarter bot ("do the full upgrade", no extra
+cost — everything runs on the existing free tiers + local resources).
+
+(a) Per-chat private memory DB (Track A): ron_memory.py rewritten —
+    the old module-level `from cryptography.fernet import Fernet` meant
+    the whole module never imported, so every memory feature was dead.
+    New clean Cipher interface: StdCipher (stdlib-only HMAC-SHA256 CTR +
+    encrypt-then-MAC, RM1 header) by default, FernetCipher when the
+    package is installed (RON_MEMORY_CIPHER=fernet one-line swap back).
+    Key from RON_MEMORY_KEY, fail closed. Strict per-chat isolation
+    (single SQLite file, chat-scoped tables, isolation audit tests);
+    record_turn() extracts facts from explicit "remember .../note down
+    ..." user phrasings; recall_context() returns a compact bounded
+    prompt block; NL commands (remember/forget-that/forget-about-X/
+    forget-everything) chat-scoped; retention pruning; never any memory
+    content in logs. Daemon's dual-write now calls record_turn for the
+    user side of every turn (replaces the plain record_message — no
+    duplicate rows; dedupe keeps it idempotent with the NL path) and
+    keeps record_message for the assistant side.
+(b) Tool use in the brain loop (Track B): new ron_tools.py —
+    web_search (DuckDuckGo), weather (Open-Meteo), news (HN Algolia),
+    reminders (local store + daemon delivery thread firing ~once/min),
+    calendar reads (hatch_gws_cli provider; needs the Google Calendar
+    connector, already linked). Text-protocol tool calls (fenced ```tool
+    JSON blocks) so it works identically on Groq/Gemini/OpenRouter;
+    OpenAI-style TOOL_SCHEMAS ship for a future native integration.
+    Read-only tools auto-run; acting tools (reminders) gated behind
+    explicit reminder requests; 2 passes max, 3 calls/pass, timeouts,
+    never raises into a chat turn; all user-facing errors
+    provider-neutral. Wired into chat() and chat_stream() after message
+    build, skipped for cheap small-talk.
+(c) Difficulty-based routing (Track C): new ron_routing.py —
+    deterministic zero-LLM classifier (cheap/standard/hard) consistent
+    with _looks_trivial (verified 0 contradictions over 154 variants);
+    tier-aware plan builder reorders but NEVER drops a (provider, model)
+    pair — full failover, 429/5xx handling, and no-double-burn intact.
+    _request() takes tier= instead of cheap=; chat()/chat_stream() route
+    per turn; hard questions (code, math, debugging, why/how) hit the
+    strongest model first, small talk stays fast and cheap. Token
+    economy preserved (zero-cost canned acks, cheap short prompts,
+    memory-recall skip on cheap).
+
+- Tests: 35 routing + 60 tools + 55 memory + 26 cipher (2 Fernet-only
+  skipped) + 27 track-A + 11 upgrade-wiring, all offline. Full suite:
+  1028 tests, 3 failures + 2 errors — all pre-existing baseline items
+  (test_buttons inline-query, test_heal nonhttp trailer, test_who_line
+  stream injection; test_backup/test_summary loader errors from missing
+  `cryptography`). The old test_memory loader error is GONE — the
+  rewrite fixed the import, so memory's 55 tests now run.
+- Prompt lines for [react:] (v1.27.3) already live in repo + live json.
+
 ## 1.27.3 — Reaction targets the user's own message (2026-09-22)
 
 - Correction (Adwaith: "I got reaction on its new response not mine"):
