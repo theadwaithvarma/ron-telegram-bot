@@ -46,8 +46,14 @@ def _dirs():
     base = os.path.join(_base(), "handoff")
     req = os.path.join(base, "requests")
     res = os.path.join(base, "responses")
-    os.makedirs(req, exist_ok=True)
-    os.makedirs(res, exist_ok=True)
+    os.makedirs(req, mode=0o700, exist_ok=True)
+    os.makedirs(res, mode=0o700, exist_ok=True)
+    # makedirs won't fix perms on pre-existing dirs — enforce owner-only.
+    for d in (os.path.join(_base(), "handoff"), req, res):
+        try:
+            os.chmod(d, 0o700)
+        except Exception:
+            pass
     return req, res
 
 

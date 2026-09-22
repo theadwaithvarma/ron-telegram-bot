@@ -51,6 +51,15 @@ class HandoffStoreTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_queue_dirs_are_owner_only(self):
+        self.hd.submit_request(111, 222, OWNER, "A", "ping")  # creates dirs
+        base = os.path.join(self.tmp.name, "handoff")
+        self.assertEqual(oct(os.stat(base).st_mode & 0o777), "0o700")
+        for sub in ("requests", "responses"):
+            p = os.path.join(base, sub)
+            self.assertEqual(oct(os.stat(p).st_mode & 0o777), "0o700",
+                             sub)
+
     def test_submit_writes_atomic_json(self):
         rid = self.hd.submit_request(111, 222, OWNER, "Adwaith",
                                      "summarize this", reply_msg=None)
