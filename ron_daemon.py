@@ -905,6 +905,7 @@ def _muse_handoff_sweeper():
                         continue
                     chat_id = req.get("chat_id")
                     msg_id = req.get("message_id")
+                    req_id = req.get("id", "?")
                     chunks, cur = [], ""
                     for line in text.split("\n"):
                         if len(cur) + len(line) + 1 > 4000 and cur:
@@ -914,10 +915,16 @@ def _muse_handoff_sweeper():
                     if cur:
                         chunks.append(cur)
                     first = True
+                    sent_mid = None
                     for chunk in chunks or [text]:
-                        send(chat_id, chunk,
-                             reply_to=msg_id if first else None)
+                        r = send(chat_id, chunk,
+                                 reply_to=msg_id if first else None)
+                        if first:
+                            sent_mid = ((r or {}).get("result") or {}
+                                        ).get("message_id")
                         first = False
+                    print(f"[ron_daemon] /muse delivered req={req_id} "
+                          f"chat={chat_id} msg={sent_mid}", flush=True)
                 except Exception as e:
                     print(f"[ron_daemon] /muse delivery failed: "
                           f"{type(e).__name__}", flush=True)
