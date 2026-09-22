@@ -51,6 +51,14 @@ class HandoffStoreTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_claim_is_atomic_first_wins(self):
+        rid = self.hd.submit_request(111, 222, OWNER, "A", "ping")
+        self.assertTrue(self.hd.claim_request(rid))
+        self.assertFalse(self.hd.claim_request(rid))  # second claimer loses
+        marker = os.path.join(self.tmp.name, "handoff", "requests",
+                              rid + ".claimed")
+        self.assertEqual(oct(os.stat(marker).st_mode & 0o777), "0o600")
+
     def test_queue_dirs_are_owner_only(self):
         self.hd.submit_request(111, 222, OWNER, "A", "ping")  # creates dirs
         base = os.path.join(self.tmp.name, "handoff")

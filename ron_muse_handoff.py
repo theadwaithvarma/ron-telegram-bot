@@ -122,15 +122,18 @@ def pending_requests():
 
 
 def claim_request(req_id):
-    """Mark a request as being worked on. Idempotent."""
+    """Mark a request as being worked on. Atomic: the exclusive create
+    means only one worker wins the claim; a second claimer gets False.
+    Returns True when this call won the claim."""
     req_dir, _ = _dirs()
     marker = os.path.join(req_dir, req_id + ".claimed")
     try:
-        with open(marker, "a"):
-            os.utime(marker, None)
-        os.chmod(marker, 0o600)
-    except Exception:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except (FileExistsError, OSError):
+        return False
+    with os.fdopen(fd, "w"):
         pass
+    return True
 
 
 def write_response(req_id, reply_text, deliver_to_app=False,
