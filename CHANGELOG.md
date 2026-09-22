@@ -1,3 +1,19 @@
+## 1.27.2 — Reaction targets the user's reply target (2026-09-22)
+
+- Bug (reported by Adwaith): when his message was itself a reply to another
+  message and the bot emitted a [react:] trailer, the reaction landed on the
+  bot's own just-sent reply instead of on the message he had replied to.
+- Fix: the daemon now threads the incoming message's reply target
+  (reply_to_message.message_id) through ai_reply -> stream_ai_reply /
+  send_rich_with_kb -> _fire_media_trailers -> fire_actions as
+  react_target_msg_id, and the [react:] action targets it. Falls back to
+  the bot's own reply when the user's message wasn't a reply (old behavior
+  kept). System prompt updated in repo + live ron_ai.json.
+- 6 new offline tests in tests/test_react_target.py (target preference,
+  fallback, drop-with-no-target, plumbing through send_rich_with_kb and
+  _fire_media_trailers). Full suite: 848 tests, 3 failures + 3 errors —
+  identical to the pre-change baseline.
+
 ## 1.27.1 — Fix edit-turn duplicate bubble (2026-09-22)
 
 - Bug: on an edit turn, pressing Stop mid-stream truncated the reply before

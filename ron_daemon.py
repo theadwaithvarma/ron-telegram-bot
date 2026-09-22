@@ -3839,12 +3839,29 @@ def _edit_bot_message(chat_id, target_id, revised, thread_id=None,
     return False
 
 
+def _react_target_from_reply(reply_msg):
+    """v1.27.x: the message_id the user's incoming message replied to
+    (reply_to_message), or None. A [react:] trailer targets it instead of
+    the bot's own just-sent reply — the reaction lands where the user
+    pointed, not on the bot's own bubble."""
+    try:
+        return (reply_msg or {}).get("message_id")
+    except Exception:
+        return None
+
+
 def _fire_media_trailers(reply, chat_id, sent_r, reply_to=None,
-                         thread_id=None, business_connection_id=None):
+                         thread_id=None, business_connection_id=None,
+                         react_target_msg_id=None):
     """v1.26.0: execute media-message trailers the model emitted ([dice],
     [poll:], [quiz:], [location:], [livelocation:], [venue:], [contact:],
     [spoilerphoto:], [mediagroup:], [react:]). Fires only after the main
-    reply landed; never raises, never blocks the reply path."""
+    reply landed; never raises, never blocks the reply path.
+
+    react_target_msg_id (v1.27.x): the message the user's incoming message
+    replied to — a [react:] trailer targets it instead of the bot's own
+    just-sent reply.
+    """
     if ron_media_trailers is None:
         return
     try:
@@ -3863,14 +3880,14 @@ def _fire_media_trailers(reply, chat_id, sent_r, reply_to=None,
         ron_media_trailers.fire_actions(
             actions, chat_id, reply_to=reply_to, thread_id=thread_id,
             business_connection_id=business_connection_id,
-            sent_msg_id=msg_id)
+            sent_msg_id=msg_id, react_target_msg_id=react_target_msg_id)
     except Exception as e:
         print(f"[ron_daemon] media trailer fire error: {e}", flush=True)
 
 
 def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
                       business_connection_id=None, user_text="",
-                      edit_target_msg_id=None):
+                      edit_target_msg_id=None, react_target_msg_id=None):
     """Trailer parsing + IN-BUBBLE rich buttons with safe fallbacks.
 
     When the reply carries [buttons:]/[links:] trailers, the message goes
@@ -3887,6 +3904,10 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
     to. When the reply carries the [edit] trailer, the revised text edits
     that message in place via editMessageText instead of sending a new
     message; on edit failure it falls back to the normal send below.
+
+    react_target_msg_id (v1.27.x): the message the user's incoming message
+    replied to. A [react:] trailer targets it instead of the bot's own
+    just-sent reply; None keeps the old behavior (react to own reply).
     """
     # v1.27.0 user-requested edits: the model emitted [edit], meaning the
     # user replied to our own message asking to change it — revise in
@@ -3904,7 +3925,8 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
                     _fire_media_trailers(
                         reply, chat_id,
                         {"result": {"message_id": edit_target_msg_id}},
-                        reply_to, thread_id, business_connection_id)
+                        reply_to, thread_id, business_connection_id,
+                        react_target_msg_id)
                     return {"ok": True, "edited": True}
             # Edit failed or nothing to edit — fall through to the normal
             # send with the trailer stripped (handled below).
@@ -3927,7 +3949,8 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
                             business_connection_id)
             if r.get("ok"):
                 _fire_media_trailers(reply, chat_id, r, reply_to, thread_id,
-                                     business_connection_id)
+                                     business_connection_id,
+                                     react_target_msg_id)
                 return r
             print(f"[ron_daemon] blocks send not ok, falling back to "
                   f"keyboard: {str(r)[:120]}", flush=True)
@@ -3952,7 +3975,7 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
             pass
     if r and r.get("ok"):
         _fire_media_trailers(reply, chat_id, r, reply_to, thread_id,
-                             business_connection_id)
+                             business_connection_id, react_target_msg_id)
     return r
 
 
@@ -4012,7 +4035,7 @@ def canned_reply(text, chat_id):
 
 
 def _stream_with_draft(chat_id, produce, user_text="",
-                       edit_target_msg_id=None):
+                       edit_target_msg_id=None, react_target_msg_id=None):
     """Shared native-draft streaming core (Bot API sendMessageDraft).
 
     produce(on_token, stop_event) runs the AI call and returns the full
@@ -4088,12 +4111,14 @@ def _stream_with_draft(chat_id, produce, user_text="",
               f"— no send", flush=True)
         return reply
     send_rich_with_kb(chat_id, reply, user_text=user_text,
-                      edit_target_msg_id=edit_target_msg_id)
+                      edit_target_msg_id=edit_target_msg_id,
+                      react_target_msg_id=react_target_msg_id)
     return reply
 
 
 def stream_ai_reply(chat_id, user_id, user_name, text, username="",
-                    system_extra="", edit_target_msg_id=None):
+                    system_extra="", edit_target_msg_id=None,
+                    react_target_msg_id=None):
     """Native draft streaming for 1:1 chats (Bot API sendMessageDraft): the
     reply animates in a draft bubble as tokens arrive (ChatGPT-style),
     throttled to stay under Telegram's rate limits. The client's native Stop
@@ -4108,7 +4133,8 @@ def stream_ai_reply(chat_id, user_id, user_name, text, username="",
             system_extra=group_context() + (system_extra or ""),
             user_id=user_id, is_private=True, username=username),
         user_text=text,
-        edit_target_msg_id=edit_target_msg_id)
+        edit_target_msg_id=edit_target_msg_id,
+        react_target_msg_id=react_target_msg_id)
     handle_group_sends(chat_id, user_id, user_name, reply)
     handle_send_topic(chat_id, user_id, user_name, reply)
     handle_topic_actions(chat_id, user_name, reply)
@@ -4277,12 +4303,17 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 # preview in the bot's own chats, but this reply must go out
                 # on the business account as one final message.
                 # Light mode also skips streaming: single cheap send instead.
+                # v1.27.x: a [react:] trailer targets the message the user's
+                # incoming message replied to (reply_msg), not the bot's own
+                # reply — compute it once here for both send paths below.
+                react_target_msg_id = _react_target_from_reply(reply_msg)
                 if private and not business_connection_id and not lm:
                     try:
                         reply = stream_ai_reply(chat_id, user_id, user_name,
                                                 text, username=username,
                                                 system_extra=edit_extra,
-                                                edit_target_msg_id=edit_target_msg_id)
+                                                edit_target_msg_id=edit_target_msg_id,
+                                                react_target_msg_id=react_target_msg_id)
                         _record_brain_success()
                         # Phase 6: cache the successful reply (before any
                         # light-mode footer) for equivalent future questions.
@@ -4384,7 +4415,8 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 reply += ron_ai.light_mode_notice(user_id)
             send_rich_with_kb(chat_id, reply, reply_to, thread_id,
                               business_connection_id, user_text=text,
-                              edit_target_msg_id=edit_target_msg_id)
+                              edit_target_msg_id=edit_target_msg_id,
+                              react_target_msg_id=react_target_msg_id)
             handle_group_sends(chat_id, user_id, user_name, reply)
             handle_send_topic(chat_id, user_id, user_name, reply)
             handle_topic_actions(chat_id, user_name, reply,

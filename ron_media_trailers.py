@@ -19,6 +19,7 @@ Trailer syntax (documented in the system prompt):
       image generated locally with PIL (no external fetch)
   [mediagroup: caption]                           -> sendMediaGroup, 2 images
   [react: 👍]                                     -> setMessageReaction on the
+      message the user replied to (their reply target), else the
       bot's own just-sent reply
 
 Parsing/validation is pure here; fire_actions() does the network calls via
@@ -291,16 +292,20 @@ def _json_payload(chat_id, thread_id=None, business_connection_id=None,
 
 
 def fire_actions(actions, chat_id, reply_to=None, thread_id=None,
-                 business_connection_id=None, sent_msg_id=None):
+                 business_connection_id=None, sent_msg_id=None,
+                 react_target_msg_id=None):
     """Execute validated media actions. Returns number that landed ok.
 
     Never raises — a failed action is logged, the rest still fire.
+    react_target_msg_id (v1.27.x): the message the user's incoming message
+    replied to. A [react:] trailer targets it instead of the bot's own
+    just-sent reply — the reaction lands where the user pointed.
     """
     ok_count = 0
     for a in actions or []:
         try:
             if _fire_one(a, chat_id, thread_id, business_connection_id,
-                         sent_msg_id):
+                         sent_msg_id, react_target_msg_id):
                 ok_count += 1
         except Exception as e:
             print(f"[media_trailers] action {a.get('kind')} failed: {e}",
@@ -308,7 +313,8 @@ def fire_actions(actions, chat_id, reply_to=None, thread_id=None,
     return ok_count
 
 
-def _fire_one(a, chat_id, thread_id, business_connection_id, sent_msg_id):
+def _fire_one(a, chat_id, thread_id, business_connection_id, sent_msg_id,
+              react_target_msg_id=None):
     kind = a.get("kind")
     base = dict(chat_id=chat_id)
     if thread_id:
@@ -373,14 +379,18 @@ def _fire_one(a, chat_id, thread_id, business_connection_id, sent_msg_id):
                             [("p0", "demo0.jpg", demo_image_bytes(1)),
                              ("p1", "demo1.jpg", demo_image_bytes(2))])
     elif kind == "react":
-        if not sent_msg_id:
-            print("[media_trailers] [react:] dropped: no sent message id",
+        # v1.27.x: prefer the message the user replied to (their reply
+        # target) over the bot's own just-sent reply. Falls back to the
+        # bot's own reply when the user's message wasn't a reply.
+        target_msg_id = react_target_msg_id or sent_msg_id
+        if not target_msg_id:
+            print("[media_trailers] [react:] dropped: no target message id",
                   flush=True)
             return False
         # Bots can react with a normal emoji reaction (never big_reaction).
         r = rich_send.api_json("setMessageReaction", {
             "chat_id": chat_id,
-            "message_id": sent_msg_id,
+            "message_id": target_msg_id,
             "reaction": [{"type": "emoji", "emoji": a.get("emoji", "👍")}],
         })
     else:
