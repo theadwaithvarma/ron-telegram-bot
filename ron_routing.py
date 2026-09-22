@@ -52,6 +52,7 @@ _CHEAP_MODELS = {
     "groq": "openai/gpt-oss-20b",
     "gemini": "gemini-flash-lite-latest",
     "openrouter": "nex-agi/nex-n2.5-pro:free",
+    "pollinations": "openai",
 }
 
 # Strongest model per provider: tried first for the "hard" tier.
@@ -59,6 +60,7 @@ _STRONGEST_MODELS = {
     "groq": "openai/gpt-oss-120b",
     "gemini": "gemini-3.8-flash",
     "openrouter": "openai/gpt-oss-120b:free",
+    "pollinations": "openai",
 }
 
 # ----------------------------------------------------------------------

@@ -1,3 +1,25 @@
+## 1.30.0 — Keyless free backup leg + wider OpenRouter :free rotation (2026-09-22)
+
+Adwaith's call: when paid quotas run out, Ron should fall back to free
+services instead of dying. The failover chain gains backup depth with
+zero normal-case cost (sequential failover — extra legs are only
+touched when everything before them fails).
+
+- New keyless "pollinations" provider: no signup, no API key, tried
+  LAST in the chain. Slow (~4s) and rate-limited, but it cannot run
+  out of quota — the parachute when Groq/Gemini/OpenRouter are all
+  429ing. Keyless providers are a first-class concept now: key_slot
+  None means "no key needed" ("" sentinel), no Authorization header
+  is sent, and they stay in the attempt plan.
+- OpenRouter :free rotation widened from 2 to 6 models: keeps the two
+  proven fast ones first, then the openrouter/free meta-router
+  (auto-picks a working free model) plus gpt-oss-120b, gemma-4-31b
+  and qwen3-coder :free. Dead :free ids auto-skip via model-not-found,
+  so the rotating roster self-heals.
+- tests/test_keyless_fallback.py: 6 offline tests covering keyless
+  plan inclusion, header omission, 429-fallback to the keyless leg,
+  and chain ordering.
+
 ## 1.29.0 — Reaction removal + tool-probe latency fix (2026-09-22)
 
 Adwaith's call: the [react:] trailer and all auto-reactions are removed

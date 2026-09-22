@@ -333,6 +333,15 @@ PROVIDER_DEFS = {
             "X-Title": "Ron Telegram Bot",
         },
     },
+    "pollinations": {
+        # Keyless last-resort leg (2026-09-22): no signup, no API key.
+        # OpenAI-compatible at /openai/chat/completions. Slow (~4s) and
+        # rate-limited, but it cannot run out of quota — the parachute
+        # when every keyed provider is down or 429ing.
+        "base_url": "https://text.pollinations.ai/openai",
+        "key_slot": None,
+        "extra_headers": {},
+    },
     "perplexity": {
         # Web-grounded answers (OpenAI-compatible).
         # Deliberately NOT in the default chat chain (ron_ai.json) — only
@@ -350,7 +359,17 @@ DEFAULT_PROVIDERS = [
     {"name": "gemini", "models": ["gemini-3.8-flash",
                                   "gemini-flash-lite-latest"]},
     {"name": "openrouter", "models": ["nex-agi/nex-n2.5-pro:free",
-                                      "nvidia/nemotron-3.5-lightning:free"]},
+                                      "nvidia/nemotron-3.5-lightning:free",
+                                      # openrouter/free is the meta-router:
+                                      # picks a working free model itself.
+                                      "openrouter/free",
+                                      "openai/gpt-oss-120b:free",
+                                      "google/gemma-4-31b-it:free",
+                                      "qwen/qwen3-coder:free"]},
+    # Pollinations last: keyless, never quota-dead, but slow. A dead
+    # :free model id auto-skips (model-not-found), so the rotating
+    # roster above self-heals without code changes.
+    {"name": "pollinations", "models": ["openai"]},
 ]
 # Token economy (2026-09-20, Phase 2): trivial messages — greetings and
 # small talk — don't need the 120b model or the full 440-word system prompt.
@@ -361,6 +380,7 @@ _CHEAP_MODELS = {
     "groq": "openai/gpt-oss-20b",
     "gemini": "gemini-flash-lite-latest",
     "openrouter": "nex-agi/nex-n2.5-pro:free",
+    "pollinations": "openai",
 }
 # Greeting regex lives in ron_routing (single source of truth); this is the
 # fallback used when the routing module is unavailable.
@@ -438,8 +458,14 @@ def _model_not_found(body):
 
 
 def _provider_key(name):
-    """Vault surrogate for a provider, or None if its key isn't connected."""
+    """Vault surrogate for a provider.
+
+    Returns "" for keyless providers (key_slot None), None if the key
+    isn't connected — the plan builder skips None, keeps "".
+    """
     slot = PROVIDER_DEFS[name]["key_slot"]
+    if slot is None:
+        return ""
     try:
         entry = dynamic_credential_entry(slot)
         return str(entry["surrogate"]).strip()
@@ -502,7 +528,9 @@ def _build_request(base_url, key, model, messages, stream, extra_headers):
     if stream:
         headers["Accept"] = "text/event-stream"
     headers.update(extra_headers or {})
-    headers["Authorization"] = f"Bearer {key}"
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    # keyless providers ("" key) get no Authorization header at all
     u = urllib.parse.urlsplit(base_url.rstrip("/") + "/chat/completions")
     return u.hostname, u.path or "/", payload, headers
 
@@ -548,8 +576,9 @@ def _request(cfg, messages, stream, timeout, tier="standard"):
         if not spec:
             continue
         key = _provider_key(name)
-        if not key:
+        if key is None:
             continue  # key not in the vault yet — skip provider silently
+                      # (keyless providers return "" and stay in the plan)
         any_key = True
         with _rate_limit_lock:
             wait = _provider_cooldown.get(name, 0.0) - now

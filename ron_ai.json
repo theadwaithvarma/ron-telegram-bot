@@ -26,9 +26,19 @@
     {
       "models": [
         "nex-agi/nex-n2.5-pro:free",
-        "nvidia/nemotron-3.5-lightning:free"
+        "nvidia/nemotron-3.5-lightning:free",
+        "openrouter/free",
+        "openai/gpt-oss-120b:free",
+        "google/gemma-4-31b-it:free",
+        "qwen/qwen3-coder:free"
       ],
       "name": "openrouter"
+    },
+    {
+      "models": [
+        "openai"
+      ],
+      "name": "pollinations"
     }
   ]
 }
