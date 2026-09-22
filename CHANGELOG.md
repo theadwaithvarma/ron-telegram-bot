@@ -29,6 +29,12 @@ Latency fix (tool probe):
   full chain.
 - Memory recall (local SQLite, ~ms) and difficulty routing (pure
   heuristics, ~ms) measured and confirmed negligible; untouched.
+- Live-config fix (not a code change): the live ron_ai.json provider
+  order had drifted to gemini-first while Gemini is currently degraded
+  (~50s to first token); restored to groq-first (repo default, v1.26.1
+  intent). Groq answers in <1s right now. Applies per turn, no restart
+  needed. Measured end-to-end AI path after the fix: "hey" 0.59s,
+  knowledge question 1.23s, weather (probe + tool) 1.42s to first token.
 - Groq-first provider ordering from v1.26.1 intact.
 
 Suite: 1036 tests, only the 4 pre-existing baseline failures
