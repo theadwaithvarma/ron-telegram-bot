@@ -28,6 +28,7 @@ import http_pool
 
 sys.path.insert(0, os.path.join(os.path.expanduser("~"), "workspace", "telegram-bot"))
 import ron_ai
+import ron_muse_handoff
 import ron_owner_rules
 import rich_send as rich_mod
 # Phase 6: semantic answer cache. None-safe — the bot replies normally
@@ -883,6 +884,43 @@ def _reminder_sweeper(rt):
         try:
             time.sleep(60)
             rt.check_due()
+        except Exception:
+            pass
+
+
+def _muse_handoff_sweeper():
+    """Deliver completed /muse answers (~15s). Drains response files and
+    send()s each back to the chat that issued the request, as a reply to
+    the /muse command message. Long answers are split into 4000-char
+    chunks so nothing is silently truncated. Never raises."""
+    while True:
+        try:
+            time.sleep(15)
+            for req, resp in ron_muse_handoff.drain_responses():
+                try:
+                    if not isinstance(req, dict):
+                        continue
+                    text = ((resp or {}).get("reply_text") or "").strip()
+                    if not text:
+                        continue
+                    chat_id = req.get("chat_id")
+                    msg_id = req.get("message_id")
+                    chunks, cur = [], ""
+                    for line in text.split("\n"):
+                        if len(cur) + len(line) + 1 > 4000 and cur:
+                            chunks.append(cur)
+                            cur = ""
+                        cur += ("\n" if cur else "") + line
+                    if cur:
+                        chunks.append(cur)
+                    first = True
+                    for chunk in chunks or [text]:
+                        send(chat_id, chunk,
+                             reply_to=msg_id if first else None)
+                        first = False
+                except Exception as e:
+                    print(f"[ron_daemon] /muse delivery failed: "
+                          f"{type(e).__name__}", flush=True)
         except Exception:
             pass
 
@@ -3414,6 +3452,40 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
             return True
         _owner_reply(chat_id, user_id, cmd_msg_id, _vitals_text())
         return True
+    if cmd == "muse":
+        # Owner-only, DM-only: wake the real Muse (the Muse app's Ron)
+        # with a request. The command is queued to the handoff dir and
+        # acked immediately — the normal provider chain is never touched.
+        # A hook wakes Muse only when a request exists; the answer comes
+        # back here as a reply to this command message.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        if not is_private:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Use /muse in our DM — keeps the request private.")
+            return True
+        args = _cmd_args(text)
+        if not args:
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Usage: /muse <what to do> — wakes the real me "
+                         "(Muse app Ron) with the full toolbox. The answer "
+                         "lands back here as a reply.")
+            return True
+        try:
+            ron_muse_handoff.submit_request(chat_id, cmd_msg_id or 0,
+                                            user_id, user_name, args,
+                                            reply_msg=reply_msg)
+        except Exception as e:
+            print(f"[ron_daemon] /muse queue failed: {type(e).__name__}",
+                  flush=True)
+            _owner_reply(chat_id, user_id, cmd_msg_id,
+                         "Couldn't queue that — try again in a bit.")
+            return True
+        _owner_reply(chat_id, user_id, cmd_msg_id,
+                     "Pinged Muse — waking up with the full toolbox. "
+                     "I'll drop the answer here as a reply.")
+        return True
     if cmd == "broadcast":
         # Owner-only: one message to every known chat. Two-step confirm —
         # "/broadcast <text>" stages, "/broadcast yes" (within 60s) sends.
@@ -5322,6 +5394,7 @@ def main():
     # Owner power commands (v1.12.0): state dir, periodic state flush, and
     # the per-provider AI-call counter hook for /stats.
     ron_owner.set_dir(os.path.join(HOME, "workspace", "telegram-bot"))
+    ron_muse_handoff.set_dir(os.path.join(HOME, "workspace", "telegram-bot"))
     ron_owner.start_flusher()
     ron_ai.AI_CALL_HOOK = ron_owner.note_ai_call
     # Phase 3: heartbeat for the watchdog, startup provider health ping,
@@ -5336,6 +5409,9 @@ def main():
           flush=True)
     threading.Thread(target=_stale_radar_loop, daemon=True).start()
     threading.Thread(target=_bake_drain_loop, daemon=True).start()
+    # v1.32.0: /muse handoff — deliver completed Muse answers to the
+    # chat that issued the request (~15s cadence).
+    threading.Thread(target=_muse_handoff_sweeper, daemon=True).start()
     while not _SHUTDOWN.is_set():
         try:
             r = api("getUpdates", {"offset": offset, "timeout": 50,

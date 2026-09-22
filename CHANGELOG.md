@@ -1,3 +1,28 @@
+## 1.32.0 — /muse: owner-only bridge to the Muse app's Ron (2026-09-22)
+
+Adwaith's call: a private side-channel from the bot to the real Muse —
+`/muse <request>` in his DM wakes the Muse app's Ron (full tools, files,
+context) without touching the bot's normal provider chain.
+
+- New ron_muse_handoff.py: atomic, persistent request/claim/result store
+  under ~/workspace/telegram-bot/handoff/ (0600 perms, tmp+fsync+rename
+  writes). Replied-to message text/caption, sender, and timestamp are
+  captured as context. Idempotent: claim/done markers, crash-safe drain,
+  no double-delivery after restarts.
+- /muse is owner-only AND DM-only: _owner_gate + private-chat check,
+  refused users get the standard "Only Adwaith can use that." — the
+  normal AI path is never invoked for it.
+- The daemon acks immediately ("Pinged Muse…") and never blocks; a
+  15s sweeper thread drains completed answers and sends them back to
+  the issuing chat as a reply (4000-char chunking, never raises).
+- Zero model tokens while idle: a plain shell poller
+  (~/hooks/scripts/muse_handoff.sh, ~30s cadence) wakes Muse only when
+  a request file exists, with stale-claim recovery (>10 min → re-wake).
+- tests/test_muse_handoff.py: 11 offline tests (gating, reply-context
+  capture, atomic writes, claim/done dedupe, drain cleanup, orphan
+  tolerance, queue-failure surfacing). Full suite: same 5 baseline
+  failures as v1.31.0, no regressions.
+
 ## 1.31.0 — Vitals: observability for the bot (2026-09-22)
 
 Cofounder call: Ron had no way to answer "is it slow right now?" with
