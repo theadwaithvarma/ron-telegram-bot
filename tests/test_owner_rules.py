@@ -10,9 +10,17 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+REPO = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, REPO)
 
+# NOTE (AGENTS.md): under `unittest discover`, an alphabetically-earlier
+# test module may have imported ron_daemon first, which inserts the LIVE
+# dir at sys.path[0] — pinning the LIVE ron_owner_rules in sys.modules.
+# Evict it and re-import the repo copy.
+sys.modules.pop("ron_owner_rules", None)
+sys.path.insert(0, REPO)
 import ron_owner_rules as rr
+assert "ron-telegram-bot" in rr.__file__, rr.__file__
 
 
 class TestDetectTeach(unittest.TestCase):
@@ -112,6 +120,37 @@ class TestStore(unittest.TestCase):
         self.assertIn("[Owner's standing rules", blk)
         self.assertIn("1. always greet warmly", blk)
         self.assertIn("2. no buttons on news", blk)
+
+    def test_rules_block_cached_by_mtime(self):
+        # rules_block() runs on every AI turn: it must not re-read the
+        # file when the mtime hasn't changed, and must pick up edits.
+        rr.add_rule("cache me")
+        first = rr.rules_block()
+        self.assertIn("cache me", first)
+        mtime_before = os.path.getmtime(rr.PATH)
+        # Rewrite identical content with a forced newer mtime.
+        with open(rr.PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        new_mtime = mtime_before + 5
+        with open(rr.PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.utime(rr.PATH, (new_mtime, new_mtime))
+        # Patch load_rules to count disk reads.
+        reads = []
+        orig_load = rr.load_rules
+        try:
+            rr.load_rules = lambda: reads.append(1) or orig_load()
+            # mtime changed -> one re-read, same content.
+            self.assertEqual(rr.rules_block(), first)
+            self.assertEqual(len(reads), 1)
+            # mtime unchanged -> served from cache, no disk read.
+            self.assertEqual(rr.rules_block(), first)
+            self.assertEqual(len(reads), 1)
+        finally:
+            rr.load_rules = orig_load
+        # A real edit invalidates the cache.
+        rr.add_rule("second rule")
+        self.assertIn("second rule", rr.rules_block())
 
 
 if __name__ == "__main__":

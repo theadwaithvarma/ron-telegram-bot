@@ -19,14 +19,23 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+REPO = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, REPO)
 
 import ron_ai
 import ron_daemon
+# NOTE (AGENTS.md): ron_daemon inserts the LIVE dir at sys.path[0] on
+# import, so `import ron_vision` above would pin the LIVE copy. Evict
+# and re-import the repo copy, then rewire the daemon's module global.
+sys.modules.pop("ron_vision", None)
+sys.path.insert(0, REPO)
 import ron_vision
+ron_daemon.ron_vision = ron_vision
+assert "ron-telegram-bot" in ron_vision.__file__, ron_vision.__file__
 
 OWNER = ron_daemon.OWNER_ID
 USER_A = 111111
@@ -106,6 +115,18 @@ class TestVisionLimits(unittest.TestCase):
                         return_value=1_000_000.0 + old):
             allowed, _ = ron_vision.check_limit(USER_A, OWNER)
             self.assertTrue(allowed)
+
+    def test_check_is_read_only_when_nothing_pruned(self):
+        # check_limit() must not rewrite the file when pruning drops
+        # nothing — a check is pure read (2 file I/Os saved per turn).
+        allowed, _ = ron_vision.check_limit(USER_A, OWNER)
+        self.assertTrue(allowed)
+        mtime1 = os.path.getmtime(ron_vision.LIMIT_FILE)
+        with mock.patch("time.time", return_value=time.time() + 5):
+            allowed, _ = ron_vision.check_limit(USER_A, OWNER)
+        self.assertTrue(allowed)
+        mtime2 = os.path.getmtime(ron_vision.LIMIT_FILE)
+        self.assertEqual(mtime1, mtime2)
 
     def test_per_user_isolation(self):
         for _ in range(5):

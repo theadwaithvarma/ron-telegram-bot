@@ -51,8 +51,11 @@ def _handle_signal(signum, frame):
     _RUNNING = False
 
 
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
+def _install_signal_handlers():
+    # Installed at main() entry, not import time — importing this module
+    # from a test/REPL must not hijack the process's signal handlers.
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
 
 
 def log(msg):
@@ -250,15 +253,9 @@ def start_daemon():
     pids = daemon_pids()
     if pids:
         log(f"daemon up, pid={pids[0]}")
-        # Deep-fix (2026-09-21): the daemon previously ran with oom_score
-        # ~670 — first in line if the box ever faces memory pressure.
-        # Deprioritize it (and the watchdog below in check_once) so
-        # random kills pick almost anything else first.
-        try:
-            with open(f"/proc/{pids[0]}/oom_score_adj", "w") as f:
-                f.write("-500")
-        except OSError:
-            pass
+        # NOTE (2026-09-22): OOM tuning was removed — this container has no
+        # CAP_SYS_RESOURCE, so oom_score_adj writes always fail silently.
+        # (AGENTS.md: "Container restarts: the deep fix".)
         return True
     log("daemon did not appear after launch")
     return False
@@ -361,6 +358,7 @@ def check_once():
 
 
 def main():
+    _install_signal_handlers()
     mode = sys.argv[1] if len(sys.argv) > 1 else "--once"
     log(f"watchdog {mode} (pid={os.getpid()})")
     if mode == "--loop":

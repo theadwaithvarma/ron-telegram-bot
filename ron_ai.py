@@ -291,7 +291,7 @@ def _breaker_reset(name):
         _provider_5xx_streak.pop(name, None)
 
 
-def _breaker_note_5xx(name, status):
+def _breaker_note_5xx(name):
     """Record a 5xx from this provider. Once the consecutive streak hits
     BREAKER_TRIP_STREAK, the breaker trips: the shared cooldown dict gets
     an entry so the plan builder skips this provider, and the streak
@@ -347,9 +347,10 @@ PROVIDER_DEFS = {
 # under "providers". Groq stays first — it's the fastest when healthy.
 DEFAULT_PROVIDERS = [
     {"name": "groq", "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]},
-    {"name": "gemini", "models": ["gemini-2.0-flash"]},
-    {"name": "openrouter", "models": ["meta-llama/llama-3.3-70b-instruct:free",
-                                      "openai/gpt-oss-120b:free"]},
+    {"name": "gemini", "models": ["gemini-3.8-flash",
+                                  "gemini-flash-lite-latest"]},
+    {"name": "openrouter", "models": ["nex-agi/nex-n2.5-pro:free",
+                                      "nvidia/nemotron-3.5-lightning:free"]},
 ]
 # Token economy (2026-09-20, Phase 2): trivial messages — greetings and
 # small talk — don't need the 120b model or the full 440-word system prompt.
@@ -361,17 +362,31 @@ _CHEAP_MODELS = {
     "gemini": "gemini-flash-lite-latest",
     "openrouter": "nex-agi/nex-n2.5-pro:free",
 }
-_TRIVIAL_RE = re.compile(
-    r"^(hi+|hello+|hey+|yo|sup|howdy|namaste|vanakkam|"
-    r"how are you|how r u|hows it going|how's it going|whats up|what's up|"
-    r"who are you|who r u|"
-    r"good morning|good afternoon|good evening)\b[.!?~]*$", re.IGNORECASE)
+# Greeting regex lives in ron_routing (single source of truth); this is the
+# fallback used when the routing module is unavailable.
+_TRIVIAL_RE = None
+
+
+def _trivial_re():
+    global _TRIVIAL_RE
+    if _TRIVIAL_RE is None:
+        mod = globals().get("ron_routing")
+        if mod is not None and hasattr(mod, "_CHEAP_GREETING_RE"):
+            _TRIVIAL_RE = mod._CHEAP_GREETING_RE
+        else:
+            _TRIVIAL_RE = re.compile(
+                r"^(hi+|hello+|hey+|yo|sup|howdy|namaste|vanakkam|"
+                r"how are you|how r u|hows it going|how's it going|whats up|what's up|"
+                r"who are you|who r u|"
+                r"good morning|good afternoon|good evening|good night)"
+                r"\b[.!?~]*$", re.IGNORECASE)
+    return _TRIVIAL_RE
 
 
 def _looks_trivial(text):
     """True for greetings/small-talk that a small model can handle."""
     t = (text or "").strip()
-    return len(t) <= 80 and bool(_TRIVIAL_RE.match(t))
+    return len(t) <= 80 and bool(_trivial_re().match(t))
 
 
 # Hard ceiling: if the SSE stream yields no data tokens for this long, the
@@ -506,8 +521,10 @@ def _request(cfg, messages, stream, timeout, tier="standard"):
     """POST /chat/completions with multi-provider failover.
 
     Tries each provider in order, each of its models in order. Per model:
-    try, on 429/5xx/network error wait RETRY_BACKOFF_SECS and retry once,
-    then fail over to the next model/provider. A 401/403 skips the rest of
+    on 429: cool the provider down and fail over immediately (no sleep —
+    sleeping on 429s was the v1.26.1 latency bug); on 5xx/network error:
+    wait RETRY_BACKOFF_SECS and retry once, then fail over to the next
+    model/provider. A 401/403 skips the rest of
     that provider (bad key — another model won't fix it); a model-not-found
     skips just that model. Returns a _PooledResponse holding the API
     semaphore until closed. Raises RateLimitedError (message contains
@@ -642,7 +659,7 @@ def _request(cfg, messages, stream, timeout, tier="standard"):
                 # Transient (5xx) or deterministic (bad model/params):
                 # one retry after backoff for 5xx only, then move on.
                 if 500 <= status < 600:
-                    if _breaker_note_5xx(name, status):
+                    if _breaker_note_5xx(name):
                         print(f"[ron_ai] circuit breaker TRIPPED for "
                               f"{name}: {BREAKER_TRIP_STREAK}+ consecutive "
                               f"5xx, skipping it for "
@@ -852,7 +869,7 @@ def _prompt_turns(chat_id, user_text, user_name):
     return turns[-PROMPT_RECENT:], summary
 
 
-def _maybe_rollover(chat_id, stored, prior_summary):
+def _maybe_rollover(chat_id, prior_summary):
     """Fold the oldest half of a chat's stored turns into its summary.
 
     Reads history fresh under the lock (another reply thread may have
@@ -914,9 +931,7 @@ def _maybe_rollover_async(chat_id, prior_summary):
 
     def _run():
         try:
-            # _maybe_rollover re-reads history itself; the `stored` arg
-            # is unused, so None is fine here.
-            _maybe_rollover(chat_id, None, prior_summary)
+            _maybe_rollover(chat_id, prior_summary)
         except Exception:
             pass
         finally:
@@ -987,11 +1002,15 @@ def _route_tier(user_text, cfg):
     return "cheap" if _use_cheap(user_text, cfg) else "standard"
 
 
-def _maybe_tools(messages, user_text, tier):
+def _maybe_tools(messages, user_text, tier, ctx=None):
     """v1.28.0 Track B: run the agentic tool loop (search/weather/news/
     calendar/reminders) when the model wants tool help. Returns the
     messages list with a tool-results block appended, or the list
-    unchanged. Never raises; skipped for cheap small-talk."""
+    unchanged. Never raises; skipped for cheap small-talk.
+
+    ctx carries user_id/chat_id/tz so acting tools (reminders) store
+    under the real user instead of user 0 / chat 0.
+    """
     if ron_tools is None or tier == "cheap":
         return messages
     try:
@@ -999,7 +1018,7 @@ def _maybe_tools(messages, user_text, tier):
             ron_tools.REMINDER_REQUEST_RE.search(user_text or ""))
         block = ron_tools.maybe_run_tools(
             messages, lambda ms: _complete_once(ms, tier),
-            user_text=user_text, allow_acting=allow_acting)
+            user_text=user_text, allow_acting=allow_acting, ctx=ctx)
     except Exception:
         block = None
     if block:
@@ -1042,7 +1061,8 @@ def chat(chat_id, user_text, user_name="there", system_extra="",
     messages = [{"role": "system", "content": system}] + turns
     # v1.28.0 Track B: tool help (web search, weather, news, calendar,
     # reminders) before the main request.
-    messages = _maybe_tools(messages, user_text, tier)
+    tool_ctx = {"user_id": user_id, "chat_id": chat_id}
+    messages = _maybe_tools(messages, user_text, tier, ctx=tool_ctx)
 
     try:
         # 120s: reasoning models can think a while before the first token
@@ -1273,7 +1293,8 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
               else cfg["system"]) + who + summary_block + (system_extra or "") + mem_extra + rules_extra
     messages = [{"role": "system", "content": system}] + turns
     # v1.28.0 Track B: tool help before the main (streaming) request.
-    messages = _maybe_tools(messages, user_text, tier)
+    tool_ctx = {"user_id": user_id, "chat_id": chat_id}
+    messages = _maybe_tools(messages, user_text, tier, ctx=tool_ctx)
 
     try:
         resp = _request(cfg, messages, stream=True, timeout=120, tier=tier)

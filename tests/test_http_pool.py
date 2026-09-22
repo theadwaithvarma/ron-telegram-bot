@@ -123,6 +123,22 @@ class PoolTest(unittest.TestCase):
         pool.post("/botX/getMe", b"", "application/x-www-form-urlencoded")
         self.assertEqual(len(FakeConn.instances), 2)
 
+    def test_no_retry_when_getresponse_fails(self):
+        """getresponse() failed after a full write — the server may have
+        processed the POST. Must raise, not retry (no duplicate send)."""
+        pool = self._pool()
+        pool.post("/botX/getMe", b"", "application/x-www-form-urlencoded")
+        conn = FakeConn.instances[0]
+        with mock.patch.object(
+                FakeConn, "getresponse",
+                side_effect=ConnectionResetError("reset after write")):
+            with self.assertRaises(ConnectionResetError):
+                pool.post("/botX/sendMessage", b"a=1",
+                          "application/x-www-form-urlencoded")
+        # The write fully succeeded exactly once — no duplicate POST.
+        self.assertEqual(len(conn.requests), 2)  # getMe + one sendMessage
+        self.assertEqual(len(FakeConn.instances), 1)  # no fresh conn made
+
     def test_non_200_returned_not_raised(self):
         pool = self._pool()
 

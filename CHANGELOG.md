@@ -1,3 +1,81 @@
+## 1.28.1 — Massive diagnosis: audit fixes + hardening (2026-09-22)
+
+Full end-to-end code scan (all modules) after v1.28.0, with fixes for
+everything the audit found that was safely testable. No features
+removed; every change has a regression test. Suite: 1043 tests, only
+the 4 pre-existing baseline failures (test_buttons, test_heal,
+test_backup/test_summary loaders).
+
+Daemon (ron_daemon.py):
+- Business recovery: failed lookups now cached 5 min (negative cache),
+  so a stream of messages on a dead connection doesn't burn a
+  getBusinessConnection call per message.
+- Stale digest: the day is marked digested only after a successful send
+  (or when empty) — a failed 09:00 digest retries on the next hourly
+  pass instead of silently skipping the day.
+- Apology cooldown: now updates only after send_markup succeeds — a
+  failed offer no longer eats the next episode's cooldown.
+- Streaming: on_token no longer joins the whole buffer per token
+  (was O(n^2)); running length tracked instead.
+- Removed dead code: unused urllib.request import, dead demo_more
+  branch, dead TRAILER_LINE_RE, redundant local re/time imports,
+  duplicate frm assignment, try/except that couldn't throw; docstring
+  updated (multi-provider brain, systemd/watchdog launch).
+- _stale_save now uses the shared _atomic_write_json.
+
+Brain (ron_ai.py):
+- Tools now receive real user_id/chat_id/ctx — reminders created via
+  the tool loop store under the real user/chat instead of 0/0.
+- _request docstring corrected: 429 fails over instantly, 5xx/network
+  gets one delayed retry.
+- DEFAULT_PROVIDERS refreshed (stale model names replaced).
+- Greeting regex shared with ron_routing (incl. "good night").
+- Removed unused _breaker_note_5xx(status) and _maybe_rollover(stored)
+  params.
+
+Memory (ron_memory.py):
+- FTS rowid prefetches capped (5000, relevance/recency ordered) and
+  all unbounded IN (...) clauses chunked — SQLite's 32766 variable
+  ceiling can never be hit, however large a chat grows.
+
+Tools (ron_tools.py):
+- Removed the one-word tool guard: pure acks are already intercepted
+  by the daemon's zero-cost canned replies before the AI path, and
+  cheap small-talk skips tools by tier — a bare "weather"/"news" now
+  reaches the probe it exists for.
+- Reminder id creation is atomic across threads (no duplicate ids).
+- Failed reminder deliveries back off exponentially (5/10/20.../60min
+  cap) instead of firing+logging every minute.
+
+HTTP (http_pool.py):
+- No retry when getresponse() fails after the request was written —
+  eliminates a duplicate non-idempotent POST path. (Conservative:
+  retry only when the failure provably happened before any byte hit
+  the wire.)
+
+Watchdog (ron_watchdog.py):
+- Removed the oom_score_adj write (container lacks CAP_SYS_RESOURCE;
+  it always failed silently).
+- Signal handlers installed in main(), not at import time.
+
+Per-turn savings:
+- check_limit (vision/imagen): no file rewrite when pruning drops
+  nothing (2 I/Os saved per check).
+- rules_block(): mtime-cached — no disk read + JSON parse per AI turn
+  when owner_rules.json hasn't changed.
+
+Tests:
+- Fixed sys.path poisoning in test_imagen/test_vision/test_tools/
+  test_owner_rules — they were silently exercising the LIVE copies
+  instead of the repo's (AGENTS.md pattern: evict + re-import).
+- test_business_recovery now also redirects BUSINESS_STALE_FILE
+  (a fixture had leaked into the production business_stale.json;
+  the leaked entry was removed from live state).
+- New regressions: business negative cache, digest send-failure
+  retry, apology cooldown on failed send, reminder backoff, reminder
+  id uniqueness under threads, check_limit read-only, rules_block
+  mtime cache, FTS cap + IN-chunking, http no-retry-after-write.
+
 ## 1.28.0 — Smarter bot: memory, tools, difficulty routing (2026-09-22)
 
 Adwaith asked for a much smarter bot ("do the full upgrade", no extra

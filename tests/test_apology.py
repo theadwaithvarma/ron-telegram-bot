@@ -109,6 +109,22 @@ class ApologyOfferTest(unittest.TestCase):
         self.assertIn((111, None), pending)
         self.assertIn((222, "bc1"), pending)
 
+    def test_failed_offer_does_not_consume_cooldown(self):
+        # If send_markup raises, the cooldown must NOT update — the next
+        # episode's offer isn't eaten by a failed send.
+        self._start_outage(mins_ago=30)
+        ron_daemon._degraded["active"] = False
+        ron_daemon._LAST_OUTAGE_SINCE = time.time() - 30 * 60
+        with mock.patch.object(ron_daemon, "send_markup",
+                               side_effect=RuntimeError("net down")):
+            ron_daemon._maybe_offer_apology([(123, None)])
+        self.assertEqual(ron_daemon._apology_last_offer, 0)
+        # A later episode can still offer.
+        ron_daemon._LAST_OUTAGE_SINCE = time.time() - 10 * 60
+        ron_daemon._maybe_offer_apology([(123, None)])
+        self.assertEqual(len(self.markups), 1)
+        self.assertGreater(ron_daemon._apology_last_offer, 0)
+
     def test_no_offer_without_outage(self):
         # Pure bake drain (degraded never on): no apology offer.
         self._seed_queue([_queue_entry(111)])

@@ -141,12 +141,6 @@ def _prune_days_locked():
         del _stats[d]
 
 
-def note_in(chat_id):
-    """One inbound message seen. Cheap: dict increments under a lock."""
-    with _LOCK:
-        _day_entry_locked(day_key())["in"] += 1
-
-
 def note_out():
     """One outbound message sent (called from the daemon's send())."""
     with _LOCK:

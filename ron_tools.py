@@ -113,10 +113,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -347,11 +348,6 @@ def get_news(topic=None, count=6):
 # Tool 4: reminders — local persistent store + daemon delivery interface
 # ---------------------------------------------------------------------------
 
-def _state_path(name):
-    d = STATE_DIR
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, name)
-
 
 def _now_utc():
     return datetime.now(timezone.utc)
@@ -423,6 +419,8 @@ def _parse_reminder_time(text, now=None, tz_name=USER_TZ):
 class ReminderStore:
     """JSON-backed reminder store. Point STATE_DIR at a temp dir in tests."""
 
+    _LOCK = threading.Lock()  # serializes load-compute-save across threads
+
     def __init__(self, state_dir=None):
         self.path = os.path.join(state_dir or STATE_DIR, REMINDERS_FILE)
 
@@ -449,14 +447,15 @@ class ReminderStore:
         if not text:
             raise ToolError("What should I remind you about?")
         dt = _parse_reminder_time(when, tz_name=tz_name)
-        items = self._load()
-        rid = max([r.get("id", 0) for r in items] + [0]) + 1
-        rem = {"id": rid, "user_id": user_id, "chat_id": chat_id,
-               "text": text, "remind_at": dt.isoformat(),
-               "created_at": _now_utc().isoformat(), "fired": False,
-               "repeat": None}
-        items.append(rem)
-        self._save(items)
+        with ReminderStore._LOCK:
+            items = self._load()
+            rid = max([r.get("id", 0) for r in items] + [0]) + 1
+            rem = {"id": rid, "user_id": user_id, "chat_id": chat_id,
+                   "text": text, "remind_at": dt.isoformat(),
+                   "created_at": _now_utc().isoformat(), "fired": False,
+                   "repeat": None}
+            items.append(rem)
+            self._save(items)
         _log(f"reminder #{rid} created for {dt.isoformat()}")
         return rem
 
@@ -504,29 +503,53 @@ def set_delivery_handler(fn):
     _delivery_handler = fn
 
 
+_DELIVERY_FAILURES = {}  # reminder id -> [consecutive_fails, next_retry_ts]
+_DELIVERY_BACKOFF_CAP = 3600  # max 1h between retries of a failing reminder
+
+
+def _note_delivery_failure(rid, now_ts, msg):
+    """Log a delivery failure and back off: 5min, 10min, 20min ... 1h cap."""
+    fails, _ = _DELIVERY_FAILURES.get(rid, (0, 0))
+    fails += 1
+    backoff = min(300 * (2 ** (fails - 1)), _DELIVERY_BACKOFF_CAP)
+    _DELIVERY_FAILURES[rid] = (fails, now_ts + backoff)
+    _log(f"{msg} (attempt {fails}; retrying in {backoff // 60} min)")
+
+
 def check_due(now=None, store=None):
     """Fire every due reminder through the delivery handler.
 
     The daemon calls this ~once a minute. Returns the number fired.
-    Never raises into the daemon loop: handler exceptions are logged and
-    the reminder stays unfired for the next pass."""
+    Never raises into the daemon loop: handler failures are logged with
+    exponential backoff (so a persistently failing handler doesn't
+    log-spam every minute) and the reminder stays unfired for the next
+    pass."""
     handler = _delivery_handler
     if handler is None:
         return 0
     store = store or ReminderStore()
+    now_ts = time.time()
     fired = 0
     for rem in store.due(now=now):
+        rid = rem.get("id")
+        fails, next_ts = _DELIVERY_FAILURES.get(rid, (0, 0))
+        if now_ts < next_ts:
+            continue  # in backoff — stay quiet
         try:
             ok = handler(dict(rem))
         except Exception as e:  # noqa: BLE001 — daemon must not die here
-            _log(f"delivery handler failed for reminder #{rem.get('id')}: {e}")
+            _note_delivery_failure(rid, now_ts,
+                                   f"delivery handler failed for reminder "
+                                   f"#{rid}: {e}")
             continue
         if ok:
+            _DELIVERY_FAILURES.pop(rid, None)
             store.mark_fired(rem["id"])
             fired += 1
         else:
-            _log(f"delivery handler returned False for reminder "
-                 f"#{rem.get('id')}")
+            _note_delivery_failure(rid, now_ts,
+                                   "delivery handler returned False for "
+                                   f"reminder #{rid}")
     return fired
 
 
@@ -956,10 +979,11 @@ def maybe_run_tools(messages, complete_fn, user_text="", allow_acting=False,
     loop early. Hard caps: max_passes probe passes, MAX_CALLS_PER_PASS
     executions per pass, PASS_TIMEOUT seconds per pass.
     """
-    # Cheap-talk guard lives with the integrator; double-guard here anyway:
-    # tool calls for one-word acks are pure waste.
-    if len((user_text or "").split()) < 2:
-        return None
+    # Note: no one-word guard here. Pure acks ("ok", "thanks", "👍") never
+    # reach the tool loop — the daemon answers them with a zero-cost canned
+    # reply before the AI path — and cheap small-talk is skipped by the
+    # integrator (tier == "cheap"). A bare "weather" or "news" is exactly
+    # the query these tools exist for.
     # Acting gate: the model may still ask, but without allow_acting the
     # acting calls are refused inside execute_tool_call. Additionally, if
     # the user text doesn't look like an explicit reminder request, force

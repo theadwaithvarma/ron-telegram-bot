@@ -974,5 +974,66 @@ class WipeUserTest(unittest.TestCase):
             ).fetchone()[0], 1)
 
 
+
+class InChunksTest(unittest.TestCase):
+    """SQLite's 32766 host-parameter ceiling must never be hit, no matter
+    how many ids an IN (...) clause carries."""
+
+    def setUp(self):
+        os.environ[ron_memory.KEY_ENV] = TEST_KEY
+
+    def test_fetch_chunks_large_id_list(self):
+        import sqlite3
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        n = 70000
+        db.executemany("INSERT INTO t VALUES (?, ?)",
+                       [(i, f"v{i}") for i in range(n)])
+        rows = ron_memory._in_chunks(
+            db, "SELECT id FROM t WHERE id IN ({q})", list(range(n)))
+        self.assertEqual(len(rows), n)
+        self.assertEqual(rows[0][0], 0)
+        self.assertEqual(rows[-1][0], n - 1)
+
+    def test_write_chunks_sum_rowcounts(self):
+        import sqlite3
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        n = 40000
+        db.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(n)])
+        deleted = ron_memory._in_chunks(
+            db, "DELETE FROM t WHERE id IN ({q})", list(range(n)),
+            fetch=False)
+        self.assertEqual(deleted, n)
+        self.assertEqual(
+            db.execute("SELECT COUNT(*) FROM t").fetchone()[0], 0)
+
+    def test_empty_id_list(self):
+        import sqlite3
+        db = sqlite3.connect(":memory:")
+        self.assertEqual(ron_memory._in_chunks(db, "SELECT 1 WHERE 1 IN ({q})",
+                                              []), [])
+        self.assertEqual(ron_memory._in_chunks(db, "SELECT 1 WHERE 1 IN ({q})",
+                                              [], fetch=False), 0)
+
+    def test_fts_recall_capped(self):
+        # The FTS rowid prefetch behind recall() is capped — a common
+        # term matching thousands of rows can't blow the variable limit.
+        store, path = fresh_store()
+        try:
+            cid = "capchat"
+            for i in range(300):
+                store.record_message(cid, 42, "u", f"common word message {i}")
+            hits = store.recall(cid, "common", limit=5)
+            self.assertLessEqual(len(hits), 5)
+            self.assertTrue(hits)
+        finally:
+            store.close()
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

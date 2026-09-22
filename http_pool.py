@@ -68,6 +68,12 @@ def _close_quietly(conn):
         pass
 
 
+class _RetryableConnError(Exception):
+    """The pooled connection died while WRITING the request (stale idle
+    connection closed by the server). The server never saw the bytes, so
+    retrying on a fresh connection cannot duplicate the send."""
+
+
 class _ConnPool:
     """Keep-alive connection pool for one HTTPS host."""
 
@@ -101,11 +107,22 @@ class _ConnPool:
             _close_quietly(conn)
 
     def _request_once(self, method, path, body, headers, timeout):
-        """One attempt: returns (conn, resp), or raises on conn failure."""
+        """One attempt: returns (conn, resp).
+
+        Raises _RetryableConnError when the pooled connection died during
+        the write (stale idle connection — safe to retry fresh). Raises
+        the original exception when getresponse() failed (the request was
+        fully written; the server may have processed it — the caller must
+        NOT retry, or a POST like sendMessage could land twice).
+        """
         conn = self._checkout()
         try:
             conn.timeout = timeout
             conn.request(method, path, body=body, headers=headers)
+        except Exception as e:
+            _close_quietly(conn)
+            raise _RetryableConnError(e) from e
+        try:
             return conn, conn.getresponse()
         except Exception:
             _close_quietly(conn)
@@ -116,7 +133,7 @@ class _ConnPool:
 
         headers is the full header dict (must include Content-Type when a
         body is sent). Retries once on a stale pooled connection — only
-        when no response arrived, so nothing is ever sent twice.
+        when the write itself failed, so a POST is never sent twice.
         """
         hdrs = dict(headers or {})
         hdrs.setdefault("User-Agent", _USER_AGENT)
@@ -133,14 +150,22 @@ class _ConnPool:
                         conn.timeout = timeout
                         conn.request(method, path, body=body, headers=hdrs)
                         resp = conn.getresponse()
+                    except _RetryableConnError as e:
+                        _close_quietly(conn)
+                        last_err = e
+                        continue
                     except Exception:
                         _close_quietly(conn)
                         raise
-            except Exception as e:
-                # Nothing came back — the pooled connection was probably
-                # closed by the server while idle. Discard and retry fresh.
+            except _RetryableConnError as e:
+                # Stale pooled connection died on write — the server never
+                # saw the bytes. Discard and retry once on a fresh conn.
                 last_err = e
                 continue
+            except Exception:
+                # getresponse() failed: the request was fully written and
+                # the server may have processed it — do NOT retry.
+                raise
             try:
                 data = resp.read()  # must fully drain before reuse
             except Exception as e:
@@ -190,9 +215,15 @@ class _ConnPool:
                     except Exception:
                         _close_quietly(conn)
                         raise
-            except Exception as e:
+            except _RetryableConnError as e:
+                # Stale pooled connection died on write — safe to retry
+                # fresh; the server never saw the bytes.
                 last_err = e
                 continue
+            except Exception:
+                # getresponse() failed after a full write — the send may
+                # have landed. Never retry; surface it.
+                raise
             return _PooledStream(self, conn, resp)
         raise last_err
 

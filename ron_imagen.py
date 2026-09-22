@@ -345,8 +345,11 @@ def check_limit(user_id, owner_id, now=None):
         key = str(user_id)
         uses = [t for t in d.get(key, [])
                 if isinstance(t, (int, float)) and now - t < LIMIT_WINDOW_SECS]
-        d[key] = uses
-        _save_limits(d)
+        if uses != d.get(key, []):
+            # Only write when pruning actually dropped something — a
+            # check is otherwise pure read (2 file I/Os saved per turn).
+            d[key] = uses
+            _save_limits(d)
     if len(uses) < LIMIT_N:
         return True, 0.0
     oldest = min(uses)

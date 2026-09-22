@@ -105,6 +105,22 @@ class StaleRadarTest(unittest.TestCase):
         self.assertFalse(ron_daemon._stale_maybe_digest(now=TUE_0930_IST + 60))
         self.assertEqual(len(self.sent), 1)
 
+    def test_maybe_digest_failed_send_retries_next_pass(self):
+        # A failed send must NOT mark the day digested — the digest
+        # retries on the next hourly pass instead of skipping the day.
+        ron_daemon._stale_note_incoming("1", "Cust", "hello?",
+                                        now=TUE_0930_IST - 30 * 3600)
+        with mock.patch.object(ron_daemon, "send",
+                               side_effect=RuntimeError("net down")):
+            self.assertFalse(ron_daemon._stale_maybe_digest(now=TUE_0930_IST))
+        store = ron_daemon._stale_load()
+        self.assertNotEqual(store.get("last_digest_day"), "2026-09-22")
+        # Next pass, send works: digest goes out, day marked.
+        self.assertTrue(ron_daemon._stale_maybe_digest(now=TUE_0930_IST + 60))
+        self.assertEqual(len(self.sent), 1)
+        store = ron_daemon._stale_load()
+        self.assertEqual(store.get("last_digest_day"), "2026-09-22")
+
     def test_maybe_digest_silent_when_empty(self):
         self.assertFalse(ron_daemon._stale_maybe_digest(now=TUE_0930_IST))
         self.assertEqual(self.sent, [])

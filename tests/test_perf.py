@@ -202,7 +202,7 @@ class AsyncRolloverTest(unittest.TestCase):
         released = threading.Event()
         calls = []
 
-        def fake_rollover(chat_id, stored, prior):
+        def fake_rollover(chat_id, prior):
             calls.append(chat_id)
             blocked.set()          # worker started...
             released.wait(timeout=15)  # ...then stuck here
@@ -235,7 +235,7 @@ class AsyncRolloverTest(unittest.TestCase):
         release = threading.Event()
         calls = []
 
-        def fake_rollover(chat_id, stored, prior):
+        def fake_rollover(chat_id, prior):
             calls.append(chat_id)
             started.set()
             release.wait(timeout=15)

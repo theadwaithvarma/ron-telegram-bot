@@ -21,7 +21,14 @@ from datetime import datetime, timedelta, timezone
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
 
+# NOTE (AGENTS.md): under `unittest discover`, an alphabetically-earlier
+# test module may have imported ron_daemon first, which inserts the LIVE
+# dir (~/workspace/telegram-bot) at sys.path[0] — pinning the LIVE
+# ron_tools in sys.modules. Evict it and re-import the repo copy.
+sys.modules.pop("ron_tools", None)
+sys.path.insert(0, REPO)
 import ron_tools
+assert "ron-telegram-bot" in ron_tools.__file__, ron_tools.__file__
 from ron_tools import (
     CalendarNotConfigured,
     GwsCliCalendarProvider,
@@ -255,6 +262,69 @@ class ReminderStoreTest(unittest.TestCase):
             self.store.cancel(999, 7)
         with self.assertRaises(ToolError):
             self.store.cancel(r["id"], 12345)  # other user
+
+    def test_concurrent_creates_get_unique_ids(self):
+        # load -> pick id -> save is one atomic step; N threads racing
+        # must not mint duplicate reminder ids.
+        import threading
+        n = 20
+        made, errors = [], []
+
+        def worker(i):
+            try:
+                made.append(self.store.create(7, 8, f"task {i}",
+                                              "in 10 minutes"))
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        ids = [r["id"] for r in made]
+        self.assertEqual(len(ids), n)
+        self.assertEqual(len(set(ids)), n)  # no duplicates
+
+    def test_delivery_failure_backs_off(self):
+        # A failing handler backs off (5min, 10min...) instead of
+        # firing+logging every minute; a success clears the backoff.
+        ron_tools._DELIVERY_FAILURES.clear()
+        ron_tools._delivery_handler = lambda rem: False
+        rem = self.store.create(7, 8, "backoff me", "in 1 minute")
+        # Make it due now.
+        all_rems = self.store._load()
+        for r in all_rems:
+            if r["id"] == rem["id"]:
+                r["remind_at"] = "2000-01-01T00:00:00+00:00"
+        self.store._save(all_rems)
+
+        import time as _t
+        with mock.patch.object(ron_tools.time, "time",
+                               return_value=1_700_000_000.0):
+            self.assertEqual(ron_tools.check_due(store=self.store), 0)
+            fails, next_ts = ron_tools._DELIVERY_FAILURES[rem["id"]]
+            self.assertEqual(fails, 1)
+            self.assertEqual(next_ts, 1_700_000_000.0 + 300)
+            # Still in backoff: no second attempt, no extra log spam.
+            self.assertEqual(ron_tools.check_due(store=self.store), 0)
+            self.assertEqual(
+                ron_tools._DELIVERY_FAILURES[rem["id"]][0], 1)
+            # After the window, it retries with doubled backoff.
+            with mock.patch.object(
+                    ron_tools.time, "time",
+                    return_value=1_700_000_000.0 + 301):
+                self.assertEqual(ron_tools.check_due(store=self.store), 0)
+                fails, next_ts = ron_tools._DELIVERY_FAILURES[rem["id"]]
+                self.assertEqual(fails, 2)
+                self.assertEqual(next_ts, 1_700_000_000.0 + 301 + 600)
+        # Success clears the failure record and marks fired.
+        ron_tools._delivery_handler = lambda rem: True
+        self.assertEqual(ron_tools.check_due(store=self.store), 1)
+        self.assertNotIn(rem["id"], ron_tools._DELIVERY_FAILURES)
+        ron_tools._DELIVERY_FAILURES.clear()
 
     def test_persists_across_instances(self):
         r = self.store.create(7, 8, "persist me", "in 10 minutes")
@@ -509,12 +579,21 @@ class MaybeRunToolsTest(FetcherFixture):
     MSGS = [{"role": "system", "content": "sys"},
             {"role": "user", "content": "what's the weather in Bengaluru?"}]
 
-    def test_short_text_skips_tools(self):
+    def test_short_text_still_probes(self):
+        # No one-word guard: pure acks ("ok", "thanks") are intercepted by
+        # the daemon's zero-cost canned replies BEFORE the AI path, so
+        # maybe_run_tools always probes. A bare "weather" must reach the
+        # probe (it is exactly what the tools exist for).
         calls = []
         out = maybe_run_tools(self.MSGS, lambda m: calls.append(m) or "NONE",
                               user_text="ok")
         self.assertIsNone(out)
-        self.assertEqual(calls, [])
+        self.assertEqual(len(calls), 1)  # probed, model said NONE
+        calls.clear()
+        out = maybe_run_tools(self.MSGS, lambda m: calls.append(m) or "NONE",
+                              user_text="weather")
+        self.assertIsNone(out)
+        self.assertEqual(len(calls), 1)  # probed, not skipped
 
     def test_none_reply_returns_none(self):
         out = maybe_run_tools(self.MSGS, lambda m: "NONE",

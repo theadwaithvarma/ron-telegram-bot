@@ -108,11 +108,30 @@ def remove_rule(n):
     return removed.get("text")
 
 
+_BLOCK_CACHE = {}  # {"mtime": float, "block": str} — rules_block() cache
+
+
 def rules_block():
-    """Prompt-injection text for ron_ai, or '' when there are no rules."""
+    """Prompt-injection text for ron_ai, or '' when there are no rules.
+
+    Cached with an mtime check — this runs on every AI turn, and a
+    disk read + JSON parse per turn is pure waste when the file
+    hasn't changed.
+    """
+    global _BLOCK_CACHE
+    try:
+        mtime = os.path.getmtime(PATH)
+    except OSError:
+        mtime = 0
+    cached = _BLOCK_CACHE.get("block")
+    if cached is not None and _BLOCK_CACHE.get("mtime") == mtime:
+        return cached
     rules = load_rules()
     if not rules:
-        return ""
-    lines = ["[Owner's standing rules — always follow these:]"]
-    lines += [f"{i}. {r['text']}" for i, r in enumerate(rules, 1)]
-    return "\n".join(lines) + "\n"
+        block = ""
+    else:
+        lines = ["[Owner's standing rules — always follow these:]"]
+        lines += [f"{i}. {r['text']}" for i, r in enumerate(rules, 1)]
+        block = "\n".join(lines) + "\n"
+    _BLOCK_CACHE = {"mtime": mtime, "block": block}
+    return block

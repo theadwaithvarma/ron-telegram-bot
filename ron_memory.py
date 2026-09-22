@@ -391,6 +391,34 @@ def extract_fact_statements(text):
     return uniq
 
 
+_SQLITE_MAX_VARS = 30000  # under SQLite's 32766 host-parameter ceiling
+_FTS_ROWID_CAP = 5000  # max FTS rowid candidates pulled for one recall query
+
+
+def _in_chunks(db, sql, ids, extra_params=(), fetch=True):
+    """Run `sql` (one {} placeholder for the IN-list) over `ids` in chunks.
+
+    A huge id list in an IN (...) clause would exceed SQLite's bound
+    variable limit and raise; chunking keeps every statement under it.
+    Chunks concatenate fetchall() rows; for write statements pass
+    fetch=False and the rowcounts are summed instead.
+    """
+    ids = list(ids)
+    if not ids:
+        return [] if fetch else 0
+    out = [] if fetch else 0
+    step = max(1, _SQLITE_MAX_VARS - len(extra_params) - 1)
+    for i in range(0, len(ids), step):
+        chunk = ids[i:i + step]
+        q = ",".join("?" * len(chunk))
+        cur = db.execute(sql.format(q=q), (*chunk, *extra_params))
+        if fetch:
+            out.extend(cur.fetchall())
+        else:
+            out += cur.rowcount
+    return out
+
+
 class MemoryStore:
     """SQLite-backed, per-chat isolated, encrypted memory."""
 
@@ -540,8 +568,9 @@ class MemoryStore:
             # Two-step on purpose: contentless FTS5 tables do not support
             # being scanned, so never JOIN them — fetch matching rowids first.
             rids = [r[0] for r in self._db.execute(
-                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?",
-                (fq,)).fetchall()]
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?"
+                " ORDER BY rowid DESC LIMIT ?",
+                (fq, _FTS_ROWID_CAP)).fetchall()]
             if not rids:
                 return []
             q = ",".join("?" * len(rids))
@@ -562,7 +591,9 @@ class MemoryStore:
         """
         pairs = self._db.execute(
             "SELECT rowid, bm25(messages_fts) FROM messages_fts"
-            " WHERE messages_fts MATCH ?", (fq,)).fetchall()
+            " WHERE messages_fts MATCH ?"
+            " ORDER BY bm25(messages_fts) LIMIT ?",
+            (fq, _FTS_ROWID_CAP)).fetchall()
         if not pairs:
             return []
         score = {r: s for r, s in pairs}
@@ -609,16 +640,16 @@ class MemoryStore:
         if not ids:
             return 0
         with self._lock:
-            q = ",".join("?" * len(ids))
-            rows = self._db.execute(
-                f"SELECT id, text_enc FROM messages WHERE id IN ({q})",
-                ids).fetchall()
+            rows = _in_chunks(
+                self._db, "SELECT id, text_enc FROM messages WHERE id IN ({q})",
+                ids)
             for rid, enc in rows:
                 self._fts_delete("messages_fts", rid, self._dec(enc))
-            cur = self._db.execute(
-                f"DELETE FROM messages WHERE id IN ({q})", ids)
+            total = _in_chunks(
+                self._db, "DELETE FROM messages WHERE id IN ({q})",
+                ids, fetch=False)
             self._db.commit()
-            return cur.rowcount
+            return total
 
     def _fts_delete(self, fts_table, rowid, text):
         """Remove one row from a contentless FTS5 index.
@@ -760,11 +791,11 @@ class MemoryStore:
             ids.append(cur)
             cur = succ.get(cur)
         with self._lock:
-            q = ",".join("?" * len(ids))
-            rmap = {r[0]: r for r in self._db.execute(
+            rmap = {r[0]: r for r in _in_chunks(
+                self._db,
                 "SELECT id, kind, text_enc, note, superseded_by,"
-                " created_ts, updated_ts FROM facts"
-                f" WHERE id IN ({q})", ids).fetchall()}
+                " created_ts, updated_ts FROM facts WHERE id IN ({q})",
+                ids)}
         return [{"id": r[0], "kind": r[1], "text": self._dec(r[2]),
                  "note": r[3], "superseded_by": r[4], "chat_id": cid,
                  "created_ts": r[5], "updated_ts": r[6]}
@@ -777,8 +808,9 @@ class MemoryStore:
             if fq:
                 # Two-step: never JOIN a contentless FTS5 table.
                 rids = [r[0] for r in self._db.execute(
-                    "SELECT rowid FROM facts_fts WHERE facts_fts MATCH ?",
-                    (fq,)).fetchall()]
+                    "SELECT rowid FROM facts_fts WHERE facts_fts MATCH ?"
+                    " ORDER BY rowid DESC LIMIT ?",
+                    (fq, _FTS_ROWID_CAP)).fetchall()]
                 if not rids:
                     return []
                 q = ",".join("?" * len(rids))
@@ -846,16 +878,16 @@ class MemoryStore:
         if not ids:
             return 0
         with self._lock:
-            q = ",".join("?" * len(ids))
-            rows = self._db.execute(
-                f"SELECT id, text_enc FROM facts WHERE id IN ({q})",
-                ids).fetchall()
+            rows = _in_chunks(
+                self._db, "SELECT id, text_enc FROM facts WHERE id IN ({q})",
+                ids)
             for rid, enc in rows:
                 self._fts_delete("facts_fts", rid, self._dec(enc))
-            cur = self._db.execute(
-                f"DELETE FROM facts WHERE id IN ({q})", ids)
+            total = _in_chunks(
+                self._db, "DELETE FROM facts WHERE id IN ({q})",
+                ids, fetch=False)
             self._db.commit()
-            return cur.rowcount
+            return total
 
     def forget_detailed(self, chat_id, query):
         """Forget with a breakdown: {"facts", "messages", "consents",
@@ -882,16 +914,15 @@ class MemoryStore:
                 (fq,)).fetchall()]
             fids, mids = [], []
             if frids:
-                q = ",".join("?" * len(frids))
-                fids = [r[0] for r in self._db.execute(
-                    f"SELECT id FROM facts WHERE id IN ({q}) AND chat_id=?",
-                    (*frids, cid)).fetchall()]
+                fids = [r[0] for r in _in_chunks(
+                    self._db,
+                    "SELECT id FROM facts WHERE id IN ({q}) AND chat_id=?",
+                    frids, (cid,))]
             if mrids:
-                q = ",".join("?" * len(mrids))
-                mids = [r[0] for r in self._db.execute(
-                    f"SELECT id FROM messages WHERE id IN ({q})"
-                    " AND chat_id=?",
-                    (*mrids, cid)).fetchall()]
+                mids = [r[0] for r in _in_chunks(
+                    self._db,
+                    "SELECT id FROM messages WHERE id IN ({q}) AND chat_id=?",
+                    mrids, (cid,))]
             # Expand each matched fact to its full chain: forgetting one
             # version forgets the whole lineage (old contradictions and
             # newer replacements alike).
@@ -905,13 +936,13 @@ class MemoryStore:
         out["messages"] = self._delete_messages(mids)
         if fids:
             with self._lock:
-                q = ",".join("?" * len(fids))
-                out["consents"] = self._db.execute(
-                    f"DELETE FROM consents WHERE fact_id IN ({q})",
-                    fids).rowcount
-                out["pendings"] = self._db.execute(
-                    "DELETE FROM pending_approvals"
-                    f" WHERE fact_id IN ({q})", fids).rowcount
+                out["consents"] = _in_chunks(
+                    self._db, "DELETE FROM consents WHERE fact_id IN ({q})",
+                    fids, fetch=False)
+                out["pendings"] = _in_chunks(
+                    self._db,
+                    "DELETE FROM pending_approvals WHERE fact_id IN ({q})",
+                    fids, fetch=False)
                 self._db.commit()
         return out
 
@@ -1015,13 +1046,13 @@ class MemoryStore:
             # Orphan cleanup: consent / approval rows that pointed at the
             # wiped DM facts.
             if fids:
-                q = ",".join("?" * len(fids))
-                out["consents"] += self._db.execute(
-                    f"DELETE FROM consents WHERE fact_id IN ({q})",
-                    fids).rowcount
-                out["pendings"] += self._db.execute(
-                    "DELETE FROM pending_approvals"
-                    f" WHERE fact_id IN ({q})", fids).rowcount
+                out["consents"] += _in_chunks(
+                    self._db, "DELETE FROM consents WHERE fact_id IN ({q})",
+                    fids, fetch=False)
+                out["pendings"] += _in_chunks(
+                    self._db,
+                    "DELETE FROM pending_approvals WHERE fact_id IN ({q})",
+                    fids, fetch=False)
             self._db.commit()
             return out
 
@@ -1053,12 +1084,13 @@ class MemoryStore:
         if fids:
             # Orphan cleanup, same as forget_detailed().
             with self._lock:
-                q = ",".join("?" * len(fids))
-                self._db.execute(
-                    f"DELETE FROM consents WHERE fact_id IN ({q})", fids)
-                self._db.execute(
-                    "DELETE FROM pending_approvals"
-                    f" WHERE fact_id IN ({q})", fids)
+                _in_chunks(
+                    self._db, "DELETE FROM consents WHERE fact_id IN ({q})",
+                    fids, fetch=False)
+                _in_chunks(
+                    self._db,
+                    "DELETE FROM pending_approvals WHERE fact_id IN ({q})",
+                    fids, fetch=False)
                 self._db.commit()
         return n
 
@@ -1249,10 +1281,11 @@ class MemoryStore:
                 " WHERE status='pending' AND expires_ts<=?", (now,)).fetchall()
             ids = [r[0] for r in rows]
             if ids:
-                q = ",".join("?" * len(ids))
-                self._db.execute(
-                    f"UPDATE pending_approvals SET status='expired'"
-                    f" WHERE id IN ({q})", ids)
+                _in_chunks(
+                    self._db,
+                    "UPDATE pending_approvals SET status='expired'"
+                    " WHERE id IN ({q})",
+                    ids, fetch=False)
                 self._db.commit()
             return ids
 

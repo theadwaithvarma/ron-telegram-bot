@@ -3,13 +3,15 @@
 
 Replies to everyone: DMs from any user, and group messages that mention
 the bot or reply to it. (Owner-only pause was lifted 2026-09-20.)
-Replies use ron_ai.py (Groq backend), streaming live via rich drafts for
-long 1:1 answers, sent as native rich messages (Bot API 10.1
-sendRichMessage) with contextual quick-reply buttons.
+Replies use ron_ai.py (multi-provider brain: Groq -> Gemini -> OpenRouter
+with instant 429 failover), streaming live via native drafts for long
+1:1 answers, sent as native rich messages (Bot API 10.1 sendRichMessage)
+with contextual quick-reply buttons.
 Business / Secretary Mode: handles business_connection updates and answers
 business_message updates on the owner's business account.
 
-Run: nohup python3 ron_daemon.py >/tmp/ron_daemon.log 2>&1 &
+Run: managed by ron-watchdog.service (systemd); never launch with bare
+nohup/python — the watchdog owns restarts and the proxy environment.
 State: offset persisted to ~/workspace/telegram-bot/ron_daemon.offset
 """
 import datetime
@@ -20,7 +22,6 @@ import signal
 import sys
 import threading
 import time
-import urllib.request
 import urllib.parse
 
 import http_pool
@@ -642,7 +643,6 @@ def _maybe_offer_apology(replied_chats):
         return  # stale marker (e.g. a pure bake drain) — no apology
     if now - _apology_last_offer < _APOLOGY_OFFER_COOLDOWN:
         return
-    _apology_last_offer = now
     ep = str(int(since))
     seen = set()
     uniq = []
@@ -663,6 +663,7 @@ def _maybe_offer_apology(replied_chats):
     ]]}
     try:
         send_markup(OWNER_ID, text, kb)
+        _apology_last_offer = time.time()
         print(f"[ron_daemon] apology offered for episode {ep} "
               f"({len(uniq)} chats)", flush=True)
     except Exception as e:
@@ -878,10 +879,9 @@ def _deliver_reminder(rem):
 
 def _reminder_sweeper(rt):
     """Fire due reminders ~once a minute. Never raises."""
-    import time as _time
     while True:
         try:
-            _time.sleep(60)
+            time.sleep(60)
             rt.check_due()
         except Exception:
             pass
@@ -2043,6 +2043,10 @@ def handle_business_connection(bc):
         save_business_connections(conns)
 
 
+_BC_RECOVERY_MISS = {}  # conn_id -> ts of last failed recovery (5-min TTL)
+_BC_RECOVERY_MISS_TTL = 300
+
+
 def _recover_business_connection(conn_id):
     """Recover a missed business connection via getBusinessConnection.
 
@@ -2051,19 +2055,29 @@ def _recover_business_connection(conn_id):
     persists it in the same shape as handle_business_connection, and returns
     it. Returns None when the connection is disabled/unknown (caller keeps
     ignoring the message).
+
+    Failed lookups are cached for 5 minutes so a stream of messages on a
+    dead connection doesn't burn a getBusinessConnection call per message.
     """
+    now = time.time()
+    miss_ts = _BC_RECOVERY_MISS.get(conn_id)
+    if miss_ts and now - miss_ts < _BC_RECOVERY_MISS_TTL:
+        return None
     try:
         r = api("getBusinessConnection",
                 {"business_connection_id": conn_id}, timeout=20)
     except Exception as e:
         print(f"[ron_daemon] business recovery api error: {e}", flush=True)
+        _BC_RECOVERY_MISS[conn_id] = now
         return None
     if not r.get("ok"):
         print(f"[ron_daemon] business recovery failed for {conn_id}: "
               f"{str(r.get('error'))[:100]}", flush=True)
+        _BC_RECOVERY_MISS[conn_id] = now
         return None
     bc = r.get("result") or {}
     if not bc.get("is_enabled"):
+        _BC_RECOVERY_MISS[conn_id] = now
         return None
     rights = bc.get("rights") or {}
     can_reply = bc.get("can_reply")
@@ -2083,6 +2097,7 @@ def _recover_business_connection(conn_id):
         save_business_connections(conns)
     print(f"[ron_daemon] business connection {conn_id}: recovered via API, "
           f"can_reply={bool(can_reply)}", flush=True)
+    _BC_RECOVERY_MISS.pop(conn_id, None)
     return conn
 
 
@@ -2120,10 +2135,7 @@ def _stale_load():
 
 def _stale_save(store):
     try:
-        tmp = BUSINESS_STALE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(store, f, ensure_ascii=False)
-        os.replace(tmp, BUSINESS_STALE_FILE)
+        _atomic_write_json(BUSINESS_STALE_FILE, store)
     except Exception as e:
         print(f"[ron_daemon] stale radar save failed: {e}", flush=True)
 
@@ -2180,7 +2192,12 @@ def _stale_format_digest(items):
 
 def _stale_maybe_digest(now=None):
     """Hourly entry point: at ~09:00 IST, DM the owner the stale digest.
-    One digest per day max; silent when empty. Returns True if sent."""
+    One digest per day max; silent when empty. Returns True if sent.
+
+    The day is marked as digested only after a successful send (or when
+    the list is empty) — a failed send retries on the next hourly pass
+    instead of silently skipping the day.
+    """
     now = now if now is not None else time.time()
     ist = datetime.datetime.fromtimestamp(now, _IST)
     day = ist.strftime("%Y-%m-%d")
@@ -2191,14 +2208,19 @@ def _stale_maybe_digest(now=None):
         if ist.hour != _STALE_DIGEST_HOUR_IST:
             return False
         items = _stale_digest_list(now)
-        store["last_digest_day"] = day
-        _stale_save(store)
-    if not items:
-        return False
+        if not items:
+            # Nothing waiting: mark the day so we don't recompute hourly.
+            store["last_digest_day"] = day
+            _stale_save(store)
+            return False
     try:
         send(OWNER_ID, _stale_format_digest(items))
         print(f"[ron_daemon] stale digest sent ({len(items)} chats)",
               flush=True)
+        with _FILE_LOCK:
+            store = _stale_load()
+            store["last_digest_day"] = day
+            _stale_save(store)
         return True
     except Exception as e:
         print(f"[ron_daemon] stale digest failed: {e}", flush=True)
@@ -3719,7 +3741,6 @@ DRAFT_PUSH_SECS = 1.5    # min seconds between draft pushes — Telegram 429s
                          # the 429 backoff in on_token still protects us)
 DRAFT_MIN_GROWTH = 24    # only push when the text actually grew this much
 DRAFT_MAX = 4096         # sendMessageDraft text cap
-TRAILER_LINE_RE = re.compile(r"^\[(buttons|links):.*$", re.M | re.I)
 STOP_EVENTS = {}  # chat_id -> threading.Event, set when user hits Stop
 _RE_429 = re.compile(r"retry after (\d+)", re.I)
 # can_stop/keep_on_stop are Bot API 10.3 (weeks old): probe once, then commit.
@@ -3898,10 +3919,7 @@ def _react_target_for(incoming_msg_id):
     """v1.27.3: the [react:] trailer always targets the incoming user's
     message — never the bot's own reply, never the message the user
     replied to. Adwaith's spec: the reaction goes on HIS message."""
-    try:
-        return incoming_msg_id if incoming_msg_id else None
-    except Exception:
-        return None
+    return incoming_msg_id if incoming_msg_id else None
 
 
 def _fire_media_trailers(reply, chat_id, sent_r, reply_to=None,
@@ -4069,18 +4087,17 @@ def canned_reply(text, chat_id):
     messages, never anything that could be a real question.
     """
     global _CANNED_PUNCT_RE
-    import re as _re
     if _CANNED_PUNCT_RE is None:
-        _CANNED_PUNCT_RE = _re.compile(r"[!.,?~…]*$")
+        _CANNED_PUNCT_RE = re.compile(r"[!.,?~…]*$")
     t = (text or "").strip()
     if not t or len(t) > 24:
         return None
     # Pure emoji (no letters/digits at all)?
-    if not _re.search(r"[A-Za-z0-9\u00c0-\u024f\u1e00-\u1eff]", t):
+    if not re.search(r"[A-Za-z0-9\u00c0-\u024f\u1e00-\u1eff]", t):
         variants = ["👍", "🙂👍", "Gotcha 👍"]
         return variants[abs(hash((str(chat_id), t))) % len(variants)]
     norm = _CANNED_PUNCT_RE.sub("", t.lower()).strip()
-    norm = _re.sub(r"\s+", " ", norm)
+    norm = re.sub(r"\s+", " ", norm)
     variants = _CANNED_REPLIES.get(norm)
     if not variants:
         return None
@@ -4105,6 +4122,7 @@ def _stream_with_draft(chat_id, produce, user_text="",
     stop_event = threading.Event()
     STOP_EVENTS[chat_id] = stop_event
     buf = []
+    buf_len = [0]  # running char count — avoids O(n^2) join-per-token
     draft_id = _draft_id()
     last_push = [0.0]
     last_push_len = [0]
@@ -4122,20 +4140,21 @@ def _stream_with_draft(chat_id, produce, user_text="",
 
     def on_token(tok):
         buf.append(tok)
+        buf_len[0] += len(tok)
         if not stream_drafts:
             return
-        cur = "".join(buf)
         now = time.time()
         # live draft update: throttled + only on real growth + past backoff.
         # plain text only — partial markdown mid-generation is not worth
         # the 400s; the final rich send carries the formatting.
-        if (len(cur) - last_push_len[0] >= DRAFT_MIN_GROWTH
+        if (buf_len[0] - last_push_len[0] >= DRAFT_MIN_GROWTH
                 and now - last_push[0] >= DRAFT_PUSH_SECS
                 and now >= next_push_ok[0]):
+            cur = "".join(buf)  # only joined when actually pushing
             snippet = strip_markdown(strip_trailer_syntax(cur)).strip()
             ok, backoff = draft_update(chat_id, draft_id, snippet)
             if ok:
-                last_push_len[0] = len(cur)
+                last_push_len[0] = buf_len[0]
                 last_push[0] = now
             elif backoff:
                 next_push_ok[0] = now + backoff
@@ -5179,19 +5198,6 @@ def handle_callback(query):
     if data.startswith("apology:"):
         _handle_apology_callback(query, data)
         return
-    if data == "demo_more":
-        msg = query.get("message") or {}
-        chat = msg.get("chat") or {}
-        if chat.get("id"):
-            # Routed through send_rich (local validation + self-healing +
-            # plain-text fallback) — no more silent total failures.
-            send_rich(chat.get("id"),
-                      "🎲 *Spoiler quiz*\n"
-                      "What has keys but can't open locks?\n\n"
-                      "Tap to reveal: ||a piano|| 🎹\n\n"
-                      "Spoilers also work mid-sentence: the treasure was "
-                      "||under the old oak|| all along.")
-        return
     if not data.startswith("q:"):
         # Phase 4: private-DM approval buttons (mem:go:<pid> / mem:no:<pid>).
         if _MEM_MODULES:
@@ -5202,7 +5208,6 @@ def handle_callback(query):
     msg = query.get("message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
-    frm = query.get("from") or {}
     if chat_id:
         # Button-mash throttle: every tap re-sends the label as a message,
         # so a user hammering a button would burn one AI call per tap and

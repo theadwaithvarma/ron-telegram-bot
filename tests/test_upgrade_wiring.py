@@ -132,6 +132,44 @@ class MaybeToolsTest(unittest.TestCase):
         finally:
             ron_tools.maybe_run_tools = orig_run
 
+    def test_ctx_threaded_to_tools(self):
+        # Regression: _maybe_tools used to drop ctx, so reminders created
+        # via chat were stored as user 0 / chat 0 (undeliverable).
+        import ron_tools
+        seen = {}
+        orig_run = ron_tools.maybe_run_tools
+
+        def fake(messages, fn, **k):
+            seen.update(k)
+            return None
+
+        ron_tools.maybe_run_tools = fake
+        try:
+            msgs = [{"role": "user", "content": "remind me in 10 minutes"}]
+            ron_ai._maybe_tools(msgs, "remind me in 10 minutes", "standard",
+                                ctx={"user_id": 42, "chat_id": 99})
+            self.assertEqual(seen.get("ctx"), {"user_id": 42, "chat_id": 99})
+        finally:
+            ron_tools.maybe_run_tools = orig_run
+
+    def test_reminder_stored_under_real_user(self):
+        # End-to-end through the real reminder tool: the reminder lands
+        # under the actual user/chat, never user 0 / chat 0.
+        import tempfile
+        import ron_tools
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = ron_tools.ReminderStore(state_dir=tmp.name)
+        res = ron_tools.execute_tool_call(
+            "create_reminder", {"text": "stretch", "when": "in 10 minutes"},
+            ctx={"user_id": 42, "chat_id": 99, "reminder_store": store},
+            allow_acting=True)
+        self.assertIn("Reminder set", res)
+        items = store.list(42)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["chat_id"], 99)
+        self.assertEqual(store.list(0), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
