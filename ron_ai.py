@@ -715,11 +715,13 @@ def probe_providers(timeout=15):
     out = {}
     for name, spec in PROVIDER_DEFS.items():
         key = _provider_key(name)
-        if not key:
+        if key is None:
             out[name] = (False, "no key in vault")
             continue
         u = urllib.parse.urlsplit(spec["base_url"].rstrip("/") + "/models")
-        headers = {"User-Agent": _UA, "Authorization": f"Bearer {key}"}
+        headers = {"User-Agent": _UA}
+        if key:  # keyless providers probe with no Authorization header
+            headers["Authorization"] = f"Bearer {key}"
         try:
             # Pooled keep-alive, like chat completions.
             status, data = http_pool.pool_for(u.hostname).get(

@@ -128,6 +128,22 @@ class KeylessProviderTest(unittest.TestCase):
         self.assertIn("openrouter/free", or_models)
         self.assertGreaterEqual(len(or_models), 5)
 
+    def test_probe_treats_keyless_as_probeable(self):
+        class P:
+            def get(self, path, headers, timeout):
+                self.got_headers = headers
+                return 200, b'{"data":[{"id":"openai"}]}'
+        pool = P()
+        with mock.patch.object(ron_ai, "_provider_key",
+                               side_effect=lambda n: "" if n == "pollinations"
+                               else None), \
+             mock.patch.object(ron_ai.http_pool, "pool_for",
+                               return_value=pool):
+            out = ron_ai.probe_providers(timeout=5)
+        self.assertEqual(out["pollinations"], (True, "ok (1 models)"))
+        self.assertNotIn("Authorization", pool.got_headers)
+        self.assertEqual(out["groq"], (False, "no key in vault"))
+
 
 if __name__ == "__main__":
     unittest.main()
