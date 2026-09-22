@@ -1,3 +1,31 @@
+## 1.26.0 — Media-message trailers (2026-09-22)
+
+- New `ron_media_trailers.py`: the AI brain can emit inline trailers that the
+  daemon converts into native Telegram message types — no menu, no commands.
+  `[dice]` / `[dice: emoji]` -> sendDice; `[poll: Q? | A | B]` -> sendPoll;
+  `[pollm: ...]` -> multiple-answer poll; `[quiz: Q? | opt | opt | 2 | why]`
+  -> sendPoll type=quiz (1-based correct index, optional explanation);
+  `[location: lat, lon]` -> sendLocation; `[livelocation: lat, lon]` ->
+  5-min live location; `[venue: lat, lon | Title | Address]` -> sendVenue;
+  `[contact: Name]` -> sendContact, ALWAYS a clearly fake demo contact
+  (fictional +1-555 number, card marked demo — never a real person's
+  details); `[spoilerphoto: caption]` -> sendPhoto with has_spoiler using a
+  locally PIL-generated image; `[mediagroup: caption]` -> sendMediaGroup
+  with 2 generated images; `[react: emoji]` -> setMessageReaction on the
+  bot's own just-sent reply. Invalid trailers (bad coords, bad quiz index,
+  short polls) are dropped with a log line; max 5 actions per reply.
+- `send_rich_with_kb` fires media actions after the main reply lands and now
+  returns the send response; `strip_trailer_syntax` removes all media trailer
+  forms so they never leak into visible text.
+- System prompt (repo `DEFAULT_CONFIG` and live `ron_ai.json` kept in sync)
+  documents the new trailers: use only when they genuinely fit, demo
+  coordinates unless the user names a real place, never real contact details.
+- Skipped as already native: rich text, code blocks, quotes/big quotes,
+  details, tables, checklists (- [ ] -> native checkboxes), rich buttons /
+  button styles / copy_text, and live message editing (streaming already
+  edits messages).
+- 34 new offline tests in `tests/test_media_trailers.py`.
+
 ## 1.25.2 — Drain survives transient 429 waves (2026-09-21)
 
 - `_drain_queue_inner` now retries the `ron_ai.chat` call up to 3 times

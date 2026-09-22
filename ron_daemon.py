@@ -69,6 +69,16 @@ try:
 except Exception:
     ron_imagen = None
 
+# Media-message trailers (v1.26.0): [dice]/[poll:]/[quiz:]/[location:]/
+# [livelocation:]/[venue:]/[contact:]/[spoilerphoto:]/[mediagroup:]/
+# [react:] the model emits become native Telegram message types.
+# None-safe — without it, media trailers are stripped and the plain
+# reply still lands.
+try:
+    import ron_media_trailers
+except Exception:
+    ron_media_trailers = None
+
 # Owner power commands (/stats, /ban, /broadcast, ...). Hard import: it's
 # our own stdlib-only module and the owner deck depends on it.
 import ron_owner
@@ -2444,13 +2454,24 @@ def handle_group_sends(origin_chat_id, user_id, user_name, reply):
 def strip_trailer_syntax(reply):
     """Remove every trailer form: [buttons:...]/[links:...]/[send_group:...]
     /[send_topic:...]/[topic:...]/[copy:...]/[switch_inline:...]/[login:...]
-    /[reply_keyboard:...]/[hide_keyboard], wherever they sit in the reply
+    /[reply_keyboard:...]/[hide_keyboard], plus the v1.26.0 media trailers
+    ([dice]/[poll:...]/[quiz:]/[location:]/[venue:]/[contact:]/
+    [spoilerphoto:]/[mediagroup:]/[react:]), wherever they sit in the reply
     (v1.21.2: the model embeds them mid-line, not just on their own line).
     Group/topic trailers keep their own-line handling — separate feature."""
+    _media_names = (ron_media_trailers.TRAILER_NAMES
+                    if ron_media_trailers is not None else
+                    ("dice", "poll", "pollm", "quiz", "location",
+                     "livelocation", "venue", "contact", "spoilerphoto",
+                     "mediagroup", "react"))
     for _name in ("buttons", "links", "copy", "switch_inline", "login",
-                  "reply_keyboard"):
+                  "reply_keyboard") + _media_names:
         reply = _strip_trailer(reply, _name)
     reply = _strip_hide_keyboard(reply)
+    # Bare media trailers ([dice] with no colon-body) — _strip_trailer only
+    # matches the colon form.
+    for _name in _media_names:
+        reply = re.sub(r"\[" + _name + r"\]", "", reply or "", flags=re.I)
     reply = GROUP_RE.sub("", reply)
     reply = SEND_TOPIC_RE.sub("", reply)
     reply = TOPIC_RE.sub("", reply)
@@ -3741,6 +3762,35 @@ def send_blocks(chat_id, blocks, reply_to=None, thread_id=None,
         return {"ok": False, "error": str(e)[:150]}
 
 
+def _fire_media_trailers(reply, chat_id, sent_r, reply_to=None,
+                         thread_id=None, business_connection_id=None):
+    """v1.26.0: execute media-message trailers the model emitted ([dice],
+    [poll:], [quiz:], [location:], [livelocation:], [venue:], [contact:],
+    [spoilerphoto:], [mediagroup:], [react:]). Fires only after the main
+    reply landed; never raises, never blocks the reply path."""
+    if ron_media_trailers is None:
+        return
+    try:
+        actions = ron_media_trailers.parse_media_trailers(reply)
+    except Exception as e:
+        print(f"[ron_daemon] media trailer parse error: {e}", flush=True)
+        return
+    if not actions:
+        return
+    msg_id = None
+    try:
+        msg_id = ((sent_r or {}).get("result") or {}).get("message_id")
+    except Exception:
+        pass
+    try:
+        ron_media_trailers.fire_actions(
+            actions, chat_id, reply_to=reply_to, thread_id=thread_id,
+            business_connection_id=business_connection_id,
+            sent_msg_id=msg_id)
+    except Exception as e:
+        print(f"[ron_daemon] media trailer fire error: {e}", flush=True)
+
+
 def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
                       business_connection_id=None, user_text=""):
     """Trailer parsing + IN-BUBBLE rich buttons with safe fallbacks.
@@ -3773,6 +3823,8 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
             r = send_blocks(chat_id, blocks, reply_to, thread_id,
                             business_connection_id)
             if r.get("ok"):
+                _fire_media_trailers(reply, chat_id, r, reply_to, thread_id,
+                                     business_connection_id)
                 return r
             print(f"[ron_daemon] blocks send not ok, falling back to "
                   f"keyboard: {str(r)[:120]}", flush=True)
@@ -3784,16 +3836,21 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
     # InlineKeyboardButton dicts: "style" is a RichMessageButton
     # (in-bubble) field only; the official InlineKeyboardButton has no
     # such field (the local validator flags it).
+    r = None
     try:
-        send_rich(chat_id, clean, markup, reply_to, thread_id,
-                  business_connection_id)
+        r = send_rich(chat_id, clean, markup, reply_to, thread_id,
+                      business_connection_id)
     except Exception as e:
         print(f"[ron_daemon] send failed: {e}", flush=True)
         try:
-            send(chat_id, strip_markdown(clean), reply_to, thread_id,
-                 business_connection_id)
+            r = send(chat_id, strip_markdown(clean), reply_to, thread_id,
+                     business_connection_id)
         except Exception:
             pass
+    if r and r.get("ok"):
+        _fire_media_trailers(reply, chat_id, r, reply_to, thread_id,
+                             business_connection_id)
+    return r
 
 
 # Token economy (2026-09-20, Phase 2): pure acknowledgments never reach the
