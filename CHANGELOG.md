@@ -1,3 +1,20 @@
+## 1.27.1 — Fix edit-turn duplicate bubble (2026-09-22)
+
+- Bug: on an edit turn, pressing Stop mid-stream truncated the reply before
+  the trailing [edit] trailer streamed; the partial fell through to the
+  normal send and posted a duplicate truncated bubble next to the edited
+  original (reported by Adwaith with screenshot).
+- Fix: edit turns never stream drafts (buffer silently instead), and a
+  stopped edit turn now sends nothing at all — the edit intent dies with
+  the Stop. Non-edit turns keep the old behavior. Successful edits still
+  suppress the new-message send; genuine edit failures still fall back to
+  exactly one normal reply.
+- 6 new regression tests in tests/test_edit_nodup.py (all pass).
+- Prompt (per Adwaith): Ron is more direct now — never asks what the user
+  is building, no unprompted follow-up questions, suggestions, or
+  "want me to..." closers; a follow-up only when a missing detail is
+  genuinely needed. In repo ron_ai.py DEFAULT_CONFIG and live ron_ai.json.
+
 ## 1.27.0 — User-requested message editing via [edit] trailer (2026-09-22)
 
 - Adwaith: "whenever we mention edit or do something about its response, it

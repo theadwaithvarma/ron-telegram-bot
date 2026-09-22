@@ -4019,6 +4019,13 @@ def _stream_with_draft(chat_id, produce, user_text="",
     reply text. Handles the stop-event slot, throttled draft pushes, and
     the final rich send. Returns the reply text. user_text threads the
     explicit-button-request flag to the final send (v1.21.1)."""
+    # v1.27.1: edit turns never stream drafts. The [edit] trailer rides at
+    # the very end of the model's output, so a mid-stream Stop truncates
+    # it; the partial then fell through to a normal send and posted a
+    # duplicate truncated bubble next to the edited original. Buffer
+    # silently instead — the turn's only visible effect is the in-place
+    # edit (or the single fallback reply when the edit fails).
+    stream_drafts = not edit_target_msg_id
     stop_event = threading.Event()
     STOP_EVENTS[chat_id] = stop_event
     buf = []
@@ -4031,13 +4038,16 @@ def _stream_with_draft(chat_id, produce, user_text="",
     # the typing indicator + empty draft to round-trip first.
     def _kickoff():
         send_typing(chat_id)
-        # empty text = native "Thinking…" placeholder, shown immediately
-        draft_update(chat_id, draft_id, "")
+        if stream_drafts:
+            # empty text = native "Thinking…" placeholder, shown immediately
+            draft_update(chat_id, draft_id, "")
     kickoff = threading.Thread(target=_kickoff, daemon=True)
     kickoff.start()
 
     def on_token(tok):
         buf.append(tok)
+        if not stream_drafts:
+            return
         cur = "".join(buf)
         now = time.time()
         # live draft update: throttled + only on real growth + past backoff.
@@ -4068,6 +4078,15 @@ def _stream_with_draft(chat_id, produce, user_text="",
     # short reply (nothing streamed) or post-stream: single rich send.
     # on generation failure the exception propagates and the caller's
     # single-send fallback replies — never an expired preview with nothing.
+    if edit_target_msg_id and stop_event.is_set():
+        # Edit turn stopped mid-stream: the partial reply lost the
+        # trailing [edit] trailer, so the normal send below would post a
+        # truncated fragment as a NEW bubble next to the original. The
+        # edit intent died with the Stop — send nothing, mirroring the
+        # pre-first-token UserStoppedError path (v1.27.1).
+        print(f"[ron_daemon] edit turn stopped mid-stream, chat={chat_id} "
+              f"— no send", flush=True)
+        return reply
     send_rich_with_kb(chat_id, reply, user_text=user_text,
                       edit_target_msg_id=edit_target_msg_id)
     return reply
