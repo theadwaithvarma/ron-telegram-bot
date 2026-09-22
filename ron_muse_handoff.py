@@ -148,10 +148,14 @@ def write_response(req_id, reply_text, deliver_to_app=False,
         pass
 
 
-def drain_responses():
-    """Read+remove all pending response files. Returns [(req, response)]."""
-    req_dir, res_dir = _dirs()
-    drained = []
+def peek_responses():
+    """Read all pending response files WITHOUT removing them. Returns
+    [(req, response)]. The caller must ack_response(req_id) only after
+    the answer was actually delivered — a failed send keeps the file so
+    a later sweep retries instead of losing the answer."""
+    _, res_dir = _dirs()
+    req_dir = os.path.join(_base(), "handoff", "requests")
+    out = []
     for path in sorted(glob.glob(os.path.join(res_dir, "*.json"))):
         req_id = os.path.basename(path)[:-5]
         try:
@@ -166,9 +170,26 @@ def drain_responses():
                 req = json.load(f)
         except Exception:
             pass
-        try:
-            os.unlink(path)
-        except Exception:
-            continue
-        drained.append((req, resp))
-    return drained
+        out.append((req, resp))
+    return out
+
+
+def ack_response(req_id):
+    """Remove a response file after successful delivery. Idempotent."""
+    _, res_dir = _dirs()
+    try:
+        os.unlink(os.path.join(res_dir, req_id + ".json"))
+    except Exception:
+        pass
+
+
+def drain_responses():
+    """Read+remove all pending response files. Returns [(req, response)].
+
+    Kept for compatibility; the daemon's sweeper uses peek/ack so a
+    failed send never loses an answer.
+    """
+    out = peek_responses()
+    for req, resp in out:
+        ack_response(resp.get("id", ""))
+    return out

@@ -888,45 +888,69 @@ def _reminder_sweeper(rt):
             pass
 
 
+def _deliver_muse_response(req, resp):
+    """Send one completed /muse answer. Returns the sent message_id on
+    success, None when delivery failed (the response file is left in
+    place for a later sweep to retry)."""
+    if not isinstance(req, dict):
+        # Orphan response (request file gone) — nothing to deliver to.
+        ron_muse_handoff.ack_response((resp or {}).get("id", ""))
+        print("[ron_daemon] /muse dropped orphan response", flush=True)
+        return None
+    text = ((resp or {}).get("reply_text") or "").strip()
+    req_id = req.get("id", "?")
+    if not text:
+        ron_muse_handoff.ack_response(req_id)
+        return None
+    chat_id = req.get("chat_id")
+    msg_id = req.get("message_id")
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 4000 and cur:
+            chunks.append(cur)
+            cur = ""
+        cur += ("\n" if cur else "") + line
+    if cur:
+        chunks.append(cur)
+
+    def _send_all(reply_to):
+        mids = []
+        for i, chunk in enumerate(chunks or [text]):
+            r = send(chat_id, chunk, reply_to=reply_to if i == 0 else None)
+            if not _api_ok(r):
+                return None
+            mids.append(((r.get("result") or {}).get("message_id")))
+        return mids
+
+    mids = _send_all(msg_id)
+    if mids is None and msg_id:
+        # Reply target gone (or otherwise rejected) — deliver as a
+        # plain message instead of dropping the answer.
+        mids = _send_all(None)
+    if mids is None:
+        print(f"[ron_daemon] /muse delivery failed, will retry: "
+              f"req={req_id} chat={chat_id}", flush=True)
+        return None
+    ron_muse_handoff.ack_response(req_id)
+    mid = mids[0] if mids else None
+    print(f"[ron_daemon] /muse delivered req={req_id} chat={chat_id} "
+          f"msg={mid}", flush=True)
+    return mid
+
+
 def _muse_handoff_sweeper():
-    """Deliver completed /muse answers (~15s). Drains response files and
-    send()s each back to the chat that issued the request, as a reply to
-    the /muse command message. Long answers are split into 4000-char
-    chunks so nothing is silently truncated. Never raises."""
+    """Deliver completed /muse answers (~15s). Peeks at response files and
+    sends each back to the chat that issued the request; the file is only
+    removed after a successful send, so a failed send is retried on the
+    next sweep instead of losing the answer. Never raises."""
     while True:
         try:
             time.sleep(15)
-            for req, resp in ron_muse_handoff.drain_responses():
+            for req, resp in ron_muse_handoff.peek_responses():
                 try:
-                    if not isinstance(req, dict):
-                        continue
-                    text = ((resp or {}).get("reply_text") or "").strip()
-                    if not text:
-                        continue
-                    chat_id = req.get("chat_id")
-                    msg_id = req.get("message_id")
-                    req_id = req.get("id", "?")
-                    chunks, cur = [], ""
-                    for line in text.split("\n"):
-                        if len(cur) + len(line) + 1 > 4000 and cur:
-                            chunks.append(cur)
-                            cur = ""
-                        cur += ("\n" if cur else "") + line
-                    if cur:
-                        chunks.append(cur)
-                    first = True
-                    sent_mid = None
-                    for chunk in chunks or [text]:
-                        r = send(chat_id, chunk,
-                                 reply_to=msg_id if first else None)
-                        if first:
-                            sent_mid = ((r or {}).get("result") or {}
-                                        ).get("message_id")
-                        first = False
-                    print(f"[ron_daemon] /muse delivered req={req_id} "
-                          f"chat={chat_id} msg={sent_mid}", flush=True)
+                    _deliver_muse_response(req, resp)
                 except Exception as e:
-                    print(f"[ron_daemon] /muse delivery failed: "
+                    print(f"[ron_daemon] /muse delivery error: "
                           f"{type(e).__name__}", flush=True)
         except Exception:
             pass

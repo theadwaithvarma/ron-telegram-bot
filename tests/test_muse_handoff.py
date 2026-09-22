@@ -120,6 +120,21 @@ class HandoffStoreTest(unittest.TestCase):
         # request marked done: never re-wakes
         self.assertEqual(self.hd.pending_requests(), [])
 
+    def test_peek_does_not_remove_and_ack_does(self):
+        rid = self.hd.submit_request(111, 222, OWNER, "A", "ping")
+        self.hd.write_response(rid, "pong")
+        peeked = self.hd.peek_responses()
+        self.assertEqual(len(peeked), 1)
+        self.assertEqual(peeked[0][0]["id"], rid)
+        self.assertEqual(peeked[0][1]["reply_text"], "pong")
+        # still there after peek
+        res_dir = os.path.join(self.tmp.name, "handoff", "responses")
+        self.assertEqual(len(os.listdir(res_dir)), 1)
+        self.hd.ack_response(rid)
+        self.assertEqual(os.listdir(res_dir), [])
+        # ack is idempotent
+        self.hd.ack_response(rid)
+
     def test_drain_tolerates_orphan_response(self):
         # response file with no matching request (crash leftovers)
         self.hd.write_response("no-such-request", "hello")
@@ -200,6 +215,68 @@ class MuseCommandTest(unittest.TestCase):
         self.assertTrue(self._call(OWNER))
         self.assertTrue(any("Couldn't queue" in s["text"]
                             for s in self.sent))
+
+
+class MuseDeliveryTest(unittest.TestCase):
+    """_deliver_muse_response: ack only on success, retry-without-reply
+    fallback, orphan drop."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.hd = ron_muse_handoff
+        self.hd.set_dir(self.tmp.name)
+        self.calls = []
+        self.mode = "ok"  # "ok" | "reply_fails" | "all_fail"
+        self._orig_send = ron_daemon.send
+
+        def fake_send(chat_id, text, **kw):
+            self.calls.append((chat_id, text, kw.get("reply_to")))
+            if self.mode == "all_fail":
+                return {"ok": False, "error": "network"}
+            if self.mode == "reply_fails" and kw.get("reply_to"):
+                return {"ok": False,
+                        "error": "Bad Request: message to be replied not found"}
+            return {"ok": True, "result": {"message_id": 777}}
+
+        ron_daemon.send = fake_send
+        self.req = {"id": "r1", "chat_id": 111, "message_id": 222,
+                    "user_id": OWNER}
+        self.hd.write_response("r1", "hello")
+
+    def tearDown(self):
+        ron_daemon.send = self._orig_send
+        self.tmp.cleanup()
+
+    def _resp_path(self):
+        return os.path.join(self.tmp.name, "handoff", "responses", "r1.json")
+
+    def test_success_acks_and_returns_message_id(self):
+        mid = ron_daemon._deliver_muse_response(
+            self.req, {"id": "r1", "reply_text": "hello"})
+        self.assertEqual(mid, 777)
+        self.assertFalse(os.path.exists(self._resp_path()))
+        self.assertEqual(self.calls[0][2], 222)  # replied to /muse msg
+
+    def test_reply_target_gone_falls_back_to_plain_send(self):
+        self.mode = "reply_fails"
+        mid = ron_daemon._deliver_muse_response(
+            self.req, {"id": "r1", "reply_text": "hello"})
+        self.assertEqual(mid, 777)
+        self.assertFalse(os.path.exists(self._resp_path()))
+        self.assertEqual([c[2] for c in self.calls], [222, None])
+
+    def test_failed_send_keeps_response_for_retry(self):
+        self.mode = "all_fail"
+        mid = ron_daemon._deliver_muse_response(
+            self.req, {"id": "r1", "reply_text": "hello"})
+        self.assertIsNone(mid)
+        self.assertTrue(os.path.exists(self._resp_path()))
+
+    def test_orphan_response_is_dropped(self):
+        mid = ron_daemon._deliver_muse_response(
+            None, {"id": "r1", "reply_text": "hello"})
+        self.assertIsNone(mid)
+        self.assertFalse(os.path.exists(self._resp_path()))
 
 
 if __name__ == "__main__":
