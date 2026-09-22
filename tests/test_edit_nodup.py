@@ -51,7 +51,7 @@ class StreamHarness(unittest.TestCase):
 
     def _fake_send(self, chat_id, reply, reply_to=None, thread_id=None,
                    business_connection_id=None, user_text="",
-                   edit_target_msg_id=None, react_target_msg_id=None):
+                   edit_target_msg_id=None):
         self.send_calls.append({
             "reply": reply, "edit_target_msg_id": edit_target_msg_id})
         return {"ok": True}

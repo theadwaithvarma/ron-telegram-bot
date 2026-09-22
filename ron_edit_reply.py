@@ -13,7 +13,7 @@ Trailer contract (documented in the system prompt):
 
 The revised text must be the COMPLETE message (not a diff) — it replaces
 the original. The daemon strips every other trailer from the revised text
-before editing, fires remaining media trailers (e.g. [react:]) against the
+before editing, fires remaining media trailers against the
 edited message, and falls back to a normal new reply when the edit fails
 (message too old, not the bot's message, etc.).
 

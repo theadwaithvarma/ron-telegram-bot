@@ -6,8 +6,8 @@ Run: python3 tests/test_media_trailers.py  (or python3 -m unittest discover test
 Covers: trailer parsing for every media kind, validation drops (bad
 coords, bad quiz index, short polls, malformed venues), bare vs
 colon-form trailers, the 5-action cap, strip_trailer_syntax removal,
-demo image generation, and fire_actions failure paths (unknown kinds,
-[react:] with no message id). No network calls, no state files touched.
+demo image generation, and fire_actions failure paths (unknown kinds).
+No network calls, no state files touched.
 """
 import os
 import sys
@@ -15,7 +15,14 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# Guard against ron_daemon's sys.path poisoning (see AGENTS.md): an
+# earlier test module under discover may have imported ron_daemon, which
+# inserts the LIVE dir at sys.path[0] — evict and re-import so we test
+# the repo copy, and assert it.
+sys.modules.pop("ron_media_trailers", None)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import ron_media_trailers as mt
+assert "ron-telegram-bot" in mt.__file__, mt.__file__
 import ron_daemon
 
 
@@ -126,14 +133,6 @@ class TestParseMisc(unittest.TestCase):
         a = mt.parse_media_trailers("Pics [mediagroup: trip]")[0]
         self.assertEqual((a["kind"], a["caption"]), ("mediagroup", "trip"))
 
-    def test_react(self):
-        a = mt.parse_media_trailers("Nice [react: 🔥]")[0]
-        self.assertEqual((a["kind"], a["emoji"]), ("react", "🔥"))
-
-    def test_react_bad_emoji_falls_back(self):
-        a = mt.parse_media_trailers("[react: xyz]")[0]
-        self.assertEqual(a["emoji"], "👍")
-
     def test_action_cap(self):
         reply = " ".join("[dice: 🎯]" for _ in range(8))
         self.assertEqual(len(mt.parse_media_trailers(reply)), 5)
@@ -143,8 +142,13 @@ class TestParseMisc(unittest.TestCase):
 
     def test_multiple_kinds_in_order(self):
         kinds = [a["kind"] for a in mt.parse_media_trailers(
-            "Hi [dice] there [poll: Q? | A | B] ok [react: 👍]")]
-        self.assertEqual(kinds, ["dice", "poll", "react"])
+            "Hi [dice] there [poll: Q? | A | B] ok [quiz: Q? | A | B | 1]")]
+        self.assertEqual(kinds, ["dice", "poll", "quiz"])
+
+    def test_react_trailer_ignored(self):
+        # [react:] was removed (Adwaith's call) — the parser must not
+        # produce a react action for it anymore.
+        self.assertEqual(mt.parse_media_trailers("Nice [react: 🔥]"), [])
 
 
 class TestStrip(unittest.TestCase):
@@ -153,10 +157,10 @@ class TestStrip(unittest.TestCase):
             "Roll! [dice] and vote [poll: Q? | A | B] plus [quiz: Q? | A | B | 1] "
             "pin [location: 1, 2] live [livelocation: 1, 2] "
             "venue [venue: 1, 2 | T | A] call [contact: X] "
-            "peek [spoilerphoto: c] pics [mediagroup: c] [react: 👍]")
+            "peek [spoilerphoto: c] pics [mediagroup: c]")
         for token in ("[dice]", "[poll:", "[quiz:", "[location:",
                       "[livelocation:", "[venue:", "[contact:",
-                      "[spoilerphoto:", "[mediagroup:", "[react:"):
+                      "[spoilerphoto:", "[mediagroup:"):
             self.assertNotIn(token, clean)
         self.assertIn("Roll!", clean)
 
@@ -180,10 +184,6 @@ class TestImageGen(unittest.TestCase):
 class TestFireActions(unittest.TestCase):
     def test_unknown_kind_false(self):
         self.assertFalse(mt._fire_one({"kind": "nope"}, 1, None, None, None))
-
-    def test_react_without_msg_id_dropped(self):
-        self.assertFalse(mt._fire_one({"kind": "react", "emoji": "👍"},
-                                      1, None, None, None))
 
     def test_fire_actions_never_raises(self):
         n = mt.fire_actions([{"kind": "nope"}], 1, sent_msg_id=None)

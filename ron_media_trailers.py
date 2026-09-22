@@ -18,9 +18,6 @@ Trailer syntax (documented in the system prompt):
   [spoilerphoto: caption]                         -> sendPhoto has_spoiler=true,
       image generated locally with PIL (no external fetch)
   [mediagroup: caption]                           -> sendMediaGroup, 2 images
-  [react: 👍]                                     -> setMessageReaction on the
-      message the user replied to (their reply target), else the
-      bot's own just-sent reply
 
 Parsing/validation is pure here; fire_actions() does the network calls via
 rich_send.api_json / http_pool (same pattern as ron_imagen). Nothing in
@@ -50,13 +47,11 @@ __all__ = ["TRAILER_NAMES", "parse_media_trailers", "fire_actions",
 # strip_trailer_syntax (it reads this list).
 TRAILER_NAMES = ("dice", "poll", "pollm", "quiz", "location",
                  "livelocation", "venue", "contact", "spoilerphoto",
-                 "mediagroup", "react")
+                 "mediagroup")
 
 _MAX_ACTIONS_PER_REPLY = 5  # sanity cap — the model is told to use sparingly
 
 _DICE_EMOJI = {"🎲", "🎯", "🏀", "⚽", "🎳", "🎰"}
-_REACT_ALLOW = {"👍", "❤️", "🔥", "🎉", "👏", "😁", "🤔", "👎", "💯",
-                "😢", "😮", "🙏"}
 
 # Fictional-use number range (555-01XX): never a real person's number.
 _FAKE_PHONE = "+15551234567"
@@ -206,10 +201,6 @@ def parse_media_trailers(reply):
         add({"kind": "mediagroup", "caption": body.strip()[:1024]})
     if _has_bare(reply, "mediagroup"):
         add({"kind": "mediagroup", "caption": ""})
-    for body in _find_bodies(reply, "react"):
-        emoji = body.strip()
-        add({"kind": "react",
-             "emoji": emoji if emoji in _REACT_ALLOW else "👍"})
     return actions
 
 
@@ -292,19 +283,16 @@ def _json_payload(chat_id, thread_id=None, business_connection_id=None,
 
 
 def fire_actions(actions, chat_id, reply_to=None, thread_id=None,
-                 business_connection_id=None, sent_msg_id=None,
-                 react_target_msg_id=None):
+                 business_connection_id=None, sent_msg_id=None):
     """Execute validated media actions. Returns number that landed ok.
 
     Never raises — a failed action is logged, the rest still fire.
-    react_target_msg_id (v1.27.3): the incoming user's message_id. A
-    [react:] trailer targets it — never the bot's own reply.
     """
     ok_count = 0
     for a in actions or []:
         try:
             if _fire_one(a, chat_id, thread_id, business_connection_id,
-                         sent_msg_id, react_target_msg_id):
+                         sent_msg_id):
                 ok_count += 1
         except Exception as e:
             print(f"[media_trailers] action {a.get('kind')} failed: {e}",
@@ -312,8 +300,7 @@ def fire_actions(actions, chat_id, reply_to=None, thread_id=None,
     return ok_count
 
 
-def _fire_one(a, chat_id, thread_id, business_connection_id, sent_msg_id,
-              react_target_msg_id=None):
+def _fire_one(a, chat_id, thread_id, business_connection_id, sent_msg_id):
     kind = a.get("kind")
     base = dict(chat_id=chat_id)
     if thread_id:
@@ -377,20 +364,6 @@ def _fire_one(a, chat_id, thread_id, business_connection_id, sent_msg_id,
         r = _post_multipart("sendMediaGroup", fields,
                             [("p0", "demo0.jpg", demo_image_bytes(1)),
                              ("p1", "demo1.jpg", demo_image_bytes(2))])
-    elif kind == "react":
-        # v1.27.3: always the incoming user's message — never the bot's
-        # own reply. No target → drop, log.
-        target_msg_id = react_target_msg_id
-        if not target_msg_id:
-            print("[media_trailers] [react:] dropped: no target message id",
-                  flush=True)
-            return False
-        # Bots can react with a normal emoji reaction (never big_reaction).
-        r = rich_send.api_json("setMessageReaction", {
-            "chat_id": chat_id,
-            "message_id": target_msg_id,
-            "reaction": [{"type": "emoji", "emoji": a.get("emoji", "👍")}],
-        })
     else:
         print(f"[media_trailers] unknown action kind: {kind}", flush=True)
         return False

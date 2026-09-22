@@ -579,21 +579,38 @@ class MaybeRunToolsTest(FetcherFixture):
     MSGS = [{"role": "system", "content": "sys"},
             {"role": "user", "content": "what's the weather in Bengaluru?"}]
 
-    def test_short_text_still_probes(self):
-        # No one-word guard: pure acks ("ok", "thanks") are intercepted by
-        # the daemon's zero-cost canned replies BEFORE the AI path, so
-        # maybe_run_tools always probes. A bare "weather" must reach the
-        # probe (it is exactly what the tools exist for).
+    def test_heuristic_gate_skips_chitchat(self):
+        # v1.29.0: the probe is a full extra LLM call, so messages with no
+        # sign of needing live information skip it entirely (zero model
+        # calls). A bare "weather" must still reach the probe — it is
+        # exactly what the tools exist for.
         calls = []
         out = maybe_run_tools(self.MSGS, lambda m: calls.append(m) or "NONE",
                               user_text="ok")
         self.assertIsNone(out)
-        self.assertEqual(len(calls), 1)  # probed, model said NONE
-        calls.clear()
+        self.assertEqual(len(calls), 0)  # gated, no probe call
+        out = maybe_run_tools(self.MSGS, lambda m: calls.append(m) or "NONE",
+                              user_text="tell me a joke")
+        self.assertIsNone(out)
+        self.assertEqual(len(calls), 0)  # gated, no probe call
         out = maybe_run_tools(self.MSGS, lambda m: calls.append(m) or "NONE",
                               user_text="weather")
         self.assertIsNone(out)
-        self.assertEqual(len(calls), 1)  # probed, not skipped
+        self.assertEqual(len(calls), 1)  # probed, model said NONE
+
+    def test_looks_tool_worthy(self):
+        for t in ("what's the weather in Bengaluru today?",
+                  "any breaking news on the match?",
+                  "search the web for that phone's price",
+                  "what's on my calendar tomorrow?",
+                  "remind me to call mom at 6",
+                  "how much does the new pixel cost?",
+                  "live score please"):
+            self.assertTrue(ron_tools.looks_tool_worthy(t), t)
+        for t in ("ok", "hey", "tell me a joke",
+                  "explain how quicksort works",
+                  "thanks, that helped", ""):
+            self.assertFalse(ron_tools.looks_tool_worthy(t), t)
 
     def test_none_reply_returns_none(self):
         out = maybe_run_tools(self.MSGS, lambda m: "NONE",

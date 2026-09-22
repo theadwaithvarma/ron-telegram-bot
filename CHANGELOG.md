@@ -1,3 +1,39 @@
+## 1.29.0 — Reaction removal + tool-probe latency fix (2026-09-22)
+
+Adwaith's call: the [react:] trailer and all auto-reactions are removed
+entirely — no reactions on any message, requests included. Separately,
+v1.28.0's agentic tool loop added a full extra LLM probe call on every
+non-cheap turn, doubling model round-trips per reply; the probe is now
+gated and fast.
+
+Reaction removal:
+- [react:] dropped from the system prompt (repo ron_ai.py
+  DEFAULT_CONFIG and live ron_ai.json) so the model stops emitting it.
+- Removed the react action end to end: parse branch, _REACT_ALLOW,
+  fire_actions/_fire_one react path, _react_target_for, the
+  react_target_msg_id/incoming_msg_id threading through ai_reply,
+  stream_ai_reply, _stream_with_draft, send_rich_with_kb and
+  _fire_media_trailers. No dead code left.
+- tests/test_react_target.py deleted; test_media_trailers.py updated
+  (plus the sys.path-poisoning guard it was missing).
+
+Latency fix (tool probe):
+- New ron_tools.looks_tool_worthy() heuristic (pure regex, zero LLM):
+  maybe_run_tools now skips the probe entirely when the message shows
+  no sign of needing live/external info. Ordinary chit-chat and
+  knowledge questions go straight to the main request — back to one
+  model call per turn, as before v1.28.0.
+- When the probe does run (tool-worthy messages), it runs on the cheap
+  tier (smallest/fastest model) instead of the turn's tier — the probe
+  only needs "NONE" or tool-call blocks. Failover still walks the
+  full chain.
+- Memory recall (local SQLite, ~ms) and difficulty routing (pure
+  heuristics, ~ms) measured and confirmed negligible; untouched.
+- Groq-first provider ordering from v1.26.1 intact.
+
+Suite: 1036 tests, only the 4 pre-existing baseline failures
+(test_buttons, test_heal, test_backup/test_summary loaders).
+
 ## 1.28.1 — Massive diagnosis: audit fixes + hardening (2026-09-22)
 
 Full end-to-end code scan (all modules) after v1.28.0, with fixes for

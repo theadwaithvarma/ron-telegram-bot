@@ -151,6 +151,33 @@ REMINDER_REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Heuristic pre-filter for the agentic tool loop (v1.29.0): the probe is
+# a full extra LLM call, so it must NOT run on every turn — only messages
+# that plausibly need live/external information reach the probe.
+# Zero LLM calls, never raises. A false positive costs one probe call
+# (the old behavior); a false negative just means no tool help this turn
+# (the pre-v1.28.0 behavior — the reply still lands).
+_TOOL_WORTHY_RE = re.compile(
+    r"\b(weather|forecast|temperature|humidity|rain|raining|snow|storm|"
+    r"cyclone|news|headlines|breaking|search|google|look\s*up|wikipedia|"
+    r"calendar|agenda|schedule|meeting|appointment|remind|reminder|"
+    r"latest|current|today'?s|right\s*now|live|score|price|cost|stock|"
+    r"how\s+much)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_tool_worthy(text):
+    """True when a message plausibly needs a live/external tool.
+
+    Pure regex, no model call. Used by maybe_run_tools to skip the
+    probe round-trip for ordinary chit-chat and knowledge questions.
+    """
+    try:
+        return bool(_TOOL_WORTHY_RE.search(text or ""))
+    except Exception:
+        return True  # fail open: a broken regex must not kill tools
+
 _log = lambda *a: print("[ron_tools]", *a, file=sys.stderr)  # noqa: E731
 
 def _tz(name):
@@ -984,6 +1011,12 @@ def maybe_run_tools(messages, complete_fn, user_text="", allow_acting=False,
     # reply before the AI path — and cheap small-talk is skipped by the
     # integrator (tier == "cheap"). A bare "weather" or "news" is exactly
     # the query these tools exist for.
+    # v1.29.0 heuristic pre-filter: the probe below is a full extra LLM
+    # call, so skip it entirely when the message shows no sign of needing
+    # live/external information. Ordinary chit-chat and knowledge
+    # questions go straight to the main request with zero added latency.
+    if not looks_tool_worthy(user_text):
+        return None
     # Acting gate: the model may still ask, but without allow_acting the
     # acting calls are refused inside execute_tool_call. Additionally, if
     # the user text doesn't look like an explicit reminder request, force

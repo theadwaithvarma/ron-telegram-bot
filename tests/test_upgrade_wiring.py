@@ -26,8 +26,7 @@ import ron_routing
 
 # ron_daemon (imported by earlier test modules under discover) holds a
 # reference to the pre-pop ron_ai module object; rewire it so later
-# tests that patch ron_ai hit the same object the daemon calls through
-# (same pattern as test_react_target.py's ron_media_trailers rewire).
+# tests that patch ron_ai hit the same object the daemon calls through.
 if "ron_daemon" in sys.modules:
     sys.modules["ron_daemon"].ron_ai = ron_ai
 
