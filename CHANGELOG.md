@@ -1,3 +1,17 @@
+## 1.27.3 — Reaction targets the user's own message (2026-09-22)
+
+- Correction (Adwaith: "I got reaction on its new response not mine"):
+  v1.27.2 misread the spec and targeted the message he replied TO. New
+  rule: a [react:] trailer always targets the incoming user's message_id —
+  never the bot's own just-sent reply, never the replied-to message.
+- Fix: ai_reply takes the incoming message id (incoming_msg_id, passed at
+  the DM/business/group/overshare call sites; button taps have none) and
+  threads it through the trailer pipeline as react_target_msg_id. No id
+  -> the reaction is dropped and logged, never retargeted. System prompt
+  updated in repo + live ron_ai.json.
+- tests/test_react_target.py rewritten for the corrected behavior
+  (targets user message, never own reply, drop-with-no-target, plumbing).
+
 ## 1.27.2 — Reaction targets the user's reply target (2026-09-22)
 
 - Bug (reported by Adwaith): when his message was itself a reply to another

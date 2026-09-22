@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Regression tests for the v1.27.x reaction-targeting fix (no network).
+"""Regression tests for the v1.27.3 reaction-targeting correction (no network).
 
-Bug (reported by Adwaith): when his message was itself a reply to another
-message and the bot emitted a [react:] trailer, the reaction landed on the
-bot's own just-sent reply (sent_msg_id) instead of on the message he had
-replied to (the reply_to_message).
+Adwaith's spec: a [react:] trailer's reaction must land on HIS message —
+the incoming user's message_id — and NEVER on the bot's own just-sent
+reply. (v1.27.2 misread this and targeted the message he had replied to;
+this reverts that logic.)
 
-Fix under test: the daemon threads the user's reply target
-(reply_msg.message_id) through send_rich_with_kb -> _fire_media_trailers ->
-fire_actions -> _fire_one as react_target_msg_id, and the [react:] action
-targets it, falling back to the bot's own reply only when the user's
-message wasn't a reply.
+Fix under test: ai_reply receives the incoming message's id as
+incoming_msg_id, threads it through stream_ai_reply -> _stream_with_draft
+-> send_rich_with_kb -> _fire_media_trailers -> fire_actions -> _fire_one
+as react_target_msg_id, and the [react:] action targets exactly that.
+No incoming id -> the reaction is dropped (logged), never retargeted to
+the bot's own reply.
 
 Run: python3 tests/test_react_target.py
 """
@@ -62,9 +63,10 @@ class ReactTargetUnit(unittest.TestCase):
         self.assertEqual(actions[0]["kind"], "react")
         return actions
 
-    def test_react_prefers_user_reply_target(self):
-        # The bug: user's message replied to msg 777, bot's own reply is
-        # 555 — the reaction must land on 777, not 555.
+    def test_react_targets_user_message_not_own_reply(self):
+        # The correction: incoming user message is 777, bot's own reply is
+        # 555 — the reaction must land on 777 (Adwaith's message), never
+        # on 555.
         n = ron_media_trailers.fire_actions(
             self._react_action(), 1234, sent_msg_id=555,
             react_target_msg_id=777)
@@ -75,16 +77,14 @@ class ReactTargetUnit(unittest.TestCase):
         self.assertEqual(params["message_id"], 777)
         self.assertEqual(params["chat_id"], 1234)
 
-    def test_react_falls_back_to_own_reply(self):
-        # No reply target (standalone user message): old behavior kept —
-        # react to the bot's own just-sent reply.
+    def test_react_never_falls_back_to_own_reply(self):
+        # No incoming id: the reaction is dropped, NOT retargeted to the
+        # bot's own reply.
         n = ron_media_trailers.fire_actions(
             self._react_action("🔥"), 1234, sent_msg_id=555,
             react_target_msg_id=None)
-        self.assertEqual(n, 1)
-        _, params = self.api.calls[0]
-        self.assertEqual(params["message_id"], 555)
-        self.assertEqual(params["reaction"][0]["emoji"], "🔥")
+        self.assertEqual(n, 0)
+        self.assertEqual(self.api.calls, [])
 
     def test_react_dropped_with_no_target(self):
         n = ron_media_trailers.fire_actions(
@@ -95,12 +95,11 @@ class ReactTargetUnit(unittest.TestCase):
 
 
 class ReactTargetHelpers(unittest.TestCase):
-    def test_react_target_from_reply(self):
-        self.assertEqual(
-            ron_daemon._react_target_from_reply({"message_id": 777}), 777)
-        self.assertIsNone(ron_daemon._react_target_from_reply(None))
-        self.assertIsNone(ron_daemon._react_target_from_reply({}))
-        self.assertIsNone(ron_daemon._react_target_from_reply("junk"))
+    def test_react_target_for(self):
+        self.assertEqual(ron_daemon._react_target_for(777), 777)
+        self.assertIsNone(ron_daemon._react_target_for(None))
+        self.assertIsNone(ron_daemon._react_target_for(0))
+        self.assertIsNone(ron_daemon._react_target_for(""))
 
 
 class ReactTargetPlumbing(unittest.TestCase):

@@ -1046,7 +1046,8 @@ def _apply_approval(pending, approved):
             # DM facts, so it must never be served from the answer cache.
             ai_reply(gid, uid, pending.get("target_name") or "there",
                      question, private=False,
-                     reply_to=pending["group_message_id"], cacheable=False)
+                     reply_to=pending["group_message_id"], cacheable=False,
+                     incoming_msg_id=pending["group_message_id"])
             _dm(uid, "Answering in the group ✓")
             print(f"[ron_daemon] overshare: approved, answering "
                   f"(group={gid})", flush=True)
@@ -2224,7 +2225,8 @@ def handle_business_message(msg):
              private=True, reply_to=msg.get("message_id"),
              business_connection_id=conn_id,
              username=frm.get("username") or "",
-             reply_msg=msg.get("reply_to_message"))
+             reply_msg=msg.get("reply_to_message"),
+             incoming_msg_id=msg.get("message_id"))
 
 
 def resolve_topic(group_id, name):
@@ -3839,13 +3841,12 @@ def _edit_bot_message(chat_id, target_id, revised, thread_id=None,
     return False
 
 
-def _react_target_from_reply(reply_msg):
-    """v1.27.x: the message_id the user's incoming message replied to
-    (reply_to_message), or None. A [react:] trailer targets it instead of
-    the bot's own just-sent reply — the reaction lands where the user
-    pointed, not on the bot's own bubble."""
+def _react_target_for(incoming_msg_id):
+    """v1.27.3: the [react:] trailer always targets the incoming user's
+    message — never the bot's own reply, never the message the user
+    replied to. Adwaith's spec: the reaction goes on HIS message."""
     try:
-        return (reply_msg or {}).get("message_id")
+        return incoming_msg_id if incoming_msg_id else None
     except Exception:
         return None
 
@@ -3858,9 +3859,8 @@ def _fire_media_trailers(reply, chat_id, sent_r, reply_to=None,
     [spoilerphoto:], [mediagroup:], [react:]). Fires only after the main
     reply landed; never raises, never blocks the reply path.
 
-    react_target_msg_id (v1.27.x): the message the user's incoming message
-    replied to — a [react:] trailer targets it instead of the bot's own
-    just-sent reply.
+    react_target_msg_id (v1.27.3): the incoming user's message_id. A
+    [react:] trailer targets it — never the bot's own just-sent reply.
     """
     if ron_media_trailers is None:
         return
@@ -3905,9 +3905,9 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
     that message in place via editMessageText instead of sending a new
     message; on edit failure it falls back to the normal send below.
 
-    react_target_msg_id (v1.27.x): the message the user's incoming message
-    replied to. A [react:] trailer targets it instead of the bot's own
-    just-sent reply; None keeps the old behavior (react to own reply).
+    react_target_msg_id (v1.27.3): the incoming user's message_id. A
+    [react:] trailer targets it — never the bot's own reply. None drops
+    the reaction (logged).
     """
     # v1.27.0 user-requested edits: the model emitted [edit], meaning the
     # user replied to our own message asking to change it — revise in
@@ -4201,13 +4201,16 @@ def _cache_store(chat_id, text, reply, cacheable):
 
 def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
            thread_id=None, business_connection_id=None, cacheable=True,
-           username="", reply_msg=None):
+           username="", reply_msg=None, incoming_msg_id=None):
     """Run the LLM call off the poll loop so updates keep flowing.
 
     reply_msg: the raw reply_to_message dict when the user's message is a
     reply. When it replies to the bot's own message (v1.27.0), the brain
     gets the original text as context and may revise it in place with the
     [edit] trailer instead of sending a new reply.
+
+    incoming_msg_id: the incoming user's own message_id — a [react:]
+    trailer (v1.27.3) targets it, never the bot's own reply.
     """
     def _go():
         cur = threading.current_thread()
@@ -4303,10 +4306,10 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 # preview in the bot's own chats, but this reply must go out
                 # on the business account as one final message.
                 # Light mode also skips streaming: single cheap send instead.
-                # v1.27.x: a [react:] trailer targets the message the user's
-                # incoming message replied to (reply_msg), not the bot's own
-                # reply — compute it once here for both send paths below.
-                react_target_msg_id = _react_target_from_reply(reply_msg)
+                # v1.27.3: a [react:] trailer targets the incoming user's
+                # message — never the bot's own reply. Compute once here
+                # for both send paths below.
+                react_target_msg_id = _react_target_for(incoming_msg_id)
                 if private and not business_connection_id and not lm:
                     try:
                         reply = stream_ai_reply(chat_id, user_id, user_name,
@@ -4903,7 +4906,8 @@ def handle_update(upd):
             send_rich_with_kb(chat_id, canned)
             return
         ai_reply(chat_id, user_id, user_name, text, username=username,
-                 reply_msg=msg.get("reply_to_message"))
+                 reply_msg=msg.get("reply_to_message"),
+                 incoming_msg_id=msg.get("message_id"))
         return
 
     # Groups: only when mentioned or replied to.
@@ -4949,7 +4953,8 @@ def handle_update(upd):
                  reply_to=msg.get("message_id"),
                  thread_id=msg.get("message_thread_id"),
                  username=username,
-                 reply_msg=msg.get("reply_to_message"))
+                 reply_msg=msg.get("reply_to_message"),
+                 incoming_msg_id=msg.get("message_id"))
 
 
 # ---------------------------------------------------------------------------

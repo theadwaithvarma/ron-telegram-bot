@@ -297,9 +297,8 @@ def fire_actions(actions, chat_id, reply_to=None, thread_id=None,
     """Execute validated media actions. Returns number that landed ok.
 
     Never raises — a failed action is logged, the rest still fire.
-    react_target_msg_id (v1.27.x): the message the user's incoming message
-    replied to. A [react:] trailer targets it instead of the bot's own
-    just-sent reply — the reaction lands where the user pointed.
+    react_target_msg_id (v1.27.3): the incoming user's message_id. A
+    [react:] trailer targets it — never the bot's own reply.
     """
     ok_count = 0
     for a in actions or []:
@@ -379,10 +378,9 @@ def _fire_one(a, chat_id, thread_id, business_connection_id, sent_msg_id,
                             [("p0", "demo0.jpg", demo_image_bytes(1)),
                              ("p1", "demo1.jpg", demo_image_bytes(2))])
     elif kind == "react":
-        # v1.27.x: prefer the message the user replied to (their reply
-        # target) over the bot's own just-sent reply. Falls back to the
-        # bot's own reply when the user's message wasn't a reply.
-        target_msg_id = react_target_msg_id or sent_msg_id
+        # v1.27.3: always the incoming user's message — never the bot's
+        # own reply. No target → drop, log.
+        target_msg_id = react_target_msg_id
         if not target_msg_id:
             print("[media_trailers] [react:] dropped: no target message id",
                   flush=True)
