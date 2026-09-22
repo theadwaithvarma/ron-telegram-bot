@@ -3180,6 +3180,67 @@ def _provider_chain_info(cfg=None):
     return out
 
 
+def _fmt_ms(ms):
+    if ms >= 10000:
+        return f"{ms / 1000:.1f}s"
+    return f"{ms:.0f}ms"
+
+
+def _vitals_text():
+    """Owner /vitals body. Never raises — every section degrades to '?'.
+    Provider names are fine here: this is owner-only, never user-facing."""
+    lines = [f"\U0001FA7A vitals \u2014 up {_uptime_str()}"]
+    try:
+        with open(os.path.join(os.path.dirname(HEARTBEAT_FILE),
+                               "ron_watchdog.json")) as f:
+            wd = json.load(f)
+        lines[0] += (f" \u00b7 restarts {wd.get('total_restarts', '?')} "
+                     f"(streak {wd.get('consecutive_crashes', '?')})")
+    except Exception:
+        pass
+    try:
+        hb = json.load(open(HEARTBEAT_FILE))
+        lines[0] += f" \u00b7 heartbeat {time.time() - hb.get('ts', 0):.0f}s ago"
+    except Exception:
+        pass
+    try:
+        chain = _provider_chain_info()
+        vit = ron_ai.get_vitals()
+        for p in chain:
+            name = p["name"]
+            v = vit.get(name, {})
+            turns = v.get("turns", 0)
+            errs = v.get("errors", 0)
+            if turns:
+                lat = (f"ttfb p50 {_fmt_ms(v['ttfb_p50_ms'])} / "
+                       f"p95 {_fmt_ms(v['ttfb_p95_ms'])}")
+            else:
+                lat = "no turns yet"
+            err_s = f" \u00b7 {errs} err" if errs else ""
+            if v.get("last_error"):
+                err_s += f" ({v['last_error']})"
+            star = "\u2b50 " if p["primary"] else ""
+            lines.append(f"{star}{name}: {p['status']} \u00b7 "
+                         f"{turns} turns \u00b7 {lat}{err_s}")
+    except Exception:
+        lines.append("providers: unknown")
+    try:
+        with open(DEGRADED_QUEUE) as f:
+            qd = sum(1 for line in f if line.strip())
+        lines.append(f"degraded queue: {qd}")
+    except Exception:
+        pass
+    try:
+        memdb = os.path.join(os.path.dirname(HEARTBEAT_FILE),
+                             "ron_memory.db")
+        if os.path.exists(memdb):
+            sz = os.path.getsize(memdb)
+            lines.append(f"memory db: {sz / 1024:.0f} KB")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
 def _purge_user_history(user_id):
     """Drop one user's turns from the JSON history.
 
@@ -3343,6 +3404,15 @@ def handle_command(chat_id, user_id, cmd, is_private, text="",
         _owner_reply(chat_id, user_id, cmd_msg_id,
                      f"Forgot rule #{n}: \u201c{removed}\u201d" if removed
                      else "Usage: /forgetrule <number from /rules>")
+        return True
+    if cmd == "vitals":
+        # Owner-only: live vitals — uptime, per-provider health +
+        # first-token p50/p95, turn/error counts, queue depth, memory
+        # size. The "is Ron slow right now?" answer, with numbers.
+        if not _owner_gate(user_id):
+            _owner_refuse(chat_id, user_id, cmd_msg_id)
+            return True
+        _owner_reply(chat_id, user_id, cmd_msg_id, _vitals_text())
         return True
     if cmd == "broadcast":
         # Owner-only: one message to every known chat. Two-step confirm —

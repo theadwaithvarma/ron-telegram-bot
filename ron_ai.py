@@ -4,6 +4,7 @@
 Reads the API key from the Secure Vault (custom.groq) as a surrogate;
 Sentinel/authd swaps it into the Authorization header on egress.
 """
+import collections
 import json
 import os
 import re
@@ -306,6 +307,135 @@ def _breaker_note_5xx(name):
             return True
         _provider_5xx_streak[name] = streak
         return False
+
+
+# ---------------------------------------------------------------------------
+# v1.31.0 — request vitals. Every provider attempt and every completed
+# streaming turn is recorded (thread-safe, tiny rolling window, persisted
+# throttled to disk). Powers the owner's /vitals command: per-provider
+# first-token p50/p95, turn counts, and error rates — so "is Ron slow
+# right now?" is answered with numbers, not vibes. Never raises; a
+# broken tracker must not break a chat turn.
+# ---------------------------------------------------------------------------
+STATS_FILE = os.path.join(DIR, "ron_stats.json")
+_STATS_WINDOW = 200       # events kept per provider (rolling)
+_STATS_FLUSH_SECS = 30    # at most one disk write per 30s
+_stats_lock = threading.Lock()
+_stats_turns = {}         # provider -> deque[(first_token_ms, total_ms)]
+_stats_attempts = {}      # provider -> deque[(ok: bool, latency_ms, kind)]
+_stats_last_flush = 0.0
+
+
+def _stats_load():
+    try:
+        with open(STATS_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return
+    try:
+        with _stats_lock:
+            for name, rows in (data.get("turns") or {}).items():
+                d = collections.deque(maxlen=_STATS_WINDOW)
+                for r in rows[-_STATS_WINDOW:]:
+                    d.append((float(r[0]), float(r[1])))
+                _stats_turns[str(name)] = d
+            for name, rows in (data.get("attempts") or {}).items():
+                d = collections.deque(maxlen=_STATS_WINDOW)
+                for r in rows[-_STATS_WINDOW:]:
+                    d.append((bool(r[0]), float(r[1]), str(r[2])))
+                _stats_attempts[str(name)] = d
+    except Exception:
+        pass
+
+
+def _stats_flush_locked():
+    global _stats_last_flush
+    now = time.monotonic()
+    if now - _stats_last_flush < _STATS_FLUSH_SECS:
+        return
+    _stats_last_flush = now
+    try:
+        data = {
+            "turns": {k: [list(r) for r in v]
+                      for k, v in _stats_turns.items()},
+            "attempts": {k: [list(r) for r in v]
+                         for k, v in _stats_attempts.items()},
+        }
+        tmp = STATS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, STATS_FILE)
+    except Exception:
+        pass
+
+
+def record_turn(provider, model, first_token_ms, total_ms):
+    """A streaming turn completed on (provider, model)."""
+    try:
+        with _stats_lock:
+            d = _stats_turns.setdefault(
+                str(provider), collections.deque(maxlen=_STATS_WINDOW))
+            d.append((float(first_token_ms), float(total_ms)))
+            _stats_flush_locked()
+    except Exception:
+        pass
+
+
+def record_attempt(provider, model, ok, latency_ms, kind=""):
+    """One HTTP attempt against a provider finished.
+
+    ok=False kinds look like "http_429", "http_500", "exception",
+    "empty" — free-form, only used for display."""
+    try:
+        with _stats_lock:
+            d = _stats_attempts.setdefault(
+                str(provider), collections.deque(maxlen=_STATS_WINDOW))
+            d.append((bool(ok), float(latency_ms), str(kind or "")))
+            _stats_flush_locked()
+    except Exception:
+        pass
+
+
+def _percentile(sorted_vals, q):
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    k = (len(sorted_vals) - 1) * (q / 100.0)
+    f = int(k)
+    c = min(f + 1, len(sorted_vals) - 1)
+    if f == c:
+        return float(sorted_vals[f])
+    return float(sorted_vals[f] + (sorted_vals[c] - sorted_vals[f])
+                 * (k - f))
+
+
+def get_vitals():
+    """Per-provider vitals snapshot. Read-only; never raises."""
+    out = {}
+    try:
+        with _stats_lock:
+            names = set(_stats_turns) | set(_stats_attempts)
+            for name in sorted(names):
+                turns = sorted(t[0] for t in _stats_turns.get(name, ()))
+                totals = sorted(t[1] for t in _stats_turns.get(name, ()))
+                atts = list(_stats_attempts.get(name, ()))
+                errs = [a for a in atts if not a[0]]
+                out[name] = {
+                    "turns": len(turns),
+                    "ttfb_p50_ms": _percentile(turns, 50),
+                    "ttfb_p95_ms": _percentile(turns, 95),
+                    "total_p50_ms": _percentile(totals, 50),
+                    "attempts": len(atts),
+                    "errors": len(errs),
+                    "last_error": errs[-1][2] if errs else "",
+                }
+    except Exception:
+        pass
+    return out
+
+
+_stats_load()
 
 # Multi-provider failover (2026-09-20): the bot no longer depends on a
 # single AI backend. Providers are tried in order; each one needs its key
@@ -623,6 +753,7 @@ def _request(cfg, messages, stream, timeout, tier="standard"):
                 except Exception:
                     pass
             _API_SEMAPHORE.acquire()
+            attempt_start = time.monotonic()
             try:
                 # Pooled keep-alive connection: saves a fresh proxy
                 # CONNECT + TLS handshake (~0.4s) on every AI call.
@@ -645,11 +776,21 @@ def _request(cfg, messages, stream, timeout, tier="standard"):
                     time.sleep(RETRY_BACKOFF_SECS)
                     attempt += 1
                     continue
+                record_attempt(name, model, False,
+                               (time.monotonic() - attempt_start) * 1000,
+                               "exception")
                 break
             status = stream_resp.status
             if status == 200:
                 _breaker_reset(name)
-                return _PooledResponse(stream_resp)
+                resp = _PooledResponse(stream_resp)
+                # Serving identity rides along for the vitals tracker —
+                # chat_stream records first-token/total against it.
+                resp.serving_provider = name
+                resp.serving_model = model
+                resp.request_ms = (time.monotonic() - attempt_start) * 1000
+                record_attempt(name, model, True, resp.request_ms, "ok")
+                return resp
             # Error status: read the body for classification, then recycle
             # the connection (body fully read, so the drain is instant).
             try:
@@ -663,6 +804,9 @@ def _request(cfg, messages, stream, timeout, tier="standard"):
                 pass
             _API_SEMAPHORE.release()
             last_err = RuntimeError(f"HTTP {status}: {err_body}"[:150])
+            record_attempt(name, model, False,
+                           (time.monotonic() - attempt_start) * 1000,
+                           f"http_{status}")
             if status == 429:
                 saw_rate_limit = True
                 _breaker_reset(name)
@@ -1332,11 +1476,32 @@ def chat_stream(chat_id, user_text, user_name="there", on_token=None,
     messages = _maybe_tools(messages, user_text, tier, ctx=tool_ctx)
 
     try:
+        t_req = time.monotonic()
         resp = _request(cfg, messages, stream=True, timeout=120, tier=tier)
     except DynamicCredentialError:
         raise RuntimeError("AI key not connected yet")
 
-    reply = _drain_stream(resp, stop_event, on_token).strip()
+    # Vitals: time to first token + total, attributed to the serving
+    # provider/model that _request attached to the response.
+    t_first = []
+    _orig_on_token = on_token
+
+    def _timed_on_token(chunk):
+        if not t_first:
+            t_first.append(time.monotonic())
+        if _orig_on_token is not None:
+            _orig_on_token(chunk)
+
+    reply = _drain_stream(resp, stop_event, _timed_on_token).strip()
+    t_end = time.monotonic()
+    try:
+        if t_first:
+            record_turn(getattr(resp, "serving_provider", "?"),
+                        getattr(resp, "serving_model", "?"),
+                        (t_first[0] - t_req) * 1000,
+                        (t_end - t_req) * 1000)
+    except Exception:
+        pass
     if not reply:
         if stop_event is not None and stop_event.is_set():
             # User hit Stop before the first token: not a backend

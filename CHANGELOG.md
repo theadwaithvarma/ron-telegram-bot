@@ -1,3 +1,23 @@
+## 1.31.0 — Vitals: observability for the bot (2026-09-22)
+
+Cofounder call: Ron had no way to answer "is it slow right now?" with
+numbers — every latency question meant hand-measuring. Now it reports
+its own vitals.
+
+- ron_ai.py gains a tiny thread-safe request tracker: every provider
+  attempt (ok / http_429 / http_5xx / exception) and every completed
+  streaming turn (first-token ms, total ms) is recorded into a rolling
+  per-provider window (200 events) and persisted throttled to
+  ron_stats.json. Never raises — a broken tracker can't break a turn.
+- New owner-only /vitals command: uptime, watchdog restarts, heartbeat
+  age, per-provider status + first-token p50/p95 + turn/error counts,
+  degraded queue depth, memory DB size. Provider names are fine here —
+  owner-only, never user-facing.
+- tests/test_vitals.py: 8 offline tests (percentile math, error
+  counting, persistence round-trip, window bound, thread-safety smoke).
+- Also fixed: missing `import collections` in ron_ai.py (the tracker's
+  silent except ate the NameError — caught by the new tests).
+
 ## 1.30.0 — Keyless free backup leg + wider OpenRouter :free rotation (2026-09-22)
 
 Adwaith's call: when paid quotas run out, Ron should fall back to free
