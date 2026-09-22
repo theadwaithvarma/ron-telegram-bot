@@ -3648,9 +3648,11 @@ def handle_poll_command(chat_id, cmd, text):
     return True
 
 
-DRAFT_PUSH_SECS = 3.0    # min seconds between draft pushes — Telegram 429s
-                         # drafts hammered faster than ~1/s
-DRAFT_MIN_GROWTH = 40    # only push when the text actually grew this much
+DRAFT_PUSH_SECS = 1.5    # min seconds between draft pushes — Telegram 429s
+                         # drafts hammered faster than ~1/s (2026-09-22:
+                         # 3.0s -> 1.5s for snappier visible streaming;
+                         # the 429 backoff in on_token still protects us)
+DRAFT_MIN_GROWTH = 24    # only push when the text actually grew this much
 DRAFT_MAX = 4096         # sendMessageDraft text cap
 TRAILER_LINE_RE = re.compile(r"^\[(buttons|links):.*$", re.M | re.I)
 STOP_EVENTS = {}  # chat_id -> threading.Event, set when user hits Stop

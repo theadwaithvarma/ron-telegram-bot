@@ -1,3 +1,27 @@
+## 1.26.1 — Failover latency fix: never sleep on 429 (2026-09-22)
+
+- Diagnosis: Ron felt slow vs NightAI — NOT the model. Groq's gpt-oss-120b
+  measures 0.4-0.7s time-to-first-token. The bottleneck was the failover
+  chain: the live provider order was openrouter -> gemini -> groq, and both
+  free-tier providers are hard rate-limited right now. Every time their
+  30s cooldown expired, a message burned ~2.5s per provider on the 429
+  "honor the try-again wait" sleep+retry dance before reaching healthy
+  Groq — worst case 30s of dead air per sick provider.
+- `ron_ai._request`: a 429 no longer sleeps (up to 30s) before failing
+  over. The provider still gets its 30-120s cooldown (no hammering) and
+  the next model/provider is tried immediately, so a healthy provider
+  serves the reply right away. 5xx retry (2s, once), circuit breaker,
+  degraded mode, and provider-neutral errors are unchanged.
+- Live `ron_ai.json` provider order restored to groq -> gemini ->
+  openrouter (matches the repo's DEFAULT_PROVIDERS: "Groq stays first —
+  it's the fastest when healthy"); free-tier providers now fail over
+  last instead of first.
+- Draft streaming throttle tuned for snappier visible progress:
+  DRAFT_PUSH_SECS 3.0 -> 1.5, DRAFT_MIN_GROWTH 40 -> 24 (Telegram 429
+  backoff in on_token still protects against draft rate limits).
+- 4 new offline tests in `tests/test_failover_speed.py` (verified to fail
+  on the pre-fix code, pass after).
+
 ## 1.26.0 — Media-message trailers (2026-09-22)
 
 - New `ron_media_trailers.py`: the AI brain can emit inline trailers that the

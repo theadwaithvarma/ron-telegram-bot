@@ -591,20 +591,18 @@ def _request(cfg, messages, stream, timeout, cheap=False):
             if status == 429:
                 saw_rate_limit = True
                 _breaker_reset(name)
-                # Honor the provider's "try again in" wait when it's
-                # short (bucket refills soon); a long wait means the
-                # provider is out for a while — cool it down and move
-                # on instead of hanging the reply thread.
+                # 2026-09-22 (speed): NEVER sleep on a 429. The failover
+                # chain exists so another provider can serve this reply
+                # NOW — waiting up to 30s for a bucket refill was the
+                # dominant "Ron is slow" latency. Cool the provider down
+                # (30-120s, honoring the server's ask when longer) and
+                # fail over to the next model/provider immediately.
                 retry_wait = _parse_retry_after(err_body)
                 with _rate_limit_lock:
                     _provider_cooldown[name] = time.monotonic() + min(
                         max(retry_wait, COOLDOWN_AFTER_RATELIMIT_SECS),
                         120.0)
-                if attempt == 0 and retry_wait <= 60.0:
-                    time.sleep(min(retry_wait, 30.0))
-                    attempt += 1
-                    continue
-                break  # next model/provider
+                break  # next model/provider — no waiting
             elif status in (401, 403):
                 # Bad/revoked key — skip the rest of this provider.
                 while i < len(plan) and plan[i][0] == name:
