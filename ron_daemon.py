@@ -79,6 +79,15 @@ try:
 except Exception:
     ron_media_trailers = None
 
+# User-requested message editing (v1.27.0): [edit] the model emits means the
+# user replied to our own message asking to change it — revise in place via
+# editMessageText instead of sending a new reply. None-safe — without it,
+# [edit] is stripped and the plain reply still lands.
+try:
+    import ron_edit_reply
+except Exception:
+    ron_edit_reply = None
+
 # Owner power commands (/stats, /ban, /broadcast, ...). Hard import: it's
 # our own stdlib-only module and the owner deck depends on it.
 import ron_owner
@@ -2214,7 +2223,8 @@ def handle_business_message(msg):
     ai_reply(chat_id, sender, frm.get("first_name", "there"), text,
              private=True, reply_to=msg.get("message_id"),
              business_connection_id=conn_id,
-             username=frm.get("username") or "")
+             username=frm.get("username") or "",
+             reply_msg=msg.get("reply_to_message"))
 
 
 def resolve_topic(group_id, name):
@@ -2465,12 +2475,12 @@ def strip_trailer_syntax(reply):
                      "livelocation", "venue", "contact", "spoilerphoto",
                      "mediagroup", "react"))
     for _name in ("buttons", "links", "copy", "switch_inline", "login",
-                  "reply_keyboard") + _media_names:
+                  "reply_keyboard", "edit") + _media_names:
         reply = _strip_trailer(reply, _name)
     reply = _strip_hide_keyboard(reply)
     # Bare media trailers ([dice] with no colon-body) — _strip_trailer only
     # matches the colon form.
-    for _name in _media_names:
+    for _name in ("edit",) + _media_names:
         reply = re.sub(r"\[" + _name + r"\]", "", reply or "", flags=re.I)
     reply = GROUP_RE.sub("", reply)
     reply = SEND_TOPIC_RE.sub("", reply)
@@ -3764,6 +3774,71 @@ def send_blocks(chat_id, blocks, reply_to=None, thread_id=None,
         return {"ok": False, "error": str(e)[:150]}
 
 
+def _is_own_message(rmsg, business_connection_id=None):
+    """v1.27.0: True when the replied-to message was sent by this bot.
+
+    Normal chats: the sender is a bot with our username. Secretary mode:
+    replies go out as Adwaith himself, so the sender id is his. This is a
+    best-effort gate — the editMessageText call itself is the final
+    arbiter (Telegram 400s on anyone else's message) and the daemon falls
+    back to a normal reply on failure.
+    """
+    frm = (rmsg or {}).get("from") or {}
+    if not isinstance(frm, dict):
+        return False
+    if business_connection_id:
+        return frm.get("id") == OWNER_ID
+    return bool(frm.get("is_bot")) and \
+        (frm.get("username") or "") == BOT_USERNAME
+
+
+def _edit_context(rmsg, business_connection_id=None):
+    """v1.27.0: when the user's message replies to the bot's own message,
+    return (message_id, original_text) so the brain can revise it in place.
+    Otherwise (None, "")."""
+    if not _is_own_message(rmsg, business_connection_id):
+        return None, ""
+    try:
+        mid = (rmsg or {}).get("message_id")
+    except Exception:
+        mid = None
+    if not mid:
+        return None, ""
+    text = (rmsg or {}).get("text") or (rmsg or {}).get("caption") or ""
+    return mid, (text or "")[:1500]
+
+
+def _edit_bot_message(chat_id, target_id, revised, thread_id=None,
+                      business_connection_id=None):
+    """v1.27.0: editMessageText on the bot's own message. Returns True on
+    success (including "message is not modified" — nothing to change is
+    not a failure), False when the edit genuinely failed and the caller
+    should fall back to a normal new reply. Never raises."""
+    params = {"chat_id": chat_id, "message_id": target_id,
+              "text": revised, "parse_mode": "Markdown"}
+    if thread_id:
+        params["message_thread_id"] = thread_id
+    if business_connection_id:
+        params["business_connection_id"] = business_connection_id
+    try:
+        r = send_healed("editMessageText", params)
+    except Exception as e:
+        print(f"[ron_daemon] editMessageText error: {e}", flush=True)
+        return False
+    if isinstance(r, dict) and r.get("ok"):
+        print(f"[ron_daemon] edited message {target_id} in place "
+              f"(chat={chat_id})", flush=True)
+        return True
+    err = str((r or {}).get("error", ""))
+    if "message is not modified" in err.lower():
+        print(f"[ron_daemon] edit no-op: revised text identical "
+              f"(chat={chat_id})", flush=True)
+        return True
+    print(f"[ron_daemon] editMessageText failed ({err[:120]}) — falling "
+          f"back to a normal reply", flush=True)
+    return False
+
+
 def _fire_media_trailers(reply, chat_id, sent_r, reply_to=None,
                          thread_id=None, business_connection_id=None):
     """v1.26.0: execute media-message trailers the model emitted ([dice],
@@ -3794,7 +3869,8 @@ def _fire_media_trailers(reply, chat_id, sent_r, reply_to=None,
 
 
 def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
-                      business_connection_id=None, user_text=""):
+                      business_connection_id=None, user_text="",
+                      edit_target_msg_id=None):
     """Trailer parsing + IN-BUBBLE rich buttons with safe fallbacks.
 
     When the reply carries [buttons:]/[links:] trailers, the message goes
@@ -3806,7 +3882,32 @@ def send_rich_with_kb(chat_id, reply, reply_to=None, thread_id=None,
     user_text: the incoming user message. When it explicitly asks for
     buttons ("show all buttons", "/menu"), the contextual button filter
     is bypassed for this turn (v1.21.1 — the "phantom buttons" bug).
+
+    edit_target_msg_id (v1.27.0): the bot's own message the user replied
+    to. When the reply carries the [edit] trailer, the revised text edits
+    that message in place via editMessageText instead of sending a new
+    message; on edit failure it falls back to the normal send below.
     """
+    # v1.27.0 user-requested edits: the model emitted [edit], meaning the
+    # user replied to our own message asking to change it — revise in
+    # place. Any other trailers (e.g. [react:]) still fire afterwards.
+    if edit_target_msg_id and ron_edit_reply is not None:
+        revised = ron_edit_reply.extract_revised_text(reply)
+        if revised is not None:
+            if not revised:
+                # Bare [edit]: the whole reply minus every trailer is the
+                # revised message.
+                revised = strip_trailer_syntax(reply).strip()
+            if revised:
+                if _edit_bot_message(chat_id, edit_target_msg_id, revised,
+                                     thread_id, business_connection_id):
+                    _fire_media_trailers(
+                        reply, chat_id,
+                        {"result": {"message_id": edit_target_msg_id}},
+                        reply_to, thread_id, business_connection_id)
+                    return {"ok": True, "edited": True}
+            # Edit failed or nothing to edit — fall through to the normal
+            # send with the trailer stripped (handled below).
     skip = _explicit_button_request(user_text)
     if skip:
         print(f"[ron_daemon] trailer: explicit button request "
@@ -3910,7 +4011,8 @@ def canned_reply(text, chat_id):
     return variants[abs(hash((str(chat_id), norm))) % len(variants)]
 
 
-def _stream_with_draft(chat_id, produce, user_text=""):
+def _stream_with_draft(chat_id, produce, user_text="",
+                       edit_target_msg_id=None):
     """Shared native-draft streaming core (Bot API sendMessageDraft).
 
     produce(on_token, stop_event) runs the AI call and returns the full
@@ -3966,11 +4068,13 @@ def _stream_with_draft(chat_id, produce, user_text=""):
     # short reply (nothing streamed) or post-stream: single rich send.
     # on generation failure the exception propagates and the caller's
     # single-send fallback replies — never an expired preview with nothing.
-    send_rich_with_kb(chat_id, reply, user_text=user_text)
+    send_rich_with_kb(chat_id, reply, user_text=user_text,
+                      edit_target_msg_id=edit_target_msg_id)
     return reply
 
 
-def stream_ai_reply(chat_id, user_id, user_name, text, username=""):
+def stream_ai_reply(chat_id, user_id, user_name, text, username="",
+                    system_extra="", edit_target_msg_id=None):
     """Native draft streaming for 1:1 chats (Bot API sendMessageDraft): the
     reply animates in a draft bubble as tokens arrive (ChatGPT-style),
     throttled to stay under Telegram's rate limits. The client's native Stop
@@ -3981,9 +4085,11 @@ def stream_ai_reply(chat_id, user_id, user_name, text, username=""):
         chat_id,
         lambda on_token, stop_event: ron_ai.chat_stream(
             chat_id, text, user_name, on_token,
-            stop_event=stop_event, system_extra=group_context(),
+            stop_event=stop_event,
+            system_extra=group_context() + (system_extra or ""),
             user_id=user_id, is_private=True, username=username),
-        user_text=text)
+        user_text=text,
+        edit_target_msg_id=edit_target_msg_id)
     handle_group_sends(chat_id, user_id, user_name, reply)
     handle_send_topic(chat_id, user_id, user_name, reply)
     handle_topic_actions(chat_id, user_name, reply)
@@ -4050,8 +4156,14 @@ def _cache_store(chat_id, text, reply, cacheable):
 
 def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
            thread_id=None, business_connection_id=None, cacheable=True,
-           username=""):
-    """Run the LLM call off the poll loop so updates keep flowing."""
+           username="", reply_msg=None):
+    """Run the LLM call off the poll loop so updates keep flowing.
+
+    reply_msg: the raw reply_to_message dict when the user's message is a
+    reply. When it replies to the bot's own message (v1.27.0), the brain
+    gets the original text as context and may revise it in place with the
+    [edit] trailer instead of sending a new reply.
+    """
     def _go():
         cur = threading.current_thread()
         try:
@@ -4089,6 +4201,29 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                                    business_connection_id)
                 return
             try:
+                # v1.27.0 user-requested edits: the user replied to our own
+                # message — hand the brain the original text so it can
+                # revise it in place with the [edit] trailer. The semantic
+                # cache is skipped for these turns: the reply depends on
+                # the specific message being revised.
+                edit_target_msg_id, edit_target_text = _edit_context(
+                    reply_msg, business_connection_id)
+                edit_extra = ""
+                if edit_target_msg_id:
+                    edit_extra = (
+                        "\n[Edit context: the user's message below is a "
+                        "reply to YOUR earlier message, quoted here:\n"
+                        "\"\"\"\n" + edit_target_text + "\n\"\"\"\n"
+                        "If the user is asking to change, fix, shorten, or "
+                        "otherwise revise that message, output ONLY the "
+                        "complete revised message text, then put [edit] on "
+                        "its own line at the very end — nothing else. The "
+                        "revised text REPLACES your earlier message in "
+                        "place, so it must be the full message, not a "
+                        "diff, with valid formatting. If the user is "
+                        "asking something new rather than changing that "
+                        "message, answer normally as a fresh reply and do "
+                        "NOT use [edit].]")
                 # Phase 6: semantic answer cache — serve a recent
                 # semantically-equivalent answer without burning API
                 # tokens. Reset the disclosure flag: _memory_context sets
@@ -4099,7 +4234,7 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 # Light mode (2026-09-20): run lean — cheap models for every
                 # message, no draft streaming, daily notice on interaction.
                 lm = ron_ai.light_mode_enabled()
-                if cacheable:
+                if cacheable and not edit_target_msg_id:
                     cached = _cache_lookup(chat_id, text)
                     if cached is not None:
                         if lm:
@@ -4126,11 +4261,16 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 if private and not business_connection_id and not lm:
                     try:
                         reply = stream_ai_reply(chat_id, user_id, user_name,
-                                                text, username=username)
+                                                text, username=username,
+                                                system_extra=edit_extra,
+                                                edit_target_msg_id=edit_target_msg_id)
                         _record_brain_success()
                         # Phase 6: cache the successful reply (before any
                         # light-mode footer) for equivalent future questions.
-                        _cache_store(chat_id, text, reply, cacheable)
+                        # Skipped for edit turns (v1.27.0): the reply is
+                        # tied to the specific message being revised.
+                        if not edit_target_msg_id:
+                            _cache_store(chat_id, text, reply, cacheable)
                         return
                     except ron_ai.UserStoppedError:
                         # Stop pressed before the first token arrived: the
@@ -4190,6 +4330,9 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                     if tname:
                         extra += (f"\nYou are replying inside the '{tname}' topic. "
                                   "When the user says 'this topic', they mean it.")
+                # v1.27.0: edit-revision context rides along for the
+                # non-streaming path too (groups, business, light mode).
+                extra += edit_extra
                 # typing fires in the background while the AI call starts
                 # immediately.
                 _kt = typing_kickoff(chat_id, business_connection_id)
@@ -4199,8 +4342,10 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 _kt.join(timeout=10)
                 _record_brain_success()
                 # Phase 6: cache the successful reply (before the
-                # light-mode footer, which is per-user/per-day).
-                _cache_store(chat_id, text, reply, cacheable)
+                # light-mode footer, which is per-user/per-day). Skipped
+                # for edit turns (v1.27.0).
+                if not edit_target_msg_id:
+                    _cache_store(chat_id, text, reply, cacheable)
             except Exception as e:
                 msg = str(e)
                 if _is_systemic(msg):
@@ -4219,7 +4364,8 @@ def ai_reply(chat_id, user_id, user_name, text, private=True, reply_to=None,
                 # users should know the bot is capable of heavier lifting.
                 reply += ron_ai.light_mode_notice(user_id)
             send_rich_with_kb(chat_id, reply, reply_to, thread_id,
-                              business_connection_id, user_text=text)
+                              business_connection_id, user_text=text,
+                              edit_target_msg_id=edit_target_msg_id)
             handle_group_sends(chat_id, user_id, user_name, reply)
             handle_send_topic(chat_id, user_id, user_name, reply)
             handle_topic_actions(chat_id, user_name, reply,
@@ -4705,7 +4851,8 @@ def handle_update(upd):
             ron_ai._save_turn(chat_id, text, user_name, canned, user_id)
             send_rich_with_kb(chat_id, canned)
             return
-        ai_reply(chat_id, user_id, user_name, text, username=username)
+        ai_reply(chat_id, user_id, user_name, text, username=username,
+                 reply_msg=msg.get("reply_to_message"))
         return
 
     # Groups: only when mentioned or replied to.
@@ -4750,7 +4897,8 @@ def handle_update(upd):
         ai_reply(chat_id, user_id, user_name, clean or text, private=False,
                  reply_to=msg.get("message_id"),
                  thread_id=msg.get("message_thread_id"),
-                 username=username)
+                 username=username,
+                 reply_msg=msg.get("reply_to_message"))
 
 
 # ---------------------------------------------------------------------------
@@ -4784,6 +4932,8 @@ def _smart_one_shot(query, user_name="there"):
     reply = ron_ai.quick_answer(query, user_name)
     for _name in _ONE_SHOT_TRAILERS:
         reply = _strip_trailer(reply, _name)
+    # v1.27.0: one-shot cards can't edit — drop any stray [edit] too.
+    reply = re.sub(r"\[edit\]", "", reply or "", flags=re.I)
     return _strip_hide_keyboard(reply).strip()
 
 

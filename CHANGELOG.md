@@ -1,3 +1,37 @@
+## 1.27.0 — User-requested message editing via [edit] trailer (2026-09-22)
+
+- Adwaith: "whenever we mention edit or do something about its response, it
+  can edit its response which we replied to." Now live: reply to one of the
+  bot's own messages with an edit request ("make it shorter", "fix the
+  typo", "change the tone") and the bot revises that message in place via
+  editMessageText instead of sending a new reply.
+- New pure module `ron_edit_reply.py`: parses the [edit] / [edit: <text>]
+  trailer the model emits. Bare [edit] means the whole reply (minus every
+  trailer) is the revised message; the colon form carries the text inline.
+- Daemon wiring: `handle_update` (DM, group, business paths) passes
+  `reply_to_message` into `ai_reply` as `reply_msg`; `_edit_context`
+  verifies the replied-to message is the bot's own (bot username check,
+  OWNER_ID for secretary mode where replies go out as Adwaith) and hands
+  the original text to the brain as per-turn context. The model decides
+  intent — a fresh question that merely replies still gets a normal reply.
+- `send_rich_with_kb` is the choke point: with an edit target and an
+  [edit] trailer it calls `_edit_bot_message` (editMessageText with
+  parse_mode Markdown + send_healed self-healing) and skips the new send;
+  remaining trailers (e.g. [react:]) fire against the edited message.
+  Edit failures (too old / not the bot's message) fall back to a normal
+  new reply silently; "message is not modified" is a silent no-op.
+- Safety: never edits anyone else's message; respects the 48h edit
+  window via the fallback; business-connection and thread ids carried
+  through; semantic cache skipped for edit turns (replies are tied to the
+  specific message being revised); [edit] stripped from one-shot cards.
+- System prompt documents the behavior in repo DEFAULT_CONFIG and live
+  ron_ai.json (full paragraph in `system`, one-liner in `system_cheap`
+  for light mode). Works in groups too — a reply to the bot already
+  satisfies the mention/reply engagement rule.
+- 28 new offline tests in tests/test_edit_reply.py — all pass. Full
+  suite: 803 tests, 6 failures/errors, identical to the pre-change
+  baseline (pre-existing, untouched).
+
 ## 1.26.1 — Failover latency fix: never sleep on 429 (2026-09-22)
 
 - Diagnosis: Ron felt slow vs NightAI — NOT the model. Groq's gpt-oss-120b
